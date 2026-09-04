@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{B7AB81BF-DA4D-4373-BC36-B7AC8A6E7FC0}</UniqueIdentifier>
+      <Extensions>cpp;c;cxx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{7D94D538-2704-44D2-BDD7-183204B432C3}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{A27BCB9D-D40A-44FD-9E30-F8E65CA9D826}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="App.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="LibVlcRuntime.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="MainWindow.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PathUtils.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PlaybackMath.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PlayerEngine.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="TimeFormatter.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="Utf8.cpp"><Filter>Source Files</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="App.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="LibVlcRuntime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="MainWindow.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PathUtils.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PlaybackMath.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PlaybackState.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PlayerEngine.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Resource.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="targetver.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="TimeFormatter.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Utf8.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="VideoPlayer.rc"><Filter>Resource Files</Filter></ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="VideoPlayer.manifest"><Filter>Resource Files</Filter></None>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,38 @@
+name: Native Windows build
+
+on:
+  push:
+    branches:
+      - codex/native-cpp-portable
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test, and package Win32 and x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out native source
+        uses: actions/checkout@v4
+
+      - name: Build all native configurations and portable packages
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-all.ps1
+
+      - name: Upload Win32 portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoPlayer-win32-portable
+          path: artifacts/VideoPlayer-win32-portable.zip
+          if-no-files-found: error
+
+      - name: Upload x64 portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoPlayer-x64-portable
+          path: artifacts/VideoPlayer-x64-portable.zip
+          if-no-files-found: error

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files"><UniqueIdentifier>{ED6D7501-6E50-44D2-B59B-0DB7E2C32BB4}</UniqueIdentifier></Filter>
+    <Filter Include="Shared"><UniqueIdentifier>{83FE8B65-63AC-44DB-A785-88466C7B6756}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Tests.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\PlaybackMath.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\TimeFormatter.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\Utf8.cpp"><Filter>Shared</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\src\VideoPlayer\App.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\PathUtils.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\PlaybackMath.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\TimeFormatter.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\Utf8.h"><Filter>Shared</Filter></ClInclude>
+  </ItemGroup>
+</Project>
