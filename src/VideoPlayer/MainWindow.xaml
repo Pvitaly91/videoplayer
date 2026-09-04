@@ -1,0 +1,173 @@
+<Window x:Class="VideoPlayer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vlc="clr-namespace:LibVLCSharp.WPF;assembly=LibVLCSharp.WPF"
+        Title="VideoPlayer"
+        Width="1000"
+        Height="650"
+        MinWidth="720"
+        MinHeight="480"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource WindowBackgroundBrush}"
+        Foreground="{StaticResource TextBrush}"
+        AllowDrop="True"
+        Loaded="Window_Loaded"
+        Closing="Window_Closing"
+        DragOver="Window_DragOver"
+        Drop="Window_Drop"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="Black">
+            <Grid>
+                <TextBlock x:Name="EmptyMessageText"
+                           MaxWidth="620"
+                           Margin="32"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="20"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap"
+                           Text="Перетягніть відеофайл сюди або натисніть “Відкрити”" />
+
+                <vlc:VideoView x:Name="VideoView" Visibility="Hidden">
+                    <!-- Alpha must be non-zero so LibVLCSharp's detached foreground window receives input. -->
+                    <Grid Background="#01000000"
+                          AllowDrop="True"
+                          DragOver="Window_DragOver"
+                          Drop="Window_Drop"
+                          MouseLeftButtonDown="VideoSurface_MouseLeftButtonDown" />
+                </vlc:VideoView>
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="1"
+                Background="{StaticResource PanelBackgroundBrush}"
+                BorderBrush="#3B404A"
+                BorderThickness="0,1,0,0"
+                Padding="10,7,10,9">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid Grid.Row="0" Margin="2,0,2,5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="58" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="70" />
+                    </Grid.ColumnDefinitions>
+
+                    <TextBlock x:Name="CurrentTimeText"
+                               Grid.Column="0"
+                               VerticalAlignment="Center"
+                               Foreground="{StaticResource TextBrush}"
+                               FontFamily="Consolas"
+                               Text="00:00" />
+
+                    <Slider x:Name="ProgressSlider"
+                            Grid.Column="1"
+                            Minimum="0"
+                            Maximum="1"
+                            SmallChange="5000"
+                            LargeChange="30000"
+                            IsEnabled="False"
+                            IsMoveToPointEnabled="True"
+                            ValueChanged="ProgressSlider_ValueChanged"
+                            ToolTip="Позиція відтворення" />
+
+                    <TextBlock x:Name="TotalTimeText"
+                               Grid.Column="2"
+                               VerticalAlignment="Center"
+                               HorizontalAlignment="Right"
+                               Foreground="{StaticResource MutedTextBrush}"
+                               FontFamily="Consolas"
+                               Text="00:00" />
+                </Grid>
+
+                <Grid Grid.Row="1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="12" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="140" />
+                        <ColumnDefinition Width="48" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <Button Grid.Column="0"
+                            Content="Відкрити файл"
+                            Click="OpenFileButton_Click"
+                            ToolTip="Відкрити відеофайл (Ctrl+O)"
+                            AutomationProperties.Name="Відкрити файл" />
+
+                    <Button x:Name="PlayPauseButton"
+                            Grid.Column="1"
+                            MinWidth="48"
+                            FontSize="17"
+                            Content="▶"
+                            IsEnabled="False"
+                            Click="PlayPauseButton_Click"
+                            ToolTip="Відтворити (Space)"
+                            AutomationProperties.Name="Відтворити або призупинити" />
+
+                    <Button x:Name="StopButton"
+                            Grid.Column="2"
+                            MinWidth="48"
+                            FontSize="16"
+                            Content="■"
+                            IsEnabled="False"
+                            Click="StopButton_Click"
+                            ToolTip="Зупинити"
+                            AutomationProperties.Name="Зупинити" />
+
+                    <Button x:Name="MuteButton"
+                            Grid.Column="4"
+                            MinWidth="48"
+                            FontSize="17"
+                            Content="🔊"
+                            IsEnabled="False"
+                            Click="MuteButton_Click"
+                            ToolTip="Вимкнути звук (M)"
+                            AutomationProperties.Name="Вимкнути або увімкнути звук" />
+
+                    <Slider x:Name="VolumeSlider"
+                            Grid.Column="5"
+                            Minimum="0"
+                            Maximum="100"
+                            Value="100"
+                            TickFrequency="5"
+                            IsEnabled="False"
+                            ValueChanged="VolumeSlider_ValueChanged"
+                            ToolTip="Гучність" />
+
+                    <TextBlock x:Name="VolumeValueText"
+                               Grid.Column="6"
+                               VerticalAlignment="Center"
+                               HorizontalAlignment="Right"
+                               Foreground="{StaticResource MutedTextBrush}"
+                               Text="100%" />
+
+                    <Button x:Name="FullscreenButton"
+                            Grid.Column="8"
+                            MinWidth="48"
+                            FontSize="19"
+                            Content="⛶"
+                            IsEnabled="False"
+                            Click="FullscreenButton_Click"
+                            ToolTip="Повноекранний режим (F або F11)"
+                            AutomationProperties.Name="Повноекранний режим" />
+                </Grid>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
