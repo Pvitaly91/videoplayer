@@ -1,5 +1,7 @@
 #include "LibVlcRuntime.h"
 
+#include "PrivacyPolicy.h"
+
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -246,6 +248,11 @@ bool LibVlcRuntime::Load(std::wstring& error) noexcept {
         RESOLVE(mediaPlayerSetHwnd, libvlc_media_player_set_hwnd)
         RESOLVE(videoSetKeyInput, libvlc_video_set_key_input)
         RESOLVE(videoSetMouseInput, libvlc_video_set_mouse_input)
+        RESOLVE(videoSetCallbacks, libvlc_video_set_callbacks)
+        RESOLVE(videoSetFormatCallbacks, libvlc_video_set_format_callbacks)
+        RESOLVE(videoGetSize, libvlc_video_get_size)
+        RESOLVE(videoSetCropGeometry, libvlc_video_set_crop_geometry)
+        RESOLVE(videoSetScale, libvlc_video_set_scale)
         RESOLVE(mediaPlayerPlay, libvlc_media_player_play)
         RESOLVE(mediaPlayerSetPause, libvlc_media_player_set_pause)
         RESOLVE(mediaPlayerStop, libvlc_media_player_stop)
@@ -300,9 +307,10 @@ int RunLibVlcSelfTest(std::wstring& error) noexcept {
         }
 
         const LibVlcRuntime::Api& api = runtime.Functions();
-        const char* const arguments[] = {"--no-video-title-show"};
         std::unique_ptr<libvlc_instance_t, InstanceReleaser> instance(
-            api.newInstance(1, arguments),
+            api.newInstance(
+                static_cast<int>(kPrivateLibVlcArguments.size()),
+                kPrivateLibVlcArguments.data()),
             InstanceReleaser{api.releaseInstance});
         if (!instance) {
             error = L"libvlc_new failed.";
@@ -321,6 +329,14 @@ int RunLibVlcSelfTest(std::wstring& error) noexcept {
         if (!player) {
             error = L"libvlc_media_player_new failed.";
             return 4;
+        }
+
+        std::unique_ptr<libvlc_media_player_t, PlayerReleaser> previewPlayer(
+            api.mediaPlayerNew(instance.get()),
+            PlayerReleaser{api.mediaPlayerRelease});
+        if (!previewPlayer) {
+            error = L"Could not create the preview media player.";
+            return 5;
         }
         return 0;
     } catch (...) {

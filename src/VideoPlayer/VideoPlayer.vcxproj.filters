@@ -21,8 +21,15 @@
     <ClCompile Include="PathUtils.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PlaybackMath.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PlayerEngine.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PreviewCache.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PreviewEngine.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PreviewMath.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PreviewPopup.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="SelectionOverlay.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="TimeFormatter.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ToolbarVisibility.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="Utf8.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="VideoGeometry.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="App.h"><Filter>Header Files</Filter></ClInclude>
@@ -32,10 +39,20 @@
     <ClInclude Include="PlaybackMath.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PlaybackState.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PlayerEngine.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PreviewCache.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PreviewEngine.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PreviewFrame.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PreviewMath.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PreviewPopup.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PrivacyPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Resource.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="SelectionOverlay.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="targetver.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="TimeFormatter.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ToolbarVisibility.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Utf8.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="VideoGeometry.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ZoomState.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="VideoPlayer.rc"><Filter>Resource Files</Filter></ResourceCompile>

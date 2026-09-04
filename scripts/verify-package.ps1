@@ -79,13 +79,116 @@ function Find-DumpBin {
     throw 'dumpbin.exe was not found in the selected Visual Studio installation.'
 }
 
+function Remove-CppComments {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    # Preserve quoted literals while blanking comments. This keeps a forbidden
+    # filename inside a real runtime string detectable, but words in explanatory
+    # comments (including PrivacyPolicy.h) cannot create false positives.
+    $literalOrComment = @'
+(?<literal>(?:u8|[uUL])?"(?:\\.|[^"\\])*"|(?:u8|[uUL])?'(?:\\.|[^'\\])*')|(?<comment>//[^\r\n]*|/\*[\s\S]*?\*/)
+'@
+    return [regex]::Replace($Text, $literalOrComment, {
+        param($match)
+        if (-not $match.Groups['comment'].Success) {
+            return $match.Value
+        }
+        return [regex]::Replace($match.Value, '[^\r\n]', ' ')
+    })
+}
+
+function Assert-PrivateProductionSource {
+    $sourceRoot = Join-Path $repositoryRoot 'src\VideoPlayer'
+    if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) {
+        throw "Production source directory is missing: $sourceRoot"
+    }
+
+    $sourceFiles = @(Get-ChildItem -LiteralPath $sourceRoot -File -Recurse | Where-Object {
+        $_.Extension.ToLowerInvariant() -in @('.cpp', '.cxx', '.h', '.hpp', '.rc')
+    })
+    if ($sourceFiles.Count -eq 0) {
+        throw "No production source files were found under $sourceRoot."
+    }
+
+    $forbiddenSourcePatterns = [ordered]@{
+        'Windows Recent Items API' = '\bSHAddToRecentDocs(?:A|W)?\b'
+        'Jump List destination-list API' = '\b(?:ICustomDestinationList|IApplicationDestinations|ApplicationDestinations)\b'
+        'registry key creation API' = '\bRegCreateKey(?:Ex)?(?:A|W)?\b'
+        'registry value write API' = '\bRegSetValue(?:Ex)?(?:A|W)?\b'
+        'C++ output file stream' = '\bstd\s*::\s*(?:o|wo|basic_o)fstream\b'
+        'write-capable Win32 file access' = '\bGENERIC_WRITE\b'
+        'Win32 file-write API' = '\bWriteFile(?:Ex)?\b'
+        'Win32 file-creation disposition' = '\b(?:CREATE_ALWAYS|CREATE_NEW|OPEN_ALWAYS|TRUNCATE_EXISTING)\b'
+        'temporary-file API' = '\b(?:GetTempPath|GetTempFileName)(?:A|W)?\b'
+        'LibVLC snapshot-to-disk API' = '\blibvlc_video_take_snapshot\b'
+        'runtime persistence filename' = '(?i)(?:recent\.json|history\.json|settings\.json|config\.ini|playback-history)'
+        'disk preview-cache path' = '(?i)(?:preview-cache|[\\/]thumbnails?[\\/])'
+    }
+    foreach ($sourceFile in $sourceFiles) {
+        $relativeName = $sourceFile.FullName.Substring($sourceRoot.Length).TrimStart('\')
+        $sourceText = Remove-CppComments -Text ([IO.File]::ReadAllText($sourceFile.FullName))
+        foreach ($entry in $forbiddenSourcePatterns.GetEnumerator()) {
+            $match = [regex]::Match($sourceText, [string]$entry.Value)
+            if ($match.Success) {
+                $sampleStart = [Math]::Max(0, $match.Index - 40)
+                $sampleLength = [Math]::Min(120, $sourceText.Length - $sampleStart)
+                $sample = $sourceText.Substring($sampleStart, $sampleLength).Replace("`r", ' ').Replace("`n", ' ').Trim()
+                throw "Production source contains forbidden $($entry.Key) in $relativeName`: $sample"
+            }
+        }
+    }
+
+    $privacyPolicyPath = Join-Path $sourceRoot 'PrivacyPolicy.h'
+    $mainWindowPath = Join-Path $sourceRoot 'MainWindow.cpp'
+    $playerEnginePath = Join-Path $sourceRoot 'PlayerEngine.cpp'
+    $previewEnginePath = Join-Path $sourceRoot 'PreviewEngine.cpp'
+    foreach ($requiredSource in @($privacyPolicyPath, $mainWindowPath, $playerEnginePath, $previewEnginePath)) {
+        if (-not (Test-Path -LiteralPath $requiredSource -PathType Leaf)) {
+            throw "Privacy-critical production source is missing: $requiredSource"
+        }
+    }
+
+    $privacyPolicy = Remove-CppComments -Text ([IO.File]::ReadAllText($privacyPolicyPath))
+    foreach ($requiredToken in @(
+        'OFN_DONTADDTORECENT',
+        '--ignore-config',
+        '--no-media-library',
+        '--no-video-title-show')) {
+        if ($privacyPolicy.IndexOf($requiredToken, [StringComparison]::Ordinal) -lt 0) {
+            throw "PrivacyPolicy.h is missing required token: $requiredToken"
+        }
+    }
+
+    $mainWindowSource = Remove-CppComments -Text ([IO.File]::ReadAllText($mainWindowPath))
+    if ($mainWindowSource -notmatch '\bkPrivateOpenDialogFlags\b') {
+        throw 'GetOpenFileNameW does not consume kPrivateOpenDialogFlags/OFN_DONTADDTORECENT.'
+    }
+    foreach ($playerSourcePath in @($playerEnginePath, $previewEnginePath)) {
+        $playerSource = Remove-CppComments -Text ([IO.File]::ReadAllText($playerSourcePath))
+        if ($playerSource -notmatch '\bkPrivateLibVlcArguments\b') {
+            throw "LibVLC player does not consume the shared private arguments: $playerSourcePath"
+        }
+    }
+
+    Write-Host "Static no-history source verification passed ($($sourceFiles.Count) production files)."
+}
+
 function Test-BannedRelativePath {
     param([Parameter(Mandatory = $true)][string]$RelativePath)
 
-    $normalized = $RelativePath.Replace('/', '\').TrimStart('\').ToLowerInvariant()
+    $normalized = $RelativePath.Replace('/', '\').TrimStart('\').TrimEnd('\').ToLowerInvariant()
     $leaf = [IO.Path]::GetFileName($normalized)
     if ($normalized -eq 'copying.lib') {
         return $false
+    }
+    $segments = @($normalized -split '\\')
+    if ($segments | Where-Object { $_ -in @('history', 'recent', 'settings', 'preview-cache', 'thumbnails', 'log', 'logs') }) {
+        return $true
+    }
+    if ($leaf -match '^(?:history|recent|settings)(?:\.|$)' -or
+        $leaf -eq 'config.ini' -or
+        $leaf -match '\.(?:db|log|tmp)$') {
+        return $true
     }
     if ($leaf -in @('vlc.exe', 'vlc-cache-gen.exe', 'uninstall.exe', 'install.exe', 'setup.exe', 'dotnet.exe', 'hostfxr.dll', 'hostpolicy.dll', 'coreclr.dll', 'clrjit.dll', 'libvlcsharp.dll')) {
         return $true
@@ -105,6 +208,8 @@ function Test-BannedRelativePath {
     }
     return $false
 }
+
+Assert-PrivateProductionSource
 
 Assert-Path -Path $packageDirectory -Kind Container
 Assert-Path -Path $application -Kind Leaf
@@ -161,8 +266,8 @@ foreach ($file in Get-ChildItem -LiteralPath $packageDirectory -File -Recurse) {
 }
 foreach ($directory in Get-ChildItem -LiteralPath $packageDirectory -Directory -Recurse) {
     $relative = $directory.FullName.Substring($packagePrefix.Length)
-    if ($relative -match '(^|[\\/])(sdk|msi|obj|\.vs|debug|release)($|[\\/])') {
-        throw "Development or installer directory in portable folder: $relative"
+    if (Test-BannedRelativePath -RelativePath $relative) {
+        throw "Banned directory in portable folder: $relative"
     }
 }
 
@@ -228,4 +333,4 @@ if ($dependents -match '(?i)\b(?:MSVCP|VCRUNTIME)140(?:_[0-9]+)?\.DLL\b') {
 
 Write-Host $dependents.Trim()
 $scope = if ($FolderOnly) { 'portable folder' } else { 'portable folder and ZIP' }
-Write-Host "Package verification passed for $Platform ($expectedMachineName): $scope; self-test returned 0 and no dynamic MSVC runtime import was found."
+Write-Host "Package verification passed for $Platform ($expectedMachineName): source is no-history clean; $scope contains no persistence artifacts; self-test returned 0 and no dynamic MSVC runtime import was found."

@@ -61,6 +61,28 @@ using LibVlcMediaPlayerSetMedia = void(__cdecl*)(libvlc_media_player_t*, libvlc_
 using LibVlcMediaPlayerSetHwnd = void(__cdecl*)(libvlc_media_player_t*, void*);
 using LibVlcVideoSetKeyInput = void(__cdecl*)(libvlc_media_player_t*, unsigned);
 using LibVlcVideoSetMouseInput = void(__cdecl*)(libvlc_media_player_t*, unsigned);
+using LibVlcVideoLockCallback = void*(__cdecl*)(void*, void**);
+using LibVlcVideoUnlockCallback =
+    void(__cdecl*)(void*, void*, void* const*);
+using LibVlcVideoDisplayCallback = void(__cdecl*)(void*, void*);
+using LibVlcVideoFormatCallback =
+    unsigned(__cdecl*)(void**, char*, unsigned*, unsigned*, unsigned*, unsigned*);
+using LibVlcVideoCleanupCallback = void(__cdecl*)(void*);
+using LibVlcVideoSetCallbacks = void(__cdecl*)(
+    libvlc_media_player_t*,
+    LibVlcVideoLockCallback,
+    LibVlcVideoUnlockCallback,
+    LibVlcVideoDisplayCallback,
+    void*);
+using LibVlcVideoSetFormatCallbacks = void(__cdecl*)(
+    libvlc_media_player_t*,
+    LibVlcVideoFormatCallback,
+    LibVlcVideoCleanupCallback);
+using LibVlcVideoGetSize =
+    int(__cdecl*)(libvlc_media_player_t*, unsigned, unsigned*, unsigned*);
+using LibVlcVideoSetCropGeometry =
+    void(__cdecl*)(libvlc_media_player_t*, const char*);
+using LibVlcVideoSetScale = void(__cdecl*)(libvlc_media_player_t*, float);
 using LibVlcMediaPlayerPlay = int(__cdecl*)(libvlc_media_player_t*);
 using LibVlcMediaPlayerSetPause = void(__cdecl*)(libvlc_media_player_t*, int);
 using LibVlcMediaPlayerStop = void(__cdecl*)(libvlc_media_player_t*);
@@ -93,6 +115,11 @@ public:
         LibVlcMediaPlayerSetHwnd mediaPlayerSetHwnd = nullptr;
         LibVlcVideoSetKeyInput videoSetKeyInput = nullptr;
         LibVlcVideoSetMouseInput videoSetMouseInput = nullptr;
+        LibVlcVideoSetCallbacks videoSetCallbacks = nullptr;
+        LibVlcVideoSetFormatCallbacks videoSetFormatCallbacks = nullptr;
+        LibVlcVideoGetSize videoGetSize = nullptr;
+        LibVlcVideoSetCropGeometry videoSetCropGeometry = nullptr;
+        LibVlcVideoSetScale videoSetScale = nullptr;
         LibVlcMediaPlayerPlay mediaPlayerPlay = nullptr;
         LibVlcMediaPlayerSetPause mediaPlayerSetPause = nullptr;
         LibVlcMediaPlayerStop mediaPlayerStop = nullptr;

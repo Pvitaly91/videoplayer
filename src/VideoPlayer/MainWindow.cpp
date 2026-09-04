@@ -3,12 +3,16 @@
 
 #include "PlaybackMath.h"
 #include "PathUtils.h"
+#include "PreviewMath.h"
+#include "PrivacyPolicy.h"
 #include "Resource.h"
 #include "TimeFormatter.h"
+#include "ToolbarVisibility.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <windowsx.h>
 
 #include <algorithm>
 #include <array>
@@ -24,6 +28,7 @@ namespace {
 
 constexpr wchar_t kWindowClassName[] = L"VideoPlayer.MainWindow";
 constexpr wchar_t kVideoClassName[] = L"VideoPlayer.VideoSurface";
+constexpr wchar_t kControlBarClassName[] = L"VideoPlayer.ControlBar";
 constexpr wchar_t kApplicationTitle[] = L"VideoPlayer";
 constexpr wchar_t kDropPrompt[] =
     L"Перетягніть відеофайл сюди або натисніть “Відкрити”";
@@ -33,13 +38,18 @@ constexpr wchar_t kMediaError[] =
     L"Не вдалося відтворити файл. Він може бути пошкоджений або містити непідтримуваний кодек.";
 
 constexpr UINT_PTR kUiTimer = 1;
-constexpr UINT kTimerIntervalMs = 250;
+constexpr UINT_PTR kFullscreenToolbarTimer = 2;
+constexpr UINT kUiTimerIntervalMs = 250;
+constexpr UINT kFullscreenToolbarTimerIntervalMs = 100;
+constexpr UINT_PTR kSeekSubclassId = 1;
 constexpr int kSeekRange = 10000;
 constexpr int kDefaultDpi = 96;
 constexpr int kInitialWidth = 1000;
 constexpr int kInitialHeight = 650;
-constexpr int kMinimumWidth = 640;
+constexpr int kMinimumWidth = 760;
 constexpr int kMinimumHeight = 400;
+constexpr int kControlBarHeight = 88;
+constexpr int kMinimumZoomSelectionLogicalPixels = 28;
 
 constexpr wchar_t kOpenFilter[] =
     L"Відеофайли\0*.mp4;*.avi;*.mkv;*.mov;*.m4v;*.webm;*.wmv;*.mpg;*.mpeg;*.ts;*.m2ts;*.mts;*.flv;*.3gp;*.ogv;*.vob\0"
@@ -61,15 +71,21 @@ std::wstring FileNameFromPath(const std::wstring& path) {
     return path.substr(separator + 1);
 }
 
+bool PointInsideRect(const POINT point, const RECT& rectangle) noexcept {
+    return point.x >= rectangle.left && point.x < rectangle.right &&
+        point.y >= rectangle.top && point.y < rectangle.bottom;
+}
+
 }  // namespace
 
 MainWindow::~MainWindow() {
     if (window_ != nullptr && IsWindow(window_) != FALSE) {
         DestroyWindow(window_);
     }
-    player_.Shutdown();
+    ShutdownPlaybackComponents();
     if (ownsFont_ && uiFont_ != nullptr) {
         DeleteObject(uiFont_);
+        uiFont_ = nullptr;
     }
 }
 
@@ -121,8 +137,20 @@ bool MainWindow::Create(const HINSTANCE instance, std::wstring& error) {
     player_.SetVolume(displayedVolume_);
     player_.SetMuted(false);
 
+    if (!previewPopup_.Create(window_, instance_, error) ||
+        !selectionOverlay_.Create(instance_, window_, window_, error) ||
+        !previewEngine_.Initialize(window_)) {
+        if (error.empty()) {
+            error = L"Не вдалося ініціалізувати попередній перегляд відео.";
+        }
+        DestroyWindow(window_);
+        return false;
+    }
+    previewInitialized_ = true;
+
     DragAcceptFiles(window_, TRUE);
-    SetTimer(window_, kUiTimer, kTimerIntervalMs, nullptr);
+    SetTimer(window_, kUiTimer, kUiTimerIntervalMs, nullptr);
+    lastInteractionMs_ = GetTickCount64();
     RefreshControls();
     return true;
 }
@@ -154,35 +182,32 @@ bool MainWindow::OpenFile(const std::wstring& path) {
     case MediaPathStatus::Empty:
         return false;
     case MediaPathStatus::CannotResolve:
-        MessageBoxW(
-            window_,
-            L"Не вдалося визначити повний шлях до файла.",
-            kApplicationTitle,
-            MB_OK | MB_ICONERROR);
+        MessageBoxW(window_, L"Не вдалося визначити повний шлях до файла.", kApplicationTitle, MB_OK | MB_ICONERROR);
         return false;
     case MediaPathStatus::NotFound:
-        MessageBoxW(
-            window_, L"Файл не знайдено.", kApplicationTitle, MB_OK | MB_ICONERROR);
+        MessageBoxW(window_, L"Файл не знайдено.", kApplicationTitle, MB_OK | MB_ICONERROR);
         return false;
     case MediaPathStatus::Directory:
-        MessageBoxW(
-            window_,
-            L"Вибраний шлях є каталогом. Виберіть відеофайл.",
-            kApplicationTitle,
-            MB_OK | MB_ICONERROR);
+        MessageBoxW(window_, L"Вибраний шлях є каталогом. Виберіть відеофайл.", kApplicationTitle, MB_OK | MB_ICONERROR);
         return false;
     case MediaPathStatus::Inaccessible:
-        MessageBoxW(
-            window_,
-            L"Не вдалося отримати доступ до вибраного файла.",
-            kApplicationTitle,
-            MB_OK | MB_ICONERROR);
+        MessageBoxW(window_, L"Не вдалося отримати доступ до вибраного файла.", kApplicationTitle, MB_OK | MB_ICONERROR);
         return false;
     }
 
+    ResetMediaUiState();
+    if (previewInitialized_) {
+        // Invalidate the old path/cache before the main player begins media
+        // replacement. The preview worker observes this generation gate and
+        // releases its old media independently of the main LibVLC player.
+        previewEngine_.SetMedia({}, player_.Generation());
+    }
     mediaErrorShown_ = false;
     std::wstring ignoredError;
     if (!player_.Open(ioPath, ignoredError)) {
+        if (previewInitialized_) {
+            previewEngine_.SetMedia({}, player_.Generation());
+        }
         hasMedia_ = player_.HasMedia();
         if (!hasMedia_) {
             currentPath_.clear();
@@ -197,8 +222,12 @@ bool MainWindow::OpenFile(const std::wstring& path) {
 
     currentPath_ = absolutePath;
     hasMedia_ = true;
+    if (previewInitialized_) {
+        previewEngine_.SetMedia(ioPath, player_.Generation());
+    }
     SetPromptVisible(false);
     UpdateWindowTitle();
+    RegisterInteraction();
     RefreshControls();
     return true;
 }
@@ -215,10 +244,9 @@ LRESULT CALLBACK MainWindow::StaticWindowProc(
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         self->window_ = window;
     }
-    if (self == nullptr) {
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
-    return self->HandleMessage(message, wParam, lParam);
+    return self == nullptr
+        ? DefWindowProcW(window, message, wParam, lParam)
+        : self->HandleMessage(message, wParam, lParam);
 }
 
 LRESULT CALLBACK MainWindow::StaticVideoProc(
@@ -232,10 +260,39 @@ LRESULT CALLBACK MainWindow::StaticVideoProc(
         self = static_cast<MainWindow*>(create->lpCreateParams);
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
-    if (self == nullptr) {
-        return DefWindowProcW(window, message, wParam, lParam);
+    return self == nullptr
+        ? DefWindowProcW(window, message, wParam, lParam)
+        : self->HandleVideoMessage(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK MainWindow::StaticControlBarProc(
+    const HWND window,
+    const UINT message,
+    const WPARAM wParam,
+    const LPARAM lParam) {
+    MainWindow* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* const create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        self = static_cast<MainWindow*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
-    return self->HandleVideoMessage(window, message, wParam, lParam);
+    return self == nullptr
+        ? DefWindowProcW(window, message, wParam, lParam)
+        : self->HandleControlBarMessage(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK MainWindow::StaticSeekSubclass(
+    const HWND window,
+    const UINT message,
+    const WPARAM wParam,
+    const LPARAM lParam,
+    const UINT_PTR subclassId,
+    const DWORD_PTR referenceData) {
+    UNREFERENCED_PARAMETER(subclassId);
+    MainWindow* const self = reinterpret_cast<MainWindow*>(referenceData);
+    return self == nullptr
+        ? DefSubclassProc(window, message, wParam, lParam)
+        : self->HandleSeekSubclass(window, message, wParam, lParam);
 }
 
 LRESULT MainWindow::HandleMessage(
@@ -263,21 +320,31 @@ LRESULT MainWindow::HandleMessage(
 
     case WM_COMMAND:
         if (HIWORD(wParam) == BN_CLICKED) {
+            RegisterInteraction();
             switch (LOWORD(wParam)) {
             case IDC_OPEN_BUTTON:
                 ShowOpenDialog();
+                FinishMouseControlInteraction();
                 return 0;
             case IDC_PLAY_BUTTON:
                 TogglePlayback();
+                FinishMouseControlInteraction();
                 return 0;
             case IDC_STOP_BUTTON:
                 StopPlayback();
+                FinishMouseControlInteraction();
                 return 0;
             case IDC_MUTE_BUTTON:
                 ToggleMute();
+                FinishMouseControlInteraction();
+                return 0;
+            case IDC_ZOOM_BUTTON:
+                ToggleAreaZoom();
+                FinishMouseControlInteraction();
                 return 0;
             case IDC_FULLSCREEN_BUTTON:
                 ToggleFullscreen();
+                FinishMouseControlInteraction();
                 return 0;
             default:
                 break;
@@ -288,18 +355,26 @@ LRESULT MainWindow::HandleMessage(
     case WM_HSCROLL: {
         const HWND source = reinterpret_cast<HWND>(lParam);
         const int notification = LOWORD(wParam);
+        RegisterInteraction();
         if (source == volumeSlider_) {
+            volumeDragging_ = notification != TB_ENDTRACK && GetCapture() == volumeSlider_;
             const int volume = static_cast<int>(SendMessageW(volumeSlider_, TBM_GETPOS, 0, 0));
             SetVolumeFromSlider(volume);
+            if (notification == TB_ENDTRACK) {
+                volumeDragging_ = false;
+                FinishMouseControlInteraction();
+            }
             return 0;
         }
         if (source == seekSlider_) {
             if (notification == TB_ENDTRACK) {
                 seekDragging_ = false;
                 CommitSeekFromSlider();
+                HideSeekPreview();
+                FinishMouseControlInteraction();
             } else {
-                seekDragging_ = true;
-                UpdateSeekPreview();
+                seekDragging_ = GetCapture() == seekSlider_;
+                UpdateSeekLabel();
             }
             return 0;
         }
@@ -310,6 +385,20 @@ LRESULT MainWindow::HandleMessage(
         if (wParam == kUiTimer) {
             RefreshControls();
             return 0;
+        }
+        if (wParam == kFullscreenToolbarTimer) {
+            UpdateControlBarVisibility();
+            return 0;
+        }
+        break;
+
+    case WM_MOUSEMOVE:
+        RegisterInteraction(true);
+        return 0;
+
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE) {
+            RegisterInteraction();
         }
         break;
 
@@ -323,21 +412,30 @@ LRESULT MainWindow::HandleMessage(
             static_cast<std::uint32_t>(lParam));
         return 0;
 
+    case kPreviewFrameReadyMessage:
+        HandlePreviewResult();
+        return 0;
+
+    case kSelectionOverlayMessage:
+        HandleSelectionOverlay(
+            static_cast<SelectionOverlayEvent>(wParam),
+            reinterpret_cast<const SelectionOverlayResult*>(lParam));
+        return 0;
+
     case WM_CLOSE:
         DestroyWindow(window_);
         return 0;
 
     case WM_DESTROY:
         KillTimer(window_, kUiTimer);
+        KillTimer(window_, kFullscreenToolbarTimer);
         DragAcceptFiles(window_, FALSE);
         RestoreExecutionState();
-        player_.Shutdown();
-        playerInitialized_ = false;
+        ShutdownPlaybackComponents();
         PostQuitMessage(0);
         return 0;
 
-    case WM_NCDESTROY:
-    {
+    case WM_NCDESTROY: {
         const HWND destroyedWindow = window_;
         SetWindowLongPtrW(destroyedWindow, GWLP_USERDATA, 0);
         const LRESULT result = DefWindowProcW(destroyedWindow, message, wParam, lParam);
@@ -348,7 +446,6 @@ LRESULT MainWindow::HandleMessage(
     default:
         break;
     }
-
     return DefWindowProcW(window_, message, wParam, lParam);
 }
 
@@ -357,9 +454,6 @@ LRESULT MainWindow::HandleVideoMessage(
     const UINT message,
     const WPARAM wParam,
     const LPARAM lParam) {
-    UNREFERENCED_PARAMETER(wParam);
-    UNREFERENCED_PARAMETER(lParam);
-
     switch (message) {
     case WM_ERASEBKGND: {
         RECT bounds{};
@@ -381,11 +475,7 @@ LRESULT MainWindow::HandleVideoMessage(
             RECT textBounds = bounds;
             const int inset = Scale(24);
             InflateRect(&textBounds, -inset, -inset);
-            DrawTextW(
-                dc,
-                kDropPrompt,
-                -1,
-                &textBounds,
+            DrawTextW(dc, kDropPrompt, -1, &textBounds,
                 DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
             SelectObject(dc, oldFont);
         }
@@ -393,17 +483,128 @@ LRESULT MainWindow::HandleVideoMessage(
         return 0;
     }
 
+    case WM_MOUSEMOVE:
+        RegisterInteraction(true);
+        return 0;
+
     case WM_LBUTTONDOWN:
+        RegisterInteraction();
         SetFocus(window_);
         return 0;
 
     case WM_LBUTTONDBLCLK:
+        RegisterInteraction();
         ToggleFullscreen();
         return 0;
 
     default:
         return DefWindowProcW(window, message, wParam, lParam);
     }
+}
+
+LRESULT MainWindow::HandleControlBarMessage(
+    const HWND window,
+    const UINT message,
+    const WPARAM wParam,
+    const LPARAM lParam) {
+    switch (message) {
+    case WM_COMMAND:
+    case WM_HSCROLL:
+        RegisterInteraction();
+        return SendMessageW(window_, message, wParam, lParam);
+
+    case WM_MOUSEMOVE:
+        RegisterInteraction(true);
+        return 0;
+
+    case WM_PARENTNOTIFY:
+        if (LOWORD(wParam) == WM_LBUTTONDOWN) {
+            switch (HIWORD(wParam)) {
+            case IDC_OPEN_BUTTON:
+            case IDC_PLAY_BUTTON:
+            case IDC_STOP_BUTTON:
+            case IDC_SEEK_SLIDER:
+            case IDC_MUTE_BUTTON:
+            case IDC_VOLUME_SLIDER:
+            case IDC_ZOOM_BUTTON:
+            case IDC_FULLSCREEN_BUTTON:
+                mouseControlInteraction_ = true;
+                break;
+            default:
+                mouseControlInteraction_ = false;
+                break;
+            }
+        }
+        break;
+
+    case WM_ERASEBKGND: {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        FillRect(
+            reinterpret_cast<HDC>(wParam),
+            &bounds,
+            reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+        return 1;
+    }
+
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        break;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT MainWindow::HandleSeekSubclass(
+    const HWND window,
+    const UINT message,
+    const WPARAM wParam,
+    const LPARAM lParam) {
+    switch (message) {
+    case WM_MOUSEMOVE: {
+        if (!seekMouseTracking_) {
+            TRACKMOUSEEVENT tracking{};
+            tracking.cbSize = sizeof(tracking);
+            tracking.dwFlags = TME_LEAVE;
+            tracking.hwndTrack = window;
+            seekMouseTracking_ = TrackMouseEvent(&tracking) != FALSE;
+        }
+        RegisterInteraction(true);
+        HandleSeekPointer(GET_X_LPARAM(lParam));
+        break;
+    }
+
+    case WM_MOUSELEAVE:
+        seekMouseTracking_ = false;
+        if (!seekDragging_) {
+            HideSeekPreview();
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        seekDragging_ = true;
+        RegisterInteraction();
+        HandleSeekPointer(GET_X_LPARAM(lParam));
+        break;
+
+    case WM_CAPTURECHANGED:
+        if (reinterpret_cast<HWND>(lParam) != window) {
+            seekDragging_ = false;
+            HideSeekPreview();
+            FinishMouseControlInteraction();
+        }
+        break;
+
+    case WM_NCDESTROY:
+        seekMouseTracking_ = false;
+        break;
+
+    default:
+        break;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
 }
 
 bool MainWindow::RegisterWindowClasses(std::wstring& error) const {
@@ -434,6 +635,19 @@ bool MainWindow::RegisterWindowClasses(std::wstring& error) const {
         error = L"Не вдалося зареєструвати область відео.";
         return false;
     }
+
+    WNDCLASSEXW controlBarClass{};
+    controlBarClass.cbSize = sizeof(controlBarClass);
+    controlBarClass.style = CS_HREDRAW | CS_VREDRAW;
+    controlBarClass.lpfnWndProc = StaticControlBarProc;
+    controlBarClass.hInstance = instance_;
+    controlBarClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    controlBarClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    controlBarClass.lpszClassName = kControlBarClassName;
+    if (RegisterClassExW(&controlBarClass) == 0 && !IsClassAlreadyRegistered()) {
+        error = L"Не вдалося зареєструвати панель керування.";
+        return false;
+    }
     return true;
 }
 
@@ -444,47 +658,60 @@ bool MainWindow::CreateChildWindows() {
         kVideoClassName,
         nullptr,
         child | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-        0,
-        0,
-        0,
-        0,
+        0, 0, 0, 0,
         window_,
         ControlId(IDC_VIDEO_SURFACE),
+        instance_,
+        this);
+    controlBar_ = CreateWindowExW(
+        0,
+        kControlBarClassName,
+        nullptr,
+        child | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        0, 0, 0, 0,
+        window_,
+        ControlId(IDC_CONTROL_BAR),
         instance_,
         this);
 
     openButton_ = CreateWindowExW(
         0, L"BUTTON", L"Відкрити", child | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 0, 0, window_, ControlId(IDC_OPEN_BUTTON), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_OPEN_BUTTON), instance_, nullptr);
     playButton_ = CreateWindowExW(
         0, L"BUTTON", L"Відтворити", child | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 0, 0, window_, ControlId(IDC_PLAY_BUTTON), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_PLAY_BUTTON), instance_, nullptr);
     stopButton_ = CreateWindowExW(
         0, L"BUTTON", L"Стоп", child | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 0, 0, window_, ControlId(IDC_STOP_BUTTON), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_STOP_BUTTON), instance_, nullptr);
     seekSlider_ = CreateWindowExW(
         0, TRACKBAR_CLASSW, nullptr, child | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-        0, 0, 0, 0, window_, ControlId(IDC_SEEK_SLIDER), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_SEEK_SLIDER), instance_, nullptr);
     currentTimeLabel_ = CreateWindowExW(
         0, L"STATIC", L"00:00", child | SS_CENTER | SS_CENTERIMAGE,
-        0, 0, 0, 0, window_, ControlId(IDC_CURRENT_TIME), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_CURRENT_TIME), instance_, nullptr);
     durationLabel_ = CreateWindowExW(
         0, L"STATIC", L"00:00", child | SS_CENTER | SS_CENTERIMAGE,
-        0, 0, 0, 0, window_, ControlId(IDC_DURATION), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_DURATION), instance_, nullptr);
     muteButton_ = CreateWindowExW(
         0, L"BUTTON", L"Без звуку", child | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 0, 0, window_, ControlId(IDC_MUTE_BUTTON), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_MUTE_BUTTON), instance_, nullptr);
     volumeSlider_ = CreateWindowExW(
         0, TRACKBAR_CLASSW, nullptr, child | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-        0, 0, 0, 0, window_, ControlId(IDC_VOLUME_SLIDER), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_VOLUME_SLIDER), instance_, nullptr);
+    zoomButton_ = CreateWindowExW(
+        0, L"BUTTON", L"Зум області", child | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 0, 0, controlBar_, ControlId(IDC_ZOOM_BUTTON), instance_, nullptr);
     fullscreenButton_ = CreateWindowExW(
         0, L"BUTTON", L"На весь екран", child | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 0, 0, window_, ControlId(IDC_FULLSCREEN_BUTTON), instance_, nullptr);
+        0, 0, 0, 0, controlBar_, ControlId(IDC_FULLSCREEN_BUTTON), instance_, nullptr);
 
-    const std::array<HWND, 10> controls{
-        videoWindow_, openButton_, playButton_, stopButton_, seekSlider_,
-        currentTimeLabel_, durationLabel_, muteButton_, volumeSlider_, fullscreenButton_};
-    if (std::any_of(controls.begin(), controls.end(), [](const HWND control) { return control == nullptr; })) {
+    const std::array<HWND, 12> controls{
+        videoWindow_, controlBar_, openButton_, playButton_, stopButton_, seekSlider_,
+        currentTimeLabel_, durationLabel_, muteButton_, volumeSlider_, zoomButton_,
+        fullscreenButton_};
+    if (std::any_of(
+            controls.begin(), controls.end(),
+            [](const HWND control) { return control == nullptr; })) {
         return false;
     }
 
@@ -493,6 +720,11 @@ bool MainWindow::CreateChildWindows() {
     SendMessageW(seekSlider_, TBM_SETPAGESIZE, 0, 100);
     SendMessageW(seekSlider_, TBM_SETPOS, TRUE, 0);
     EnableWindow(seekSlider_, FALSE);
+    if (SetWindowSubclass(
+            seekSlider_, StaticSeekSubclass, kSeekSubclassId,
+            reinterpret_cast<DWORD_PTR>(this)) == FALSE) {
+        return false;
+    }
 
     SendMessageW(volumeSlider_, TBM_SETRANGEMIN, FALSE, 0);
     SendMessageW(volumeSlider_, TBM_SETRANGEMAX, FALSE, 100);
@@ -526,42 +758,48 @@ void MainWindow::ApplySystemFont() {
         uiFont_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     }
 
-    const std::array<HWND, 9> controls{
+    const std::array<HWND, 10> controls{
         openButton_, playButton_, stopButton_, seekSlider_, currentTimeLabel_,
-        durationLabel_, muteButton_, volumeSlider_, fullscreenButton_};
+        durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_};
     for (const HWND control : controls) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
     }
 }
 
-void MainWindow::LayoutChildren(const int width, const int height) const {
-    if (videoWindow_ == nullptr) {
+void MainWindow::LayoutChildren(const int width, const int height) {
+    if (videoWindow_ == nullptr || controlBar_ == nullptr) {
         return;
     }
 
-    const int panelHeight = Scale(88);
-    const int videoHeight = std::max(0, height - panelHeight);
-    MoveWindow(videoWindow_, 0, 0, width, videoHeight, TRUE);
+    const int panelHeight = Scale(kControlBarHeight);
+    const int panelTop = (std::max)(0, height - panelHeight);
+    const int videoHeight = fullscreen_ ? height : panelTop;
+    MoveWindow(videoWindow_, 0, 0, width, (std::max)(0, videoHeight), TRUE);
+    SetWindowPos(
+        controlBar_, HWND_TOP, 0, panelTop, width, panelHeight,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 
     const int margin = Scale(8);
     const int gap = Scale(6);
     const int rowHeight = Scale(28);
     const int timeWidth = Scale(60);
-    const int firstRowY = videoHeight + Scale(7);
+    const int firstRowY = Scale(7);
     const int sliderX = margin + timeWidth + gap;
-    const int sliderWidth = std::max(0, width - (2 * margin) - (2 * timeWidth) - (2 * gap));
+    const int sliderWidth = (std::max)(
+        0, width - (2 * margin) - (2 * timeWidth) - (2 * gap));
 
     MoveWindow(currentTimeLabel_, margin, firstRowY, timeWidth, rowHeight, TRUE);
     MoveWindow(seekSlider_, sliderX, firstRowY, sliderWidth, rowHeight, TRUE);
     MoveWindow(durationLabel_, width - margin - timeWidth, firstRowY, timeWidth, rowHeight, TRUE);
 
-    const int secondRowY = videoHeight + Scale(48);
-    const int openWidth = Scale(80);
-    const int playWidth = Scale(96);
-    const int stopWidth = Scale(58);
-    const int muteWidth = Scale(92);
-    const int volumeWidth = Scale(110);
-    const int fullscreenWidth = Scale(118);
+    const int secondRowY = Scale(48);
+    const int openWidth = Scale(76);
+    const int playWidth = Scale(92);
+    const int stopWidth = Scale(54);
+    const int muteWidth = Scale(86);
+    const int volumeWidth = Scale(92);
+    const int zoomWidth = Scale(106);
+    const int fullscreenWidth = Scale(116);
 
     int left = margin;
     MoveWindow(openButton_, left, secondRowY, openWidth, rowHeight, TRUE);
@@ -573,10 +811,18 @@ void MainWindow::LayoutChildren(const int width, const int height) const {
     int right = width - margin;
     right -= fullscreenWidth;
     MoveWindow(fullscreenButton_, right, secondRowY, fullscreenWidth, rowHeight, TRUE);
+    right -= gap + zoomWidth;
+    MoveWindow(zoomButton_, right, secondRowY, zoomWidth, rowHeight, TRUE);
     right -= gap + volumeWidth;
     MoveWindow(volumeSlider_, right, secondRowY, volumeWidth, rowHeight, TRUE);
     right -= gap + muteWidth;
     MoveWindow(muteButton_, right, secondRowY, muteWidth, rowHeight, TRUE);
+
+    if (fullscreen_ && controlBarVisible_) {
+        SetWindowPos(
+            controlBar_, HWND_TOP, 0, panelTop, width, panelHeight,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    }
 }
 
 int MainWindow::Scale(const int value) const noexcept {
@@ -588,7 +834,8 @@ bool MainWindow::ProcessKeyboardMessage(const MSG& message) {
         return false;
     }
     if (window_ == nullptr ||
-        (message.hwnd != window_ && GetAncestor(message.hwnd, GA_ROOT) != window_)) {
+        (message.hwnd != window_ && GetAncestor(message.hwnd, GA_ROOTOWNER) != window_ &&
+         GetAncestor(message.hwnd, GA_ROOT) != window_)) {
         return false;
     }
     if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
@@ -632,6 +879,11 @@ bool MainWindow::HandleHotKey(
             ToggleMute();
         }
         return true;
+    case 'Z':
+        if (!repeated) {
+            ToggleAreaZoom();
+        }
+        return true;
     case 'F':
     case VK_F11:
         if (!repeated) {
@@ -639,13 +891,11 @@ bool MainWindow::HandleHotKey(
         }
         return true;
     case VK_ESCAPE:
-        if (fullscreen_) {
-            if (!repeated) {
-                ExitFullscreen();
-            }
+        if (!repeated && (zoomState_ != ZoomState::None || fullscreen_)) {
+            HandleZoomEscape();
             return true;
         }
-        return false;
+        return zoomState_ != ZoomState::None || fullscreen_;
     default:
         return false;
     }
@@ -661,17 +911,13 @@ void MainWindow::ShowOpenDialog() {
     dialog.lpstrFile = fileName.data();
     dialog.nMaxFile = static_cast<DWORD>(fileName.size());
     dialog.lpstrTitle = L"Відкрити відеофайл";
-    dialog.Flags =
-        OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
-        OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    dialog.Flags = kPrivateOpenDialogFlags;
     if (GetOpenFileNameW(&dialog) != FALSE) {
         OpenFile(fileName.data());
     } else if (CommDlgExtendedError() != 0) {
         MessageBoxW(
-            window_,
-            L"Не вдалося відкрити діалог вибору файла.",
-            kApplicationTitle,
-            MB_OK | MB_ICONERROR);
+            window_, L"Не вдалося відкрити діалог вибору файла.",
+            kApplicationTitle, MB_OK | MB_ICONERROR);
     }
 }
 
@@ -691,6 +937,7 @@ void MainWindow::TogglePlayback() {
     if (!hasMedia_) {
         return;
     }
+    RegisterInteraction();
     if (player_.State() == PlaybackState::Playing) {
         player_.Pause();
         RestoreExecutionState();
@@ -707,6 +954,7 @@ void MainWindow::StopPlayback() {
     if (!hasMedia_) {
         return;
     }
+    RegisterInteraction();
     player_.Stop();
     RestoreExecutionState();
     SendMessageW(seekSlider_, TBM_SETPOS, TRUE, 0);
@@ -717,10 +965,11 @@ void MainWindow::SeekBy(const std::int64_t deltaMs) {
     if (!hasMedia_ || !player_.IsSeekable()) {
         return;
     }
-    const std::int64_t duration = std::max<std::int64_t>(0, player_.DurationMs());
+    const std::int64_t duration = (std::max<std::int64_t>)(0, player_.DurationMs());
     if (duration <= 0) {
         return;
     }
+    RegisterInteraction();
     const std::int64_t current = ClampTime(player_.PositionMs(), duration);
     const std::int64_t target = videoplayer::SeekBy(current, deltaMs, duration);
     player_.Seek(target);
@@ -736,18 +985,99 @@ void MainWindow::CommitSeekFromSlider() {
     if (duration <= 0) {
         return;
     }
-    const int sliderPosition = static_cast<int>(SendMessageW(seekSlider_, TBM_GETPOS, 0, 0));
+    const int sliderPosition = static_cast<int>(
+        SendMessageW(seekSlider_, TBM_GETPOS, 0, 0));
     const std::int64_t target = SliderToTime(sliderPosition, duration);
     player_.Seek(target);
     SetWindowTextW(currentTimeLabel_, videoplayer::FormatTime(target).c_str());
 }
 
-void MainWindow::UpdateSeekPreview() {
+void MainWindow::UpdateSeekLabel() {
     const std::int64_t duration = player_.DurationMs();
-    const int sliderPosition = static_cast<int>(SendMessageW(seekSlider_, TBM_GETPOS, 0, 0));
+    const int sliderPosition = static_cast<int>(
+        SendMessageW(seekSlider_, TBM_GETPOS, 0, 0));
     SetWindowTextW(
         currentTimeLabel_,
         videoplayer::FormatTime(SliderToTime(sliderPosition, duration)).c_str());
+}
+
+void MainWindow::HandleSeekPointer(const int mouseX) {
+    if (!hasMedia_ || !player_.IsSeekable() || !previewInitialized_) {
+        HideSeekPreview();
+        return;
+    }
+    const std::int64_t duration = player_.DurationMs();
+    if (duration <= 0) {
+        HideSeekPreview();
+        return;
+    }
+
+    RECT channel{};
+    SendMessageW(seekSlider_, TBM_GETCHANNELRECT, 0, reinterpret_cast<LPARAM>(&channel));
+    previewHoverTimeMs_ = PreviewTimeFromChannelX(mouseX, channel, duration);
+    POINT anchor{mouseX, channel.top};
+    ClientToScreen(seekSlider_, &anchor);
+    previewAnchorScreen_ = anchor;
+    const std::uint32_t generation = player_.Generation();
+    const std::int64_t quantized = QuantizePreviewTimestamp(
+        previewHoverTimeMs_, duration);
+    const bool sameRequest = previewRequestId_ != 0 &&
+        previewRequestGeneration_ == generation &&
+        previewRequestTimestampMs_ == quantized;
+    if (sameRequest) {
+        if (previewDisplayedFrame_) {
+            previewPopup_.ShowFrameAt(
+                previewAnchorScreen_, dpi_, previewHoverTimeMs_, previewDisplayedFrame_);
+        } else {
+            previewPopup_.ShowPlaceholderAt(
+                previewAnchorScreen_, dpi_, previewHoverTimeMs_);
+        }
+        return;
+    }
+
+    previewRequestGeneration_ = generation;
+    previewRequestTimestampMs_ = quantized;
+    if (previewDisplayedFrame_) {
+        previewPopup_.ShowFrameAt(
+            previewAnchorScreen_, dpi_, previewHoverTimeMs_, previewDisplayedFrame_);
+    } else {
+        previewPopup_.ShowPlaceholderAt(
+            previewAnchorScreen_, dpi_, previewHoverTimeMs_);
+    }
+    previewRequestId_ = previewEngine_.RequestFrame(previewHoverTimeMs_, duration);
+}
+
+void MainWindow::HideSeekPreview(const bool cancelRequest) noexcept {
+    if (cancelRequest && previewInitialized_) {
+        previewEngine_.CancelRequests();
+    }
+    previewRequestId_ = 0;
+    previewDisplayedRequestId_ = 0;
+    previewRequestGeneration_ = 0;
+    previewRequestTimestampMs_ = -1;
+    previewDisplayedFrame_.reset();
+    previewPopup_.Hide();
+}
+
+void MainWindow::HandlePreviewResult() {
+    if (!previewInitialized_) {
+        return;
+    }
+    const auto result = previewEngine_.TakeLatestResult();
+    if (!result.has_value() || previewRequestId_ == 0 ||
+        result->requestId > previewRequestId_ ||
+        result->requestId <= previewDisplayedRequestId_ ||
+        result->mediaGeneration != previewRequestGeneration_ ||
+        result->mediaGeneration != player_.Generation() ||
+        !previewPopup_.IsVisible()) {
+        return;
+    }
+    if (result->frame && result->frame->IsValid()) {
+        previewDisplayedRequestId_ = result->requestId;
+        previewDisplayedFrame_ = result->frame;
+        previewPopup_.ShowFrameAt(
+            previewAnchorScreen_, dpi_, previewHoverTimeMs_, previewDisplayedFrame_);
+    }
 }
 
 void MainWindow::SetVolumeFromSlider(const int volume) {
@@ -768,13 +1098,15 @@ void MainWindow::SetVolumeFromSlider(const int volume) {
 void MainWindow::AdjustVolume(const int delta) {
     const int base = muted_ ? 0 : displayedVolume_;
     const int adjusted = ClampVolume(base + delta);
+    RegisterInteraction();
     SendMessageW(volumeSlider_, TBM_SETPOS, TRUE, adjusted);
     SetVolumeFromSlider(adjusted);
 }
 
 void MainWindow::ToggleMute() {
+    RegisterInteraction();
     if (muted_) {
-        const int restored = std::max(1, ClampVolume(lastNonZeroVolume_));
+        const int restored = (std::max)(1, ClampVolume(lastNonZeroVolume_));
         displayedVolume_ = restored;
         muted_ = false;
         player_.SetVolume(restored);
@@ -803,6 +1135,11 @@ void MainWindow::EnterFullscreen() {
     if (fullscreen_ || window_ == nullptr) {
         return;
     }
+    if (zoomState_ == ZoomState::Selecting) {
+        selectionOverlay_.Cancel();
+        zoomState_ = ZoomState::None;
+        SetWindowTextW(zoomButton_, L"Зум області");
+    }
 
     savedPlacement_.length = sizeof(savedPlacement_);
     if (GetWindowPlacement(window_, &savedPlacement_) == FALSE) {
@@ -825,16 +1162,24 @@ void MainWindow::EnterFullscreen() {
     SetWindowLongPtrW(window_, GWL_STYLE, fullscreenStyle);
     SetWindowLongPtrW(window_, GWL_EXSTYLE, fullscreenExtendedStyle);
     fullscreen_ = true;
+    toolbarWasFullscreen_ = false;
+    controlBarVisible_ = true;
+    lastInteractionMs_ = GetTickCount64();
+    SetTimer(
+        window_, kFullscreenToolbarTimer,
+        kFullscreenToolbarTimerIntervalMs, nullptr);
 
     SetWindowPos(
-        window_,
-        HWND_TOP,
+        window_, HWND_TOP,
         monitorInfo.rcMonitor.left,
         monitorInfo.rcMonitor.top,
         monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
         monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     SetWindowTextW(fullscreenButton_, L"Вийти з екрана");
+    SetControlBarVisible(true);
+    UpdateControlBarVisibility();
+    FinishMouseControlInteraction();
 }
 
 void MainWindow::ExitFullscreen() {
@@ -842,20 +1187,263 @@ void MainWindow::ExitFullscreen() {
         return;
     }
 
+    HideSeekPreview();
+    ResetAreaZoom();
+    KillTimer(window_, kFullscreenToolbarTimer);
+    fullscreen_ = false;
+    toolbarWasFullscreen_ = false;
+    SetControlBarVisible(true);
+
     SetWindowLongPtrW(window_, GWL_STYLE, savedStyle_);
     SetWindowLongPtrW(window_, GWL_EXSTYLE, savedExtendedStyle_);
     savedPlacement_.length = sizeof(savedPlacement_);
     SetWindowPlacement(window_, &savedPlacement_);
     SetWindowPos(
-        window_,
-        nullptr,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-    fullscreen_ = false;
+        window_, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+        SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     SetWindowTextW(fullscreenButton_, L"На весь екран");
+    RECT client{};
+    GetClientRect(window_, &client);
+    LayoutChildren(client.right, client.bottom);
+}
+
+void MainWindow::SetControlBarVisible(const bool visible) {
+    if (controlBar_ == nullptr) {
+        return;
+    }
+    if (!fullscreen_ && !visible) {
+        return;
+    }
+    const bool styleVisible =
+        (GetWindowLongPtrW(controlBar_, GWL_STYLE) & WS_VISIBLE) != 0;
+    if (controlBarVisible_ == visible && styleVisible == visible) {
+        return;
+    }
+    controlBarVisible_ = visible;
+    ShowWindow(controlBar_, visible ? SW_SHOWNA : SW_HIDE);
+    if (visible) {
+        SetWindowPos(
+            controlBar_, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+}
+
+void MainWindow::RegisterInteraction(const bool pointerMoved) {
+    lastInteractionMs_ = GetTickCount64();
+    if (!fullscreen_ || controlBarVisible_ || !pointerMoved) {
+        SetControlBarVisible(true);
+        return;
+    }
+    UpdateControlBarVisibility(true);
+}
+
+void MainWindow::UpdateControlBarVisibility(const bool pointerMoved) {
+    if (controlBar_ == nullptr || window_ == nullptr) {
+        return;
+    }
+    if (!fullscreen_) {
+        toolbarWasFullscreen_ = false;
+        SetControlBarVisible(true);
+        return;
+    }
+
+    const std::uint64_t now = GetTickCount64();
+    POINT cursorScreen{};
+    const bool haveCursor = GetCursorPos(&cursorScreen) != FALSE;
+    bool moved = pointerMoved;
+    if (haveCursor) {
+        moved = moved || !hasLastCursor_ ||
+            cursorScreen.x != lastCursorScreen_.x ||
+            cursorScreen.y != lastCursorScreen_.y;
+        lastCursorScreen_ = cursorScreen;
+        hasLastCursor_ = true;
+    }
+
+    RECT client{};
+    GetClientRect(window_, &client);
+    POINT cursorClient = cursorScreen;
+    const bool converted = haveCursor && ScreenToClient(window_, &cursorClient) != FALSE;
+    const bool cursorInside = converted && PointInsideRect(cursorClient, client);
+
+    RECT toolbarBounds{};
+    const bool pointerOverToolbar = controlBarVisible_ && haveCursor &&
+        GetWindowRect(controlBar_, &toolbarBounds) != FALSE &&
+        PointInsideRect(cursorScreen, toolbarBounds);
+    const HWND focused = GetFocus();
+    const bool controlHasFocus = focused == controlBar_ ||
+        (focused != nullptr && IsChild(controlBar_, focused) != FALSE);
+
+    ToolbarVisibilityInput input{};
+    input.wasFullscreen = toolbarWasFullscreen_;
+    input.fullscreen = fullscreen_;
+    input.playing = player_.State() == PlaybackState::Playing;
+    input.currentlyVisible = controlBarVisible_;
+    input.cursorInsideClient = cursorInside;
+    input.cursorMoved = moved;
+    input.pointerOverToolbar = pointerOverToolbar;
+    input.seekDragging = seekDragging_;
+    input.volumeDragging = volumeDragging_;
+    input.previewVisible = previewPopup_.IsVisible();
+    input.zoomSelecting = zoomState_ == ZoomState::Selecting;
+    input.controlHasFocus = controlHasFocus;
+    input.cursorY = cursorClient.y;
+    input.clientHeight = client.bottom - client.top;
+    input.dpi = static_cast<unsigned>(dpi_ > 0 ? dpi_ : kDefaultDpi);
+    input.nowMs = now;
+    input.lastInteractionMs = lastInteractionMs_;
+
+    const ToolbarVisibilityDecision decision = EvaluateToolbarVisibility(input);
+    if (decision.action == ToolbarVisibilityAction::Show) {
+        SetControlBarVisible(true);
+    } else if (decision.action == ToolbarVisibilityAction::Hide) {
+        SetControlBarVisible(false);
+    }
+    if (moved) {
+        lastInteractionMs_ = now;
+    }
+    toolbarWasFullscreen_ = true;
+}
+
+void MainWindow::FinishMouseControlInteraction() noexcept {
+    if (!mouseControlInteraction_) {
+        return;
+    }
+    if (!fullscreen_ && zoomState_ == ZoomState::Selecting) {
+        // The owned selection overlay is non-activating. Preserve the fact
+        // that selection began with the mouse until a successful crop enters
+        // fullscreen, then transfer focus away from the toolbar.
+        return;
+    }
+    mouseControlInteraction_ = false;
+    if (fullscreen_ && videoWindow_ != nullptr &&
+        IsWindow(videoWindow_) != FALSE) {
+        SetFocus(videoWindow_);
+    }
+}
+
+void MainWindow::ToggleAreaZoom() {
+    RegisterInteraction();
+    if (zoomState_ == ZoomState::Selecting || zoomState_ == ZoomState::Applied) {
+        ResetAreaZoom();
+    } else {
+        BeginAreaZoom();
+    }
+}
+
+void MainWindow::BeginAreaZoom() {
+    VideoDimensions video{};
+    GeometryRect viewportScreen{};
+    if (!hasMedia_ || !CurrentVideoViewport(video, viewportScreen)) {
+        return;
+    }
+    const GeometryRect content = ComputeVideoContentRect(video, viewportScreen);
+    if (content.IsEmpty()) {
+        return;
+    }
+
+    selectionVideo_ = video;
+    selectionViewportScreen_ = viewportScreen;
+    const int minimum = ScaleLogicalPixels(
+        kMinimumZoomSelectionLogicalPixels,
+        static_cast<unsigned>(dpi_ > 0 ? dpi_ : kDefaultDpi));
+    if (selectionOverlay_.Begin(content, minimum)) {
+        HideSeekPreview();
+        zoomState_ = ZoomState::Selecting;
+        SetWindowTextW(zoomButton_, L"Скасувати зум");
+        SetControlBarVisible(true);
+    }
+}
+
+void MainWindow::ResetAreaZoom() {
+    if (zoomState_ == ZoomState::Selecting) {
+        selectionOverlay_.Cancel();
+    }
+    if (playerInitialized_) {
+        player_.ResetVideoCrop();
+    }
+    zoomState_ = ZoomState::None;
+    selectionVideo_ = {};
+    selectionViewportScreen_ = {};
+    if (zoomButton_ != nullptr) {
+        SetWindowTextW(zoomButton_, L"Зум області");
+    }
+    RegisterInteraction();
+}
+
+void MainWindow::HandleZoomEscape() {
+    const ZoomEscapeDecision decision = EvaluateZoomEscape(zoomState_, fullscreen_);
+    switch (decision.action) {
+    case ZoomEscapeAction::CancelSelection:
+        selectionOverlay_.Cancel();
+        zoomState_ = decision.nextState;
+        SetWindowTextW(zoomButton_, L"Зум області");
+        FinishMouseControlInteraction();
+        RegisterInteraction();
+        break;
+    case ZoomEscapeAction::ResetCrop:
+        ResetAreaZoom();
+        break;
+    case ZoomEscapeAction::ExitFullscreen:
+        ExitFullscreen();
+        break;
+    case ZoomEscapeAction::None:
+    default:
+        break;
+    }
+}
+
+void MainWindow::HandleSelectionOverlay(
+    const SelectionOverlayEvent event,
+    const SelectionOverlayResult* const result) {
+    if (zoomState_ != ZoomState::Selecting) {
+        return;
+    }
+    if (event != SelectionOverlayEvent::Completed || result == nullptr) {
+        zoomState_ = ZoomState::None;
+        SetWindowTextW(zoomButton_, L"Зум області");
+        FinishMouseControlInteraction();
+        RegisterInteraction();
+        return;
+    }
+
+    const int minimum = ScaleLogicalPixels(
+        kMinimumZoomSelectionLogicalPixels,
+        static_cast<unsigned>(dpi_ > 0 ? dpi_ : kDefaultDpi));
+    const VideoCropMapping mapping = MapSelectionToVideoCrop(
+        selectionVideo_, selectionViewportScreen_, result->screenRect, minimum);
+    if (!mapping.valid || !player_.ApplyVideoCrop(mapping.crop)) {
+        zoomState_ = ZoomState::None;
+        SetWindowTextW(zoomButton_, L"Зум області");
+        FinishMouseControlInteraction();
+        RegisterInteraction();
+        return;
+    }
+
+    zoomState_ = ZoomState::Applied;
+    SetWindowTextW(zoomButton_, L"Скинути зум");
+    if (!fullscreen_) {
+        EnterFullscreen();
+    }
+    RegisterInteraction();
+}
+
+bool MainWindow::CurrentVideoViewport(
+    VideoDimensions& video,
+    GeometryRect& viewportScreen) const noexcept {
+    video = {};
+    viewportScreen = {};
+    if (!playerInitialized_ || videoWindow_ == nullptr ||
+        !player_.GetVideoSize(video)) {
+        return false;
+    }
+    RECT bounds{};
+    if (GetWindowRect(videoWindow_, &bounds) == FALSE ||
+        bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
+        return false;
+    }
+    viewportScreen = {bounds.left, bounds.top, bounds.right, bounds.bottom};
+    return true;
 }
 
 void MainWindow::HandlePlayerEvent(
@@ -873,14 +1461,19 @@ void MainWindow::HandlePlayerEvent(
     case PlayerEvent::Stopped:
     case PlayerEvent::EndReached:
         RestoreExecutionState();
+        SetControlBarVisible(true);
         break;
     case PlayerEvent::EncounteredError:
         RestoreExecutionState();
+        ResetAreaZoom();
+        HideSeekPreview();
         if (player_.State() == PlaybackState::Error) {
             ShowMediaError();
         }
         break;
     case PlayerEvent::Opening:
+        SetControlBarVisible(true);
+        break;
     case PlayerEvent::LengthChanged:
     case PlayerEvent::SeekableChanged:
         break;
@@ -902,18 +1495,26 @@ void MainWindow::RefreshControls() {
     EnableWindow(playButton_, hasMedia_ && state != PlaybackState::Opening);
     EnableWindow(stopButton_, hasMedia_ && state != PlaybackState::Stopped);
 
-    const std::int64_t duration = std::max<std::int64_t>(0, player_.DurationMs());
+    const std::int64_t duration =
+        (std::max<std::int64_t>)(0, player_.DurationMs());
     const std::int64_t position = ClampTime(player_.PositionMs(), duration);
     const bool canSeek = hasMedia_ && duration > 0 && player_.IsSeekable();
     EnableWindow(seekSlider_, canSeek);
 
     SetWindowTextW(durationLabel_, videoplayer::FormatTime(duration).c_str());
     if (seekDragging_) {
-        UpdateSeekPreview();
+        UpdateSeekLabel();
     } else {
         SendMessageW(seekSlider_, TBM_SETPOS, TRUE, TimeToSlider(position, duration));
         SetWindowTextW(currentTimeLabel_, videoplayer::FormatTime(position).c_str());
     }
+
+    VideoDimensions dimensions{};
+    const bool canZoom = hasMedia_ &&
+        state != PlaybackState::Opening && state != PlaybackState::Error &&
+        (zoomState_ != ZoomState::None || player_.GetVideoSize(dimensions));
+    EnableWindow(zoomButton_, canZoom);
+    UpdateControlBarVisibility();
 }
 
 void MainWindow::UpdateExecutionState(const bool playing) {
@@ -934,6 +1535,8 @@ void MainWindow::RestoreExecutionState() {
 }
 
 void MainWindow::ShowMediaError() {
+    ResetAreaZoom();
+    HideSeekPreview();
     if (mediaErrorShown_) {
         return;
     }
@@ -955,6 +1558,47 @@ void MainWindow::UpdateWindowTitle() {
         ? std::wstring(kApplicationTitle)
         : std::wstring(kApplicationTitle) + L" — " + fileName;
     SetWindowTextW(window_, title.c_str());
+}
+
+void MainWindow::ResetMediaUiState() noexcept {
+    HideSeekPreview();
+    seekDragging_ = false;
+    volumeDragging_ = false;
+    selectionOverlay_.Cancel();
+    if (playerInitialized_) {
+        player_.ResetVideoCrop();
+    }
+    zoomState_ = ZoomState::None;
+    selectionVideo_ = {};
+    selectionViewportScreen_ = {};
+    if (zoomButton_ != nullptr) {
+        SetWindowTextW(zoomButton_, L"Зум області");
+    }
+}
+
+void MainWindow::ShutdownPlaybackComponents() noexcept {
+    if (shutdownComplete_) {
+        return;
+    }
+    shutdownComplete_ = true;
+
+    if (seekSlider_ != nullptr && IsWindow(seekSlider_) != FALSE) {
+        RemoveWindowSubclass(seekSlider_, StaticSeekSubclass, kSeekSubclassId);
+    }
+    selectionOverlay_.Cancel();
+    selectionOverlay_.Destroy();
+    if (previewInitialized_) {
+        previewEngine_.Shutdown();
+        previewInitialized_ = false;
+    }
+    previewPopup_.Destroy();
+    if (playerInitialized_) {
+        player_.ResetVideoCrop();
+        player_.Shutdown();
+        playerInitialized_ = false;
+    } else {
+        player_.Shutdown();
+    }
 }
 
 int MainWindow::TimeToSlider(

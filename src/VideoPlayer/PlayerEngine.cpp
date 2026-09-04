@@ -2,6 +2,7 @@
 
 #include "LibVlcRuntime.h"
 #include "PlaybackMath.h"
+#include "PrivacyPolicy.h"
 #include "Utf8.h"
 
 #include <algorithm>
@@ -307,6 +308,17 @@ public:
         }
     }
 
+    void ResetVideoCropLocked() noexcept {
+        videoCropped = false;
+        if (!player || !runtime.IsLoaded()) {
+            return;
+        }
+
+        const LibVlcRuntime::Api& api = runtime.Functions();
+        api.videoSetCropGeometry(player.get(), nullptr);
+        api.videoSetScale(player.get(), 0.0F);
+    }
+
     void ShutdownLocked() noexcept {
         context->shuttingDown.store(true, std::memory_order_release);
         context->notificationWindow.store(nullptr, std::memory_order_release);
@@ -315,6 +327,7 @@ public:
 
         if (player && runtime.IsLoaded()) {
             const LibVlcRuntime::Api& api = runtime.Functions();
+            ResetVideoCropLocked();
             api.mediaPlayerStop(player.get());
             api.mediaPlayerSetMedia(player.get(), nullptr);
         }
@@ -359,6 +372,7 @@ public:
     std::atomic<bool> initialized{false};
     std::atomic<int> volume{100};
     std::atomic<bool> muted{false};
+    bool videoCropped = false;
     HWND videoWindow = nullptr;
 };
 
@@ -400,8 +414,9 @@ bool PlayerEngine::Initialize(
     }
 
     const LibVlcRuntime::Api& api = impl_->runtime.Functions();
-    const char* const arguments[] = {"--no-video-title-show"};
-    libvlc_instance_t* rawInstance = api.newInstance(1, arguments);
+    libvlc_instance_t* rawInstance = api.newInstance(
+        static_cast<int>(kPrivateLibVlcArguments.size()),
+        kPrivateLibVlcArguments.data());
     if (rawInstance == nullptr) {
         error = VlcFailure(api, L"libvlc_new failed.");
         impl_->ShutdownLocked();
@@ -470,6 +485,9 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
     }
 
     const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+    // Crop geometry is a persistent media-player variable in LibVLC. Clear it
+    // before every media replacement, including after a prior failed open.
+    impl_->ResetVideoCropLocked();
     if (impl_->media) {
         api.mediaPlayerStop(impl_->player.get());
         api.mediaPlayerSetMedia(impl_->player.get(), nullptr);
@@ -497,6 +515,7 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
         rawMedia = api.mediaNewPath(impl_->instance.get(), utf8Path.c_str());
     }
     if (rawMedia == nullptr) {
+        impl_->ResetVideoCropLocked();
         impl_->mediaSource.reset();
         impl_->context->state.store(PlaybackState::Error, std::memory_order_release);
         error = VlcFailure(api, L"Could not create LibVLC media.");
@@ -507,6 +526,7 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
     api.mediaPlayerSetMedia(impl_->player.get(), impl_->media.get());
     impl_->context->state.store(PlaybackState::Opening, std::memory_order_release);
     if (api.mediaPlayerPlay(impl_->player.get()) != 0) {
+        impl_->ResetVideoCropLocked();
         api.mediaPlayerStop(impl_->player.get());
         api.mediaPlayerSetMedia(impl_->player.get(), nullptr);
         impl_->media.reset();
@@ -533,6 +553,9 @@ bool PlayerEngine::Play(std::wstring& error) {
     }
 
     const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+    if (impl_->context->state.load(std::memory_order_acquire) == PlaybackState::Error) {
+        impl_->ResetVideoCropLocked();
+    }
     if (impl_->context->state.load(std::memory_order_acquire) == PlaybackState::Ended) {
         api.mediaPlayerStop(impl_->player.get());
         api.mediaPlayerSetTime(impl_->player.get(), 0);
@@ -541,6 +564,7 @@ bool PlayerEngine::Play(std::wstring& error) {
     }
 
     if (api.mediaPlayerPlay(impl_->player.get()) != 0) {
+        impl_->ResetVideoCropLocked();
         impl_->context->state.store(PlaybackState::Error, std::memory_order_release);
         error = VlcFailure(api, L"libvlc_media_player_play failed.");
         return false;
@@ -690,6 +714,111 @@ std::int64_t PlayerEngine::DurationMs() const noexcept {
     } catch (...) {
     }
     return impl_->context->durationMs.load(std::memory_order_acquire);
+}
+
+bool PlayerEngine::GetVideoSize(VideoDimensions& dimensions) const noexcept {
+    dimensions = {};
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
+            !impl_->media) {
+            return false;
+        }
+
+        unsigned width = 0;
+        unsigned height = 0;
+        if (impl_->runtime.Functions().videoGetSize(
+                impl_->player.get(),
+                0U,
+                &width,
+                &height) != 0 ||
+            width == 0U || height == 0U) {
+            return false;
+        }
+
+        dimensions = {width, height};
+        return true;
+    } catch (...) {
+        dimensions = {};
+        return false;
+    }
+}
+
+bool PlayerEngine::ApplyVideoCrop(const VideoCrop& crop) noexcept {
+    try {
+        if (!crop.IsValid()) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
+            !impl_->media) {
+            return false;
+        }
+
+        if (impl_->context->state.load(std::memory_order_acquire) ==
+            PlaybackState::Error) {
+            impl_->ResetVideoCropLocked();
+            return false;
+        }
+
+        const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+        unsigned decodedWidth = 0;
+        unsigned decodedHeight = 0;
+        if (api.videoGetSize(
+                impl_->player.get(),
+                0U,
+                &decodedWidth,
+                &decodedHeight) != 0 ||
+            decodedWidth == 0U || decodedHeight == 0U) {
+            return false;
+        }
+
+        const std::uint64_t right =
+            static_cast<std::uint64_t>(crop.x) + crop.width;
+        const std::uint64_t bottom =
+            static_cast<std::uint64_t>(crop.y) + crop.height;
+        if (right > decodedWidth || bottom > decodedHeight) {
+            return false;
+        }
+
+        const std::string geometry = FormatVideoCropGeometry(crop);
+        if (geometry.empty()) {
+            return false;
+        }
+
+        // LibVLC copies this string into the media-player crop variable.
+        api.videoSetCropGeometry(impl_->player.get(), geometry.c_str());
+        api.videoSetScale(impl_->player.get(), 0.0F);
+        impl_->videoCropped = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void PlayerEngine::ResetVideoCrop() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->ResetVideoCropLocked();
+    } catch (...) {
+    }
+}
+
+bool PlayerEngine::IsVideoCropped() const noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->videoCropped &&
+            impl_->context->state.load(std::memory_order_acquire) ==
+                PlaybackState::Error) {
+            // Do not invoke LibVLC reentrantly from its event callback. The UI
+            // observes the error and reaches this safe, serialized reset path.
+            impl_->ResetVideoCropLocked();
+        }
+        return impl_->videoCropped;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool PlayerEngine::IsSeekable() const noexcept {

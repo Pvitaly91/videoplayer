@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PlaybackState.h"
+#include "VideoGeometry.h"
 
 #include <cstdint>
 #include <memory>
@@ -29,6 +30,10 @@ public:
     void SetVideoWindow(HWND videoWindow) noexcept;
     std::int64_t PositionMs() const noexcept;
     std::int64_t DurationMs() const noexcept;
+    bool GetVideoSize(VideoDimensions& dimensions) const noexcept;
+    bool ApplyVideoCrop(const VideoCrop& crop) noexcept;
+    void ResetVideoCrop() noexcept;
+    bool IsVideoCropped() const noexcept;
     bool IsSeekable() const noexcept;
     bool IsMuted() const noexcept;
     int Volume() const noexcept;

@@ -8,14 +8,25 @@
     <ClCompile Include="Tests.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PlaybackMath.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\PreviewCache.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\PreviewMath.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\TimeFormatter.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ToolbarVisibility.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\Utf8.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\VideoGeometry.cpp"><Filter>Shared</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\VideoPlayer\App.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PathUtils.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PlaybackMath.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\PreviewCache.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\PreviewFrame.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\PreviewMath.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\PrivacyPolicy.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\TimeFormatter.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ToolbarVisibility.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\Utf8.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\VideoGeometry.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ZoomState.h"><Filter>Shared</Filter></ClInclude>
   </ItemGroup>
 </Project>

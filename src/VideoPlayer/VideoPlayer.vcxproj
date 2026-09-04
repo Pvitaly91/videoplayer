@@ -191,8 +191,15 @@
     <ClCompile Include="PathUtils.cpp" />
     <ClCompile Include="PlaybackMath.cpp" />
     <ClCompile Include="PlayerEngine.cpp" />
+    <ClCompile Include="PreviewCache.cpp" />
+    <ClCompile Include="PreviewEngine.cpp" />
+    <ClCompile Include="PreviewMath.cpp" />
+    <ClCompile Include="PreviewPopup.cpp" />
+    <ClCompile Include="SelectionOverlay.cpp" />
     <ClCompile Include="TimeFormatter.cpp" />
+    <ClCompile Include="ToolbarVisibility.cpp" />
     <ClCompile Include="Utf8.cpp" />
+    <ClCompile Include="VideoGeometry.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="App.h" />
@@ -202,10 +209,20 @@
     <ClInclude Include="PlaybackMath.h" />
     <ClInclude Include="PlaybackState.h" />
     <ClInclude Include="PlayerEngine.h" />
+    <ClInclude Include="PreviewCache.h" />
+    <ClInclude Include="PreviewEngine.h" />
+    <ClInclude Include="PreviewFrame.h" />
+    <ClInclude Include="PreviewMath.h" />
+    <ClInclude Include="PreviewPopup.h" />
+    <ClInclude Include="PrivacyPolicy.h" />
     <ClInclude Include="Resource.h" />
+    <ClInclude Include="SelectionOverlay.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="TimeFormatter.h" />
+    <ClInclude Include="ToolbarVisibility.h" />
     <ClInclude Include="Utf8.h" />
+    <ClInclude Include="VideoGeometry.h" />
+    <ClInclude Include="ZoomState.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="VideoPlayer.rc" />
