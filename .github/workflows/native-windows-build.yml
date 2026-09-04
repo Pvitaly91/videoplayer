@@ -12,7 +12,8 @@ permissions:
 jobs:
   build:
     name: Build, test, and package Win32 and x64
-    runs-on: windows-latest
+    # VS 2022/v143 is provided by the pinned Windows Server 2022 image.
+    runs-on: windows-2022
     timeout-minutes: 90
 
     steps:
