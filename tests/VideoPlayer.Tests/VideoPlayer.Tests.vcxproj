@@ -97,5 +97,24 @@
     <ClInclude Include="..\..\src\VideoPlayer\ZoomState.h"><Link>Shared\ZoomState.h</Link></ClInclude>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemDefinitionGroup>
+    <ClCompile><PreprocessorDefinitions>VIDEOPLAYER_TESTING;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <Link><AdditionalDependencies>Comctl32.lib;Comdlg32.lib;Shell32.lib;Ole32.lib;User32.lib;Gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="UiLifecycleTests.cpp" />
+    <ClCompile Include="PreviewLifecycleTests.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\MainWindow.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\PlayerEngine.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\PreviewEngine.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\LibVlcRuntime.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\PreviewPopup.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\SelectionOverlay.cpp" />
+    <ClInclude Include="FakePlayerBackend.h" />
+    <ClInclude Include="PreviewLifecycleTests.h" />
+    <ClInclude Include="PlaybackSnapshotTests.h" />
+    <ClInclude Include="..\..\src\VideoPlayer\PlaybackSnapshot.h" />
+    <ClInclude Include="..\..\src\VideoPlayer\PlayerEngineTestAccess.h" />
+  </ItemGroup>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

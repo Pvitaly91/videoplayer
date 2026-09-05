@@ -1,6 +1,6 @@
 #pragma once
 
-#include "PlaybackState.h"
+#include "PlaybackSnapshot.h"
 #include "VideoGeometry.h"
 
 #include <cstdint>
@@ -28,12 +28,15 @@ public:
     void SetVolume(int volume) noexcept;
     void SetMuted(bool muted) noexcept;
     void SetVideoWindow(HWND videoWindow) noexcept;
+    PlaybackSnapshot Snapshot() const noexcept;
+    PlaybackSnapshot CachedSnapshot() const noexcept;
     std::int64_t PositionMs() const noexcept;
     std::int64_t DurationMs() const noexcept;
     bool GetVideoSize(VideoDimensions& dimensions) const noexcept;
     bool ApplyVideoCrop(const VideoCrop& crop) noexcept;
     void ResetVideoCrop() noexcept;
     bool IsVideoCropped() const noexcept;
+    bool GetVideoCrop(VideoCrop& crop) const noexcept;
     bool IsSeekable() const noexcept;
     bool IsMuted() const noexcept;
     int Volume() const noexcept;
@@ -44,6 +47,9 @@ public:
     void Shutdown() noexcept;
 
 private:
+#if defined(VIDEOPLAYER_TESTING)
+    friend struct PlayerEngineTestAccess;
+#endif
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

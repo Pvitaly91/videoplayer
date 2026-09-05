@@ -11,6 +11,8 @@
 #include "../../src/VideoPlayer/Utf8.h"
 #include "../../src/VideoPlayer/VideoGeometry.h"
 #include "../../src/VideoPlayer/ZoomState.h"
+#include "PlaybackSnapshotTests.h"
+#include "PreviewLifecycleTests.h"
 
 #include <Windows.h>
 
@@ -25,6 +27,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+void RunUiLifecycleTests(int& passed, int& failed);
 
 namespace {
 
@@ -119,6 +123,11 @@ public:
     {
         std::wcout << L"Passed: " << passed_ << L", failed: " << failed_ << L'\n';
         return failed_ == 0 ? 0 : 1;
+    }
+
+    void AddCounts(const int passed, const int failed) {
+        passed_ += passed;
+        failed_ += failed;
     }
 
 private:
@@ -1132,5 +1141,13 @@ int wmain(const int argc, wchar_t* const* const argv)
     TestToolbarVisibility(runner);
     TestZoomEscapeHierarchy(runner);
     TestPrivacyPolicy(runner);
+    RunPlaybackSnapshotTests(runner);
+    RunPreviewLifecycleTests([&runner](bool success, const wchar_t* name) {
+        runner.True(success, name);
+    });
+    int uiPassed = 0;
+    int uiFailed = 0;
+    RunUiLifecycleTests(uiPassed, uiFailed);
+    runner.AddCounts(uiPassed, uiFailed);
     return runner.Finish();
 }

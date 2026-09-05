@@ -80,7 +80,9 @@ bool SelectionOverlay::Create(
 bool SelectionOverlay::Begin(
     const GeometryRect screenBounds,
     const int minimumSelectionPixels) noexcept {
-    if (window_ == nullptr || !IsWindow(window_) || !IsWindow(owner_)) {
+    if (window_ == nullptr || !IsWindow(window_) || !IsWindow(owner_) ||
+        IsWindowVisible(owner_) == FALSE || IsIconic(owner_) != FALSE ||
+        IsWindowEnabled(owner_) == FALSE) {
         return false;
     }
 
@@ -207,6 +209,11 @@ LRESULT SelectionOverlay::HandleMessage(
         if (active_ && dragging_ && reinterpret_cast<HWND>(lParam) != window_) {
             dragging_ = false;
             FinishCancellation(SelectionOverlayEvent::CaptureLost);
+        }
+        return 0;
+    case WM_CANCELMODE:
+        if (active_) {
+            FinishCancellation(SelectionOverlayEvent::Cancelled);
         }
         return 0;
     case WM_ERASEBKGND:

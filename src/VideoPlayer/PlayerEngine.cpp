@@ -4,16 +4,19 @@
 #include "PlaybackMath.h"
 #include "PrivacyPolicy.h"
 #include "Utf8.h"
+#if defined(VIDEOPLAYER_TESTING)
+#include "PlayerEngineTestAccess.h"
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace videoplayer {
@@ -21,13 +24,60 @@ namespace {
 
 struct CallbackContext final {
     std::atomic<bool> shuttingDown{false};
-    std::atomic<unsigned int> callbacksInFlight{0};
     std::atomic<HWND> notificationWindow{nullptr};
-    std::atomic<PlaybackState> state{PlaybackState::Stopped};
-    std::atomic<std::int64_t> positionMs{0};
-    std::atomic<std::int64_t> durationMs{0};
-    std::atomic<bool> seekable{false};
-    std::atomic<std::uint32_t> generation{0};
+    PlaybackSnapshotStore playback;
+    std::mutex callbacksMutex;
+    std::condition_variable callbacksChanged;
+    unsigned int callbacksInFlight = 0;
+};
+
+struct EventBinding final {
+    CallbackContext* context = nullptr;
+    const std::uint32_t generation;
+};
+
+class CallbackLease final {
+public:
+    explicit CallbackLease(CallbackContext& context) : context_(context) {
+        const std::lock_guard<std::mutex> lock(context_.callbacksMutex);
+        ++context_.callbacksInFlight;
+    }
+    ~CallbackLease() {
+        const std::lock_guard<std::mutex> lock(context_.callbacksMutex);
+        --context_.callbacksInFlight;
+        context_.callbacksChanged.notify_all();
+    }
+private:
+    CallbackContext& context_;
+};
+
+// LibVLC's HWND operations can synchronously dispatch Win32 messages. A
+// getter reached from those messages must not wait on this thread's own
+// engine operation or call the backend recursively.
+class EngineOperation final {
+public:
+    EngineOperation(std::mutex& mutex, std::atomic<DWORD>& owner, const bool wait = true)
+        : lock_(mutex, std::defer_lock), owner_(owner) {
+        const DWORD thread = ::GetCurrentThreadId();
+        if (owner_.load(std::memory_order_acquire) == thread) {
+            return;
+        }
+        if (wait) {
+            lock_.lock();
+        } else if (!lock_.try_lock()) {
+            return;
+        }
+        owner_.store(thread, std::memory_order_release);
+    }
+    ~EngineOperation() {
+        if (lock_.owns_lock()) {
+            owner_.store(0, std::memory_order_release);
+        }
+    }
+    explicit operator bool() const noexcept { return lock_.owns_lock(); }
+private:
+    std::unique_lock<std::mutex> lock_;
+    std::atomic<DWORD>& owner_;
 };
 
 struct FileMediaSource final {
@@ -131,72 +181,91 @@ bool RequiresWin32FileCallbacks(const std::wstring& path) noexcept {
     return path.rfind(L"\\\\?\\", 0) == 0 || path.rfind(L"\\\\.\\", 0) == 0;
 }
 
-void __cdecl LibVlcEventCallback(const libvlc_event_t* event, void* opaque) {
-    auto* context = static_cast<CallbackContext*>(opaque);
-    if (context == nullptr) {
+void __cdecl LibVlcEventCallback(const libvlc_event_t* event, void* opaque) noexcept {
+    const auto* binding = static_cast<const EventBinding*>(opaque);
+    if (binding == nullptr || binding->context == nullptr) {
         return;
     }
-
-    context->callbacksInFlight.fetch_add(1, std::memory_order_acq_rel);
-    if (context->shuttingDown.load(std::memory_order_acquire) || event == nullptr) {
-        context->callbacksInFlight.fetch_sub(1, std::memory_order_acq_rel);
-        return;
-    }
-
-    PlayerEvent notification{};
-    bool recognized = true;
-    switch (event->type) {
-        case libvlc_MediaPlayerOpening:
-            context->state.store(PlaybackState::Opening, std::memory_order_release);
-            notification = PlayerEvent::Opening;
-            break;
-        case libvlc_MediaPlayerPlaying:
-            context->state.store(PlaybackState::Playing, std::memory_order_release);
-            notification = PlayerEvent::Playing;
-            break;
-        case libvlc_MediaPlayerPaused:
-            context->state.store(PlaybackState::Paused, std::memory_order_release);
-            notification = PlayerEvent::Paused;
-            break;
-        case libvlc_MediaPlayerStopped:
-            context->positionMs.store(0, std::memory_order_release);
-            context->state.store(PlaybackState::Stopped, std::memory_order_release);
-            notification = PlayerEvent::Stopped;
-            break;
-        case libvlc_MediaPlayerEndReached:
-            context->positionMs.store(
-                context->durationMs.load(std::memory_order_acquire),
-                std::memory_order_release);
-            context->state.store(PlaybackState::Ended, std::memory_order_release);
-            notification = PlayerEvent::EndReached;
-            break;
-        case libvlc_MediaPlayerEncounteredError:
-            context->state.store(PlaybackState::Error, std::memory_order_release);
-            notification = PlayerEvent::EncounteredError;
-            break;
-        case libvlc_MediaPlayerLengthChanged:
-            notification = PlayerEvent::LengthChanged;
-            break;
-        case libvlc_MediaPlayerSeekableChanged:
-            notification = PlayerEvent::SeekableChanged;
-            break;
-        default:
-            recognized = false;
-            break;
-    }
-
-    if (recognized && !context->shuttingDown.load(std::memory_order_acquire)) {
-        const HWND window = context->notificationWindow.load(std::memory_order_acquire);
-        if (window != nullptr) {
-            ::PostMessageW(
-                window,
-                kPlayerEventMessage,
-                static_cast<WPARAM>(notification),
-                static_cast<LPARAM>(context->generation.load(std::memory_order_acquire)));
+    CallbackContext* const context = binding->context;
+    try {
+        const CallbackLease lease(*context);
+        if (context->shuttingDown.load(std::memory_order_acquire) || event == nullptr) {
+            return;
         }
-    }
 
-    context->callbacksInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        PlayerEvent notification{};
+        bool recognized = true;
+        bool stateChanged = true;
+        PlaybackState state = PlaybackState::Stopped;
+        switch (event->type) {
+            case libvlc_MediaPlayerOpening:
+                state = PlaybackState::Opening;
+                notification = PlayerEvent::Opening;
+                break;
+            case libvlc_MediaPlayerPlaying:
+                state = PlaybackState::Playing;
+                notification = PlayerEvent::Playing;
+                break;
+            case libvlc_MediaPlayerPaused:
+                state = PlaybackState::Paused;
+                notification = PlayerEvent::Paused;
+                break;
+            case libvlc_MediaPlayerStopped:
+                state = PlaybackState::Stopped;
+                notification = PlayerEvent::Stopped;
+                break;
+            case libvlc_MediaPlayerEndReached:
+                state = PlaybackState::Ended;
+                notification = PlayerEvent::EndReached;
+                break;
+            case libvlc_MediaPlayerEncounteredError:
+                state = PlaybackState::Error;
+                notification = PlayerEvent::EncounteredError;
+                break;
+            case libvlc_MediaPlayerLengthChanged:
+                stateChanged = false;
+                notification = PlayerEvent::LengthChanged;
+                break;
+            case libvlc_MediaPlayerSeekableChanged:
+                stateChanged = false;
+                notification = PlayerEvent::SeekableChanged;
+                break;
+            default:
+                recognized = false;
+                break;
+        }
+
+        const bool current = recognized && (stateChanged
+            ? context->playback.SetState(binding->generation, state)
+            : context->playback.Read().generation == binding->generation);
+        if (current && !context->shuttingDown.load(std::memory_order_acquire)) {
+            const HWND window = context->notificationWindow.load(std::memory_order_acquire);
+            if (window != nullptr) {
+                ::PostMessageW(
+                    window,
+                    kPlayerEventMessage,
+                    static_cast<WPARAM>(notification),
+                    static_cast<LPARAM>(binding->generation));
+            }
+        }
+    } catch (...) {
+        // Never unwind into LibVLC. A later UI poll reads the real backend;
+        // an exceptional callback cannot alter another media generation.
+        ::OutputDebugStringW(L"VideoPlayer: playback event processing failed.\n");
+    }
+}
+
+PlaybackState ObservedPlaybackState(const libvlc_state_t state) noexcept {
+    switch (state) {
+        case libvlc_Opening:
+        case libvlc_Buffering:
+            return PlaybackState::Opening;
+        case libvlc_Playing: return PlaybackState::Playing;
+        case libvlc_Paused: return PlaybackState::Paused;
+        case libvlc_Ended: return PlaybackState::Ended;
+        case libvlc_Error: return PlaybackState::Error;
+        default: return PlaybackState::Stopped;
+    }
 }
 
 std::wstring Utf8Diagnostic(const char* message) {
@@ -284,49 +353,91 @@ public:
           media(nullptr, MediaReleaser{}) {
     }
 
+    const LibVlcRuntime::Api& Functions() const noexcept {
+#if defined(VIDEOPLAYER_TESTING)
+        if (testBackend) {
+            return testApi;
+        }
+#endif
+        return runtime.Functions();
+    }
+
+    bool BackendLoaded() const noexcept {
+#if defined(VIDEOPLAYER_TESTING)
+        if (testBackend) {
+            return true;
+        }
+#endif
+        return runtime.IsLoaded();
+    }
+
+    bool AttachEventsLocked(const std::uint32_t generation, std::wstring& error) {
+        const LibVlcRuntime::Api& api = Functions();
+        eventBinding = std::make_unique<EventBinding>(EventBinding{context.get(), generation});
+        eventManager = api.mediaPlayerEventManager(player.get());
+        if (eventManager == nullptr) {
+            error = L"libvlc_media_player_event_manager failed.";
+            return false;
+        }
+        for (const libvlc_event_e eventType : kObservedEvents) {
+            if (api.eventAttach(
+                    eventManager, eventType, &LibVlcEventCallback, eventBinding.get()) != 0) {
+                error = L"libvlc_event_attach failed.";
+                DetachEventsLocked();
+                return false;
+            }
+            ++attachedEventCount;
+        }
+        return true;
+    }
+
     void DetachEventsLocked() noexcept {
-        if (eventManager == nullptr || !runtime.IsLoaded()) {
+        if (eventManager == nullptr || !BackendLoaded()) {
             attachedEventCount = 0;
             eventManager = nullptr;
             return;
         }
-        const LibVlcRuntime::Api& api = runtime.Functions();
+        const LibVlcRuntime::Api& api = Functions();
         for (std::size_t index = 0; index < attachedEventCount; ++index) {
             api.eventDetach(
                 eventManager,
                 kObservedEvents[index],
                 &LibVlcEventCallback,
-                context.get());
+                eventBinding.get());
         }
         attachedEventCount = 0;
         eventManager = nullptr;
     }
 
-    void WaitForCallbacksLocked() const noexcept {
-        while (context->callbacksInFlight.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
-        }
+    void WaitForCallbacksLocked() const {
+        std::unique_lock<std::mutex> lock(context->callbacksMutex);
+        context->callbacksChanged.wait(lock, [this] {
+            return context->callbacksInFlight == 0;
+        });
     }
 
     void ResetVideoCropLocked() noexcept {
-        videoCropped = false;
-        if (!player || !runtime.IsLoaded()) {
+        {
+            const std::lock_guard<std::mutex> lock(cropMutex);
+            videoCrop = {};
+        }
+        if (!player || !BackendLoaded()) {
             return;
         }
 
-        const LibVlcRuntime::Api& api = runtime.Functions();
+        const LibVlcRuntime::Api& api = Functions();
         api.videoSetCropGeometry(player.get(), nullptr);
         api.videoSetScale(player.get(), 0.0F);
     }
 
-    void ShutdownLocked() noexcept {
+    void ShutdownLocked() {
         context->shuttingDown.store(true, std::memory_order_release);
         context->notificationWindow.store(nullptr, std::memory_order_release);
         DetachEventsLocked();
         WaitForCallbacksLocked();
 
-        if (player && runtime.IsLoaded()) {
-            const LibVlcRuntime::Api& api = runtime.Functions();
+        if (player && BackendLoaded()) {
+            const LibVlcRuntime::Api& api = Functions();
             ResetVideoCropLocked();
             api.mediaPlayerStop(player.get());
             api.mediaPlayerSetMedia(player.get(), nullptr);
@@ -338,15 +449,14 @@ public:
         // once more for a callback that may have been selected immediately
         // before event_detach acquired the LibVLC event-manager lock.
         WaitForCallbacksLocked();
+        eventBinding.reset();
         instance.reset();
         runtime.Unload();
 
         initialized.store(false, std::memory_order_release);
+        hasMedia.store(false, std::memory_order_release);
         videoWindow = nullptr;
-        context->positionMs.store(0, std::memory_order_release);
-        context->durationMs.store(0, std::memory_order_release);
-        context->seekable.store(false, std::memory_order_release);
-        context->state.store(PlaybackState::Stopped, std::memory_order_release);
+        context->playback.BeginMedia();
     }
 
     inline static constexpr std::array<libvlc_event_e, 8> kObservedEvents{
@@ -361,6 +471,7 @@ public:
     };
 
     std::unique_ptr<CallbackContext> context;
+    std::unique_ptr<EventBinding> eventBinding;
     LibVlcRuntime runtime;
     InstancePtr instance;
     PlayerPtr player;
@@ -369,11 +480,18 @@ public:
     libvlc_event_manager_t* eventManager = nullptr;
     std::size_t attachedEventCount = 0;
     mutable std::mutex mutex;
+    mutable std::atomic<DWORD> mutexOwner{0};
     std::atomic<bool> initialized{false};
+    std::atomic<bool> hasMedia{false};
     std::atomic<int> volume{100};
     std::atomic<bool> muted{false};
-    bool videoCropped = false;
+    VideoCrop videoCrop{};
+    mutable std::mutex cropMutex;
     HWND videoWindow = nullptr;
+#if defined(VIDEOPLAYER_TESTING)
+    bool testBackend = false;
+    LibVlcRuntime::Api testApi{};
+#endif
 };
 
 PlayerEngine::PlayerEngine() : impl_(std::make_unique<Impl>()) {
@@ -388,7 +506,11 @@ bool PlayerEngine::Initialize(
     const HWND notificationWindow,
     std::wstring& error) {
     error.clear();
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+    if (!lock) {
+        error = L"A playback operation is already in progress.";
+        return false;
+    }
     if (videoWindow == nullptr || notificationWindow == nullptr) {
         error = L"PlayerEngine requires valid video and notification windows.";
         return false;
@@ -397,23 +519,19 @@ bool PlayerEngine::Initialize(
     if (impl_->initialized.load(std::memory_order_acquire)) {
         impl_->videoWindow = videoWindow;
         impl_->context->notificationWindow.store(notificationWindow, std::memory_order_release);
-        impl_->runtime.Functions().mediaPlayerSetHwnd(impl_->player.get(), videoWindow);
+        impl_->Functions().mediaPlayerSetHwnd(impl_->player.get(), videoWindow);
         return true;
     }
 
     impl_->context->shuttingDown.store(false, std::memory_order_release);
     impl_->context->notificationWindow.store(notificationWindow, std::memory_order_release);
-    impl_->context->state.store(PlaybackState::Stopped, std::memory_order_release);
-    impl_->context->positionMs.store(0, std::memory_order_release);
-    impl_->context->durationMs.store(0, std::memory_order_release);
-    impl_->context->seekable.store(false, std::memory_order_release);
 
     if (!impl_->runtime.Load(error)) {
         impl_->context->notificationWindow.store(nullptr, std::memory_order_release);
         return false;
     }
 
-    const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+    const LibVlcRuntime::Api& api = impl_->Functions();
     libvlc_instance_t* rawInstance = api.newInstance(
         static_cast<int>(kPrivateLibVlcArguments.size()),
         kPrivateLibVlcArguments.data());
@@ -432,26 +550,6 @@ bool PlayerEngine::Initialize(
         return false;
     }
     impl_->player = PlayerPtr(rawPlayer, PlayerReleaser{api.mediaPlayerRelease});
-
-    impl_->eventManager = api.mediaPlayerEventManager(impl_->player.get());
-    if (impl_->eventManager == nullptr) {
-        error = L"libvlc_media_player_event_manager failed.";
-        impl_->ShutdownLocked();
-        return false;
-    }
-
-    for (const libvlc_event_e eventType : Impl::kObservedEvents) {
-        if (api.eventAttach(
-                impl_->eventManager,
-                eventType,
-                &LibVlcEventCallback,
-                impl_->context.get()) != 0) {
-            error = L"libvlc_event_attach failed.";
-            impl_->ShutdownLocked();
-            return false;
-        }
-        ++impl_->attachedEventCount;
-    }
 
     impl_->videoWindow = videoWindow;
     api.mediaPlayerSetHwnd(impl_->player.get(), videoWindow);
@@ -478,13 +576,22 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+    if (!lock) {
+        error = L"A playback operation is already in progress.";
+        return false;
+    }
     if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player) {
         error = L"PlayerEngine is not initialized.";
         return false;
     }
 
-    const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+    const LibVlcRuntime::Api& api = impl_->Functions();
+    // Invalidate the old identity BEFORE stopping it. A synchronous Stop
+    // callback and already queued UI events retain their original generation.
+    const std::uint32_t generation = impl_->context->playback.BeginMedia();
+    impl_->hasMedia.store(false, std::memory_order_release);
+    impl_->DetachEventsLocked();
     // Crop geometry is a persistent media-player variable in LibVLC. Clear it
     // before every media replacement, including after a prior failed open.
     impl_->ResetVideoCropLocked();
@@ -495,11 +602,10 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
         impl_->mediaSource.reset();
     }
 
-    impl_->context->state.store(PlaybackState::Stopped, std::memory_order_release);
-    impl_->context->positionMs.store(0, std::memory_order_release);
-    impl_->context->durationMs.store(0, std::memory_order_release);
-    impl_->context->seekable.store(false, std::memory_order_release);
-    impl_->context->generation.fetch_add(1, std::memory_order_acq_rel);
+    // Stop joins the old input; event_detach serializes with event dispatch.
+    // Keep its immutable binding alive through both barriers.
+    impl_->WaitForCallbacksLocked();
+    impl_->eventBinding.reset();
 
     libvlc_media_t* rawMedia = nullptr;
     if (RequiresWin32FileCallbacks(path)) {
@@ -517,22 +623,25 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
     if (rawMedia == nullptr) {
         impl_->ResetVideoCropLocked();
         impl_->mediaSource.reset();
-        impl_->context->state.store(PlaybackState::Error, std::memory_order_release);
+        impl_->context->playback.SetState(generation, PlaybackState::Error);
         error = VlcFailure(api, L"Could not create LibVLC media.");
         return false;
     }
 
     impl_->media = MediaPtr(rawMedia, MediaReleaser{api.mediaRelease});
     api.mediaPlayerSetMedia(impl_->player.get(), impl_->media.get());
-    impl_->context->state.store(PlaybackState::Opening, std::memory_order_release);
-    if (api.mediaPlayerPlay(impl_->player.get()) != 0) {
+    impl_->context->playback.SetState(generation, PlaybackState::Opening);
+    if (!impl_->AttachEventsLocked(generation, error) ||
+        api.mediaPlayerPlay(impl_->player.get()) != 0) {
         impl_->ResetVideoCropLocked();
         api.mediaPlayerStop(impl_->player.get());
         api.mediaPlayerSetMedia(impl_->player.get(), nullptr);
         impl_->media.reset();
         impl_->mediaSource.reset();
-        impl_->context->state.store(PlaybackState::Error, std::memory_order_release);
-        error = VlcFailure(api, L"libvlc_media_player_play failed.");
+        impl_->context->playback.SetState(generation, PlaybackState::Error);
+        if (error.empty()) {
+            error = VlcFailure(api, L"libvlc_media_player_play failed.");
+        }
         return false;
     }
 
@@ -540,32 +649,38 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
     api.audioSetMute(
         impl_->player.get(),
         impl_->muted.load(std::memory_order_acquire) ? 1 : 0);
+    impl_->hasMedia.store(true, std::memory_order_release);
     return true;
 }
 
 bool PlayerEngine::Play(std::wstring& error) {
     error.clear();
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+    if (!lock) {
+        error = L"A playback operation is already in progress.";
+        return false;
+    }
     if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
         !impl_->media) {
         error = L"No media is open.";
         return false;
     }
 
-    const LibVlcRuntime::Api& api = impl_->runtime.Functions();
-    if (impl_->context->state.load(std::memory_order_acquire) == PlaybackState::Error) {
+    const LibVlcRuntime::Api& api = impl_->Functions();
+    const PlaybackSnapshot snapshot = impl_->context->playback.Read();
+    if (snapshot.state == PlaybackState::Error) {
         impl_->ResetVideoCropLocked();
     }
-    if (impl_->context->state.load(std::memory_order_acquire) == PlaybackState::Ended) {
+    if (snapshot.state == PlaybackState::Ended) {
         api.mediaPlayerStop(impl_->player.get());
         api.mediaPlayerSetTime(impl_->player.get(), 0);
-        impl_->context->positionMs.store(0, std::memory_order_release);
-        impl_->context->state.store(PlaybackState::Opening, std::memory_order_release);
+        impl_->context->playback.SetState(snapshot.generation, PlaybackState::Opening);
+        impl_->context->playback.Seek(snapshot.generation, 0);
     }
 
     if (api.mediaPlayerPlay(impl_->player.get()) != 0) {
         impl_->ResetVideoCropLocked();
-        impl_->context->state.store(PlaybackState::Error, std::memory_order_release);
+        impl_->context->playback.SetState(snapshot.generation, PlaybackState::Error);
         error = VlcFailure(api, L"libvlc_media_player_play failed.");
         return false;
     }
@@ -578,10 +693,10 @@ bool PlayerEngine::Play(std::wstring& error) {
 
 void PlayerEngine::Pause() noexcept {
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->initialized.load(std::memory_order_acquire) && impl_->player &&
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (lock && impl_->initialized.load(std::memory_order_acquire) && impl_->player &&
             impl_->media) {
-            impl_->runtime.Functions().mediaPlayerSetPause(impl_->player.get(), 1);
+            impl_->Functions().mediaPlayerSetPause(impl_->player.get(), 1);
         }
     } catch (...) {
     }
@@ -589,14 +704,14 @@ void PlayerEngine::Pause() noexcept {
 
 void PlayerEngine::Stop() noexcept {
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->initialized.load(std::memory_order_acquire) && impl_->player &&
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (lock && impl_->initialized.load(std::memory_order_acquire) && impl_->player &&
             impl_->media) {
-            const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+            const LibVlcRuntime::Api& api = impl_->Functions();
             api.mediaPlayerStop(impl_->player.get());
             api.mediaPlayerSetTime(impl_->player.get(), 0);
-            impl_->context->positionMs.store(0, std::memory_order_release);
-            impl_->context->state.store(PlaybackState::Stopped, std::memory_order_release);
+            impl_->context->playback.SetState(
+                impl_->context->playback.Read().generation, PlaybackState::Stopped);
         }
     } catch (...) {
     }
@@ -604,30 +719,32 @@ void PlayerEngine::Stop() noexcept {
 
 void PlayerEngine::Seek(const std::int64_t milliseconds) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (!lock || !impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
             !impl_->media) {
             return;
         }
 
-        const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+        const LibVlcRuntime::Api& api = impl_->Functions();
         const bool seekable = api.mediaPlayerIsSeekable(impl_->player.get()) != 0;
-        impl_->context->seekable.store(seekable, std::memory_order_release);
         if (!seekable) {
             return;
         }
 
-        std::int64_t duration =
-            impl_->context->durationMs.load(std::memory_order_acquire);
+        const PlaybackSnapshot snapshot = impl_->context->playback.Read();
+        std::int64_t duration = snapshot.durationMs;
         const libvlc_time_t reportedLength = api.mediaPlayerGetLength(impl_->player.get());
         if (reportedLength >= 0) {
             duration = static_cast<std::int64_t>(reportedLength);
-            impl_->context->durationMs.store(duration, std::memory_order_release);
         }
 
         const std::int64_t target = ClampTime(milliseconds, duration);
+        impl_->context->playback.Observe(
+            snapshot.generation, snapshot.state, snapshot.positionMs, duration, seekable);
         api.mediaPlayerSetTime(impl_->player.get(), static_cast<libvlc_time_t>(target));
-        impl_->context->positionMs.store(target, std::memory_order_release);
+        // Immediate feedback is the requested main-player seek, not invented
+        // elapsed playback. The next timer snapshot uses the real backend.
+        impl_->context->playback.Seek(snapshot.generation, target);
     } catch (...) {
     }
 }
@@ -636,9 +753,9 @@ void PlayerEngine::SetVolume(const int volume) noexcept {
     const int clamped = ClampVolume(volume);
     impl_->volume.store(clamped, std::memory_order_release);
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->initialized.load(std::memory_order_acquire) && impl_->player) {
-            impl_->runtime.Functions().audioSetVolume(impl_->player.get(), clamped);
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (lock && impl_->initialized.load(std::memory_order_acquire) && impl_->player) {
+            impl_->Functions().audioSetVolume(impl_->player.get(), clamped);
         }
     } catch (...) {
     }
@@ -647,9 +764,9 @@ void PlayerEngine::SetVolume(const int volume) noexcept {
 void PlayerEngine::SetMuted(const bool muted) noexcept {
     impl_->muted.store(muted, std::memory_order_release);
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->initialized.load(std::memory_order_acquire) && impl_->player) {
-            impl_->runtime.Functions().audioSetMute(impl_->player.get(), muted ? 1 : 0);
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (lock && impl_->initialized.load(std::memory_order_acquire) && impl_->player) {
+            impl_->Functions().audioSetMute(impl_->player.get(), muted ? 1 : 0);
         }
     } catch (...) {
     }
@@ -657,77 +774,71 @@ void PlayerEngine::SetMuted(const bool muted) noexcept {
 
 void PlayerEngine::SetVideoWindow(const HWND videoWindow) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (!lock) {
+            return;
+        }
         impl_->videoWindow = videoWindow;
         if (impl_->initialized.load(std::memory_order_acquire) && impl_->player) {
-            impl_->runtime.Functions().mediaPlayerSetHwnd(impl_->player.get(), videoWindow);
+            impl_->Functions().mediaPlayerSetHwnd(impl_->player.get(), videoWindow);
         }
     } catch (...) {
+    }
+}
+
+PlaybackSnapshot PlayerEngine::Snapshot() const noexcept {
+    try {
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner, false);
+        const PlaybackSnapshot cached = impl_->context->playback.Read();
+        if (!lock || !impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
+            !impl_->media) {
+            return cached;
+        }
+
+        const LibVlcRuntime::Api& api = impl_->Functions();
+        const libvlc_time_t position = api.mediaPlayerGetTime(impl_->player.get());
+        const libvlc_time_t duration = api.mediaPlayerGetLength(impl_->player.get());
+        const bool seekable = api.mediaPlayerIsSeekable(impl_->player.get()) != 0;
+        const PlaybackState state = ObservedPlaybackState(
+            api.mediaPlayerGetState(impl_->player.get()));
+        if (state == PlaybackState::Error && impl_->videoCrop.IsValid()) {
+            impl_->ResetVideoCropLocked();
+        }
+        return impl_->context->playback.Observe(
+            cached.generation, state, position, duration, seekable);
+    } catch (...) {
+        return {};
+    }
+}
+
+PlaybackSnapshot PlayerEngine::CachedSnapshot() const noexcept {
+    try {
+        return impl_->context->playback.Read();
+    } catch (...) {
+        return {};
     }
 }
 
 std::int64_t PlayerEngine::PositionMs() const noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
-            !impl_->media) {
-            return 0;
-        }
-
-        const PlaybackState state =
-            impl_->context->state.load(std::memory_order_acquire);
-        if (state == PlaybackState::Stopped) {
-            return 0;
-        }
-        if (state == PlaybackState::Ended) {
-            return impl_->context->durationMs.load(std::memory_order_acquire);
-        }
-
-        const libvlc_time_t value =
-            impl_->runtime.Functions().mediaPlayerGetTime(impl_->player.get());
-        if (value < 0) {
-            return impl_->context->positionMs.load(std::memory_order_acquire);
-        }
-        const std::int64_t result = ClampTime(
-            static_cast<std::int64_t>(value),
-            impl_->context->durationMs.load(std::memory_order_acquire));
-        impl_->context->positionMs.store(result, std::memory_order_release);
-        return result;
-    } catch (...) {
-        return impl_->context->positionMs.load(std::memory_order_acquire);
-    }
+    return Snapshot().positionMs;
 }
 
 std::int64_t PlayerEngine::DurationMs() const noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->initialized.load(std::memory_order_acquire) && impl_->player &&
-            impl_->media) {
-            const libvlc_time_t value =
-                impl_->runtime.Functions().mediaPlayerGetLength(impl_->player.get());
-            if (value >= 0) {
-                impl_->context->durationMs.store(
-                    static_cast<std::int64_t>(value),
-                    std::memory_order_release);
-            }
-        }
-    } catch (...) {
-    }
-    return impl_->context->durationMs.load(std::memory_order_acquire);
+    return Snapshot().durationMs;
 }
 
 bool PlayerEngine::GetVideoSize(VideoDimensions& dimensions) const noexcept {
     dimensions = {};
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner, false);
+        if (!lock || !impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
             !impl_->media) {
             return false;
         }
 
         unsigned width = 0;
         unsigned height = 0;
-        if (impl_->runtime.Functions().videoGetSize(
+        if (impl_->Functions().videoGetSize(
                 impl_->player.get(),
                 0U,
                 &width,
@@ -750,19 +861,19 @@ bool PlayerEngine::ApplyVideoCrop(const VideoCrop& crop) noexcept {
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (!lock || !impl_->initialized.load(std::memory_order_acquire) || !impl_->player ||
             !impl_->media) {
             return false;
         }
 
-        if (impl_->context->state.load(std::memory_order_acquire) ==
+        if (impl_->context->playback.Read().state ==
             PlaybackState::Error) {
             impl_->ResetVideoCropLocked();
             return false;
         }
 
-        const LibVlcRuntime::Api& api = impl_->runtime.Functions();
+        const LibVlcRuntime::Api& api = impl_->Functions();
         unsigned decodedWidth = 0;
         unsigned decodedHeight = 0;
         if (api.videoGetSize(
@@ -790,7 +901,10 @@ bool PlayerEngine::ApplyVideoCrop(const VideoCrop& crop) noexcept {
         // LibVLC copies this string into the media-player crop variable.
         api.videoSetCropGeometry(impl_->player.get(), geometry.c_str());
         api.videoSetScale(impl_->player.get(), 0.0F);
-        impl_->videoCropped = true;
+        {
+            const std::lock_guard<std::mutex> cropLock(impl_->cropMutex);
+            impl_->videoCrop = crop;
+        }
         return true;
     } catch (...) {
         return false;
@@ -799,40 +913,32 @@ bool PlayerEngine::ApplyVideoCrop(const VideoCrop& crop) noexcept {
 
 void PlayerEngine::ResetVideoCrop() noexcept {
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        impl_->ResetVideoCropLocked();
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (lock) {
+            impl_->ResetVideoCropLocked();
+        }
     } catch (...) {
     }
 }
 
 bool PlayerEngine::IsVideoCropped() const noexcept {
+    VideoCrop crop{};
+    return GetVideoCrop(crop);
+}
+
+bool PlayerEngine::GetVideoCrop(VideoCrop& crop) const noexcept {
+    crop = {};
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->videoCropped &&
-            impl_->context->state.load(std::memory_order_acquire) ==
-                PlaybackState::Error) {
-            // Do not invoke LibVLC reentrantly from its event callback. The UI
-            // observes the error and reaches this safe, serialized reset path.
-            impl_->ResetVideoCropLocked();
-        }
-        return impl_->videoCropped;
+        const std::lock_guard<std::mutex> lock(impl_->cropMutex);
+        crop = impl_->videoCrop;
+        return crop.IsValid();
     } catch (...) {
         return false;
     }
 }
 
 bool PlayerEngine::IsSeekable() const noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->initialized.load(std::memory_order_acquire) && impl_->player &&
-            impl_->media) {
-            const bool value =
-                impl_->runtime.Functions().mediaPlayerIsSeekable(impl_->player.get()) != 0;
-            impl_->context->seekable.store(value, std::memory_order_release);
-        }
-    } catch (...) {
-    }
-    return impl_->context->seekable.load(std::memory_order_acquire);
+    return Snapshot().seekable;
 }
 
 bool PlayerEngine::IsMuted() const noexcept {
@@ -844,21 +950,15 @@ int PlayerEngine::Volume() const noexcept {
 }
 
 PlaybackState PlayerEngine::State() const noexcept {
-    return impl_->context->state.load(std::memory_order_acquire);
+    return CachedSnapshot().state;
 }
 
 std::uint32_t PlayerEngine::Generation() const noexcept {
-    return impl_->context->generation.load(std::memory_order_acquire);
+    return CachedSnapshot().generation;
 }
 
 bool PlayerEngine::HasMedia() const noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        return impl_->initialized.load(std::memory_order_acquire) &&
-            impl_->player && impl_->media;
-    } catch (...) {
-        return false;
-    }
+    return impl_->hasMedia.load(std::memory_order_acquire);
 }
 
 bool PlayerEngine::IsInitialized() const noexcept {
@@ -870,10 +970,46 @@ void PlayerEngine::Shutdown() noexcept {
         return;
     }
     try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        impl_->ShutdownLocked();
+        const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
+        if (lock) {
+            impl_->ShutdownLocked();
+        }
     } catch (...) {
     }
 }
+
+#if defined(VIDEOPLAYER_TESTING)
+void PlayerEngineTestAccess::Install(
+    PlayerEngine& engine,
+    const LibVlcRuntime::Api& api,
+    libvlc_media_player_t* const player,
+    libvlc_media_t* const media,
+    const PlaybackSnapshot& snapshot) {
+    const EngineOperation lock(engine.impl_->mutex, engine.impl_->mutexOwner);
+    if (!lock) {
+        return;
+    }
+    engine.impl_->ShutdownLocked();
+    engine.impl_->testApi = api;
+    engine.impl_->testBackend = true;
+    engine.impl_->player = PlayerPtr(player, PlayerReleaser{});
+    engine.impl_->media = MediaPtr(media, MediaReleaser{});
+    engine.impl_->context->shuttingDown.store(false, std::memory_order_release);
+    const std::uint32_t generation = engine.impl_->context->playback.Read().generation;
+    engine.impl_->context->playback.Observe(
+        generation, snapshot.state, snapshot.positionMs, snapshot.durationMs, snapshot.seekable);
+    engine.impl_->hasMedia.store(media != nullptr, std::memory_order_release);
+    engine.impl_->initialized.store(true, std::memory_order_release);
+}
+
+void PlayerEngineTestAccess::DeliverEvent(
+    PlayerEngine& engine,
+    const libvlc_event_e type,
+    const std::uint32_t attachedGeneration) {
+    EventBinding binding{engine.impl_->context.get(), attachedGeneration};
+    const libvlc_event_t event{static_cast<int>(type)};
+    LibVlcEventCallback(&event, &binding);
+}
+#endif
 
 }  // namespace videoplayer

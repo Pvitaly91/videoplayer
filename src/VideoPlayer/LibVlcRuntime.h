@@ -21,6 +21,11 @@ struct libvlc_event_manager_t;
 
 using libvlc_time_t = std::int64_t;
 
+enum libvlc_state_t : int {
+    libvlc_NothingSpecial = 0, libvlc_Opening, libvlc_Buffering,
+    libvlc_Playing, libvlc_Paused, libvlc_Stopped, libvlc_Ended, libvlc_Error,
+};
+
 struct libvlc_event_t final {
     int type;
 };
@@ -55,6 +60,7 @@ using LibVlcMediaNewCallbacks = libvlc_media_t*(__cdecl*)(
     LibVlcMediaCloseCallback,
     void*);
 using LibVlcMediaRelease = void(__cdecl*)(libvlc_media_t*);
+using LibVlcMediaAddOption = void(__cdecl*)(libvlc_media_t*, const char*);
 using LibVlcMediaPlayerNew = libvlc_media_player_t*(__cdecl*)(libvlc_instance_t*);
 using LibVlcMediaPlayerRelease = void(__cdecl*)(libvlc_media_player_t*);
 using LibVlcMediaPlayerSetMedia = void(__cdecl*)(libvlc_media_player_t*, libvlc_media_t*);
@@ -86,6 +92,8 @@ using LibVlcVideoSetScale = void(__cdecl*)(libvlc_media_player_t*, float);
 using LibVlcMediaPlayerPlay = int(__cdecl*)(libvlc_media_player_t*);
 using LibVlcMediaPlayerSetPause = void(__cdecl*)(libvlc_media_player_t*, int);
 using LibVlcMediaPlayerStop = void(__cdecl*)(libvlc_media_player_t*);
+using LibVlcMediaPlayerGetState = libvlc_state_t(__cdecl*)(libvlc_media_player_t*);
+using LibVlcVideoGetTrackCount = int(__cdecl*)(libvlc_media_player_t*);
 using LibVlcMediaPlayerGetTime = libvlc_time_t(__cdecl*)(libvlc_media_player_t*);
 using LibVlcMediaPlayerSetTime = void(__cdecl*)(libvlc_media_player_t*, libvlc_time_t);
 using LibVlcMediaPlayerGetLength = libvlc_time_t(__cdecl*)(libvlc_media_player_t*);
@@ -109,6 +117,7 @@ public:
         LibVlcMediaNewPath mediaNewPath = nullptr;
         LibVlcMediaNewCallbacks mediaNewCallbacks = nullptr;
         LibVlcMediaRelease mediaRelease = nullptr;
+        LibVlcMediaAddOption mediaAddOption = nullptr;
         LibVlcMediaPlayerNew mediaPlayerNew = nullptr;
         LibVlcMediaPlayerRelease mediaPlayerRelease = nullptr;
         LibVlcMediaPlayerSetMedia mediaPlayerSetMedia = nullptr;
@@ -123,6 +132,8 @@ public:
         LibVlcMediaPlayerPlay mediaPlayerPlay = nullptr;
         LibVlcMediaPlayerSetPause mediaPlayerSetPause = nullptr;
         LibVlcMediaPlayerStop mediaPlayerStop = nullptr;
+        LibVlcMediaPlayerGetState mediaPlayerGetState = nullptr;
+        LibVlcVideoGetTrackCount videoGetTrackCount = nullptr;
         LibVlcMediaPlayerGetTime mediaPlayerGetTime = nullptr;
         LibVlcMediaPlayerSetTime mediaPlayerSetTime = nullptr;
         LibVlcMediaPlayerGetLength mediaPlayerGetLength = nullptr;

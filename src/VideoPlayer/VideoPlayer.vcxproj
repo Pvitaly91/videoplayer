@@ -211,6 +211,7 @@
     <ClInclude Include="PathUtils.h" />
     <ClInclude Include="PlaybackMath.h" />
     <ClInclude Include="PlaybackState.h" />
+    <ClInclude Include="PlaybackSnapshot.h" />
     <ClInclude Include="PlayerEngine.h" />
     <ClInclude Include="PreviewCache.h" />
     <ClInclude Include="PreviewEngine.h" />

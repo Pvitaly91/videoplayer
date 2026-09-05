@@ -214,7 +214,10 @@ bool PreviewPopup::RegisterWindowClass(std::wstring& error) noexcept {
 }
 
 void PreviewPopup::PositionAndShow(const POINT anchorScreen, const int dpi) noexcept {
-    if (window_ == nullptr) {
+    if (window_ == nullptr || owner_ == nullptr ||
+        ::IsWindowVisible(owner_) == FALSE || ::IsIconic(owner_) != FALSE ||
+        ::IsWindowEnabled(owner_) == FALSE) {
+        Hide();
         return;
     }
     dpi_ = dpi > 0 ? dpi : USER_DEFAULT_SCREEN_DPI;

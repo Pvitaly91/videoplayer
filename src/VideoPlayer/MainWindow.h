@@ -39,6 +39,8 @@ public:
     void OpenFiles(const std::vector<std::wstring>& paths);
 
 private:
+    friend struct MainWindowTestAccess;
+    using SetParentFunction = HWND (WINAPI*)(HWND, HWND);
     static LRESULT CALLBACK StaticWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK StaticVideoProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK StaticControlBarProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -64,6 +66,9 @@ private:
     bool ReparentControlBarControls(HWND parent) noexcept;
     void ApplyFullscreenControlBarOpacity() noexcept;
     void UpdateProgressStrip() noexcept;
+    bool CanShowOwnedPopups() const noexcept;
+    void CancelTransientUi() noexcept;
+    void RestoreUiAfterLifecycle();
 
     bool ProcessKeyboardMessage(const MSG& message);
     bool HandleHotKey(UINT key, bool controlDown, bool repeated);
@@ -77,6 +82,7 @@ private:
     void UpdateSeekLabel();
     bool SetSeekSliderFromPointer(int mouseX);
     void HandleSeekPointer(int mouseX);
+    bool CanReusePreviewRequest(std::uint32_t generation, std::int64_t quantizedTimestamp) const noexcept;
     void HideSeekPreview(bool cancelRequest = true) noexcept;
     void HandlePreviewResult();
     void SetVolumeFromSlider(int volume);
@@ -90,9 +96,11 @@ private:
     void RegisterInteraction(bool pointerMoved = false);
     void UpdateControlBarVisibility(bool pointerMoved = false);
     void FinishMouseControlInteraction() noexcept;
+    void RestoreVideoFocusAfterMouseInteraction() noexcept;
 
     void ToggleAreaZoom();
     void BeginAreaZoom();
+    bool ApplyAreaZoom(const VideoCrop& crop);
     void ResetAreaZoom();
     void HandleZoomEscape();
     void HandleSelectionOverlay(SelectionOverlayEvent event, const SelectionOverlayResult* result);
@@ -100,6 +108,7 @@ private:
 
     void HandlePlayerEvent(PlayerEvent event, std::uint32_t generation);
     void RefreshControls();
+    void RenderPlaybackSnapshot();
     void UpdateExecutionState(bool playing);
     void RestoreExecutionState();
     void ShowMediaError();
@@ -132,6 +141,7 @@ private:
     int dpi_ = 96;
 
     PlayerEngine player_;
+    PlaybackSnapshot playbackSnapshot_{};
     PreviewEngine previewEngine_;
     PreviewPopup previewPopup_;
     SelectionOverlay selectionOverlay_;
@@ -173,6 +183,12 @@ private:
     WINDOWPLACEMENT savedPlacement_{sizeof(WINDOWPLACEMENT)};
     bool executionStateActive_ = false;
     bool shutdownComplete_ = false;
+    bool applicationActive_ = true;
+    bool minimized_ = false;
+    bool cancellingTransient_ = false;
+    bool restoringUi_ = false;
+    bool pendingVideoRefocus_ = false;
+    SetParentFunction setParent_ = ::SetParent;
 };
 
 }  // namespace videoplayer

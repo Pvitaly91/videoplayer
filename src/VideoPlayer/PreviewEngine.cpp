@@ -31,7 +31,27 @@ constexpr std::size_t kPreviewBufferAlignment = 32;
 constexpr auto kDecodeThrottle = std::chrono::milliseconds(120);
 constexpr auto kFrameWaitTimeout = std::chrono::milliseconds(3000);
 constexpr auto kCancellationPollInterval = std::chrono::milliseconds(40);
-constexpr std::int64_t kAcceptedSeekToleranceMs = 2500;
+constexpr auto kRetryBackoff = std::chrono::milliseconds(80);
+constexpr unsigned int kMaximumDecodeAttempts = 2;
+
+std::int64_t PreviewDecodeTarget(const PreviewDecodeRequest& request) noexcept {
+    // At duration itself there is no following frame. Decode the final small
+    // interval so a request at the right edge can capture the final image.
+    const auto finalFrameTime = (std::max)(std::int64_t{0}, request.durationMs - 200);
+    return (std::max)(std::int64_t{0}, (std::min)(request.timestampMs, finalFrameTime));
+}
+
+bool PassPreviewPrerollBarrier(
+    bool& discardedFirstFrame,
+    const std::uint64_t displayedSequence,
+    std::uint64_t& afterSequence) noexcept {
+    if (discardedFirstFrame) {
+        return true;
+    }
+    discardedFirstFrame = true;
+    afterSequence = displayedSequence;
+    return false;
+}
 
 struct FileMediaSource final {
     explicit FileMediaSource(std::wstring sourcePath)
@@ -191,6 +211,7 @@ struct CapturedFrame final {
     unsigned int width = 0;
     unsigned int height = 0;
     unsigned int pitch = 0;
+    std::uint64_t sequence = 0;
     std::vector<std::uint8_t> pixels;
 };
 
@@ -351,19 +372,15 @@ public:
         const std::uint64_t requestId,
         const std::uint32_t mediaGeneration,
         const unsigned int attempt,
-        const std::atomic<bool>& stopping,
-        const std::atomic<std::uint64_t>& cancelEpoch,
-        const std::uint64_t requestCancelEpoch,
-        const std::atomic<std::uint32_t>& activeMediaGeneration,
+        const PreviewCancellation& cancellation,
+        const PreviewDecodeRequest& request,
         CapturedFrame& destination) noexcept {
         try {
             std::unique_lock<std::mutex> lock(mutex_);
             std::uint64_t observedSequence = afterSequence;
             for (;;) {
                 while (frameSequence_ <= observedSequence) {
-                    if (stopping.load(std::memory_order_acquire) ||
-                        cancelEpoch.load(std::memory_order_acquire) != requestCancelEpoch ||
-                        activeMediaGeneration.load(std::memory_order_acquire) != mediaGeneration) {
+                    if (cancellation.IsCancelled(request)) {
                         return FrameWaitResult::Cancelled;
                     }
                     const auto now = std::chrono::steady_clock::now();
@@ -374,9 +391,7 @@ public:
                         lock,
                         (std::min)(deadline, now + kCancellationPollInterval));
                 }
-                if (stopping.load(std::memory_order_acquire) ||
-                    cancelEpoch.load(std::memory_order_acquire) != requestCancelEpoch ||
-                    activeMediaGeneration.load(std::memory_order_acquire) != mediaGeneration) {
+                if (cancellation.IsCancelled(request)) {
                     return FrameWaitResult::Cancelled;
                 }
                 if (capturedMediaGeneration_ == mediaGeneration &&
@@ -394,6 +409,7 @@ public:
             destination.width = width_;
             destination.height = height_;
             destination.pitch = width_ * 4U;
+            destination.sequence = frameSequence_;
             destination.pixels = compactPixels_;
             return FrameWaitResult::Ready;
         } catch (...) {
@@ -476,15 +492,67 @@ void* __cdecl LockVideo(void* opaque, void** planes) noexcept {
     return context != nullptr ? context->Lock(planes) : nullptr;
 }
 
-void __cdecl UnlockVideo(
+void __cdecl DisplayVideo(
     void* opaque,
-    void* picture,
-    void* const*) noexcept {
+    void* picture) noexcept {
     auto* context = static_cast<PreviewVideoContext*>(opaque);
     if (context != nullptr) {
         context->Unlock(picture);
     }
 }
+
+// The UI can wake the active frame wait without owning or racing the worker's
+// callback context. Each player publishes a distinct shared context here;
+// the relay itself retains only a weak reference.
+class PreviewContextWakeRelay final {
+public:
+    void Set(const std::shared_ptr<PreviewVideoContext>& context) noexcept {
+        try {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            context_ = context;
+        } catch (...) {
+        }
+    }
+
+    void Clear(const std::shared_ptr<PreviewVideoContext>& context) noexcept {
+        try {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            if (context_.lock() == context) {
+                context_.reset();
+            }
+        } catch (...) {
+        }
+    }
+
+    void Wake() noexcept {
+        std::shared_ptr<PreviewVideoContext> context;
+        try {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            context = context_.lock();
+        } catch (...) {
+            return;
+        }
+        if (context) {
+            context->Wake();
+        }
+    }
+
+#if defined(VIDEOPLAYER_TESTING)
+    bool TargetsForTesting(
+        const std::shared_ptr<PreviewVideoContext>& context) noexcept {
+        try {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return context_.lock() == context;
+        } catch (...) {
+            return false;
+        }
+    }
+#endif
+
+private:
+    std::mutex mutex_;
+    std::weak_ptr<PreviewVideoContext> context_;
+};
 
 struct InstanceReleaser final {
     LibVlcRelease release = nullptr;
@@ -517,28 +585,16 @@ using InstancePtr = std::unique_ptr<libvlc_instance_t, InstanceReleaser>;
 using PlayerPtr = std::unique_ptr<libvlc_media_player_t, PlayerReleaser>;
 using MediaPtr = std::unique_ptr<libvlc_media_t, MediaReleaser>;
 
-struct DecodeRequest final {
-    std::wstring path;
-    std::uint32_t mediaGeneration = 0;
-    std::uint64_t requestId = 0;
-    std::uint64_t cancelEpoch = 0;
-    std::int64_t timestampMs = 0;
-    std::int64_t durationMs = 0;
-};
+using DecodeRequest = PreviewDecodeRequest;
+using DecodeStatus = PreviewDecodeStatus;
 
-enum class DecodeStatus {
-    Ready,
-    Cancelled,
-    Failed,
-};
-
-class WorkerResources final {
+class WorkerResources final : public PreviewBackend {
 public:
-    explicit WorkerResources(PreviewVideoContext& videoContext)
+    explicit WorkerResources(PreviewContextWakeRelay& wakeRelay)
         : instance_(nullptr, InstanceReleaser{}),
           player_(nullptr, PlayerReleaser{}),
           media_(nullptr, MediaReleaser{}),
-          videoContext_(videoContext) {
+          wakeRelay_(wakeRelay) {
     }
 
     ~WorkerResources() {
@@ -550,102 +606,92 @@ public:
 
     DecodeStatus Decode(
         const DecodeRequest& request,
-        const std::atomic<bool>& stopping,
-        const std::atomic<std::uint64_t>& cancelEpoch,
-        const std::atomic<std::uint32_t>& activeMediaGeneration,
-        PreviewFramePtr& result) noexcept {
+        const PreviewCancellation& cancellation,
+        PreviewFramePtr& result) override {
         result.reset();
         try {
-            if (IsCancelled(request, stopping, cancelEpoch, activeMediaGeneration)) {
+            if (cancellation.IsCancelled(request)) {
                 return DecodeStatus::Cancelled;
             }
-            if (!EnsurePlayer() || !EnsureMedia(request)) {
-                return DecodeStatus::Failed;
+            // Stop and release the old player, not only its input: LibVLC may
+            // retain a vout on a stopped player. Its delayed cleanup must not
+            // clear a new input's callback buffers.
+            ReleaseMedia();
+            if (!EnsurePlayer()) {
+                return DecodeStatus::RuntimeFailure;
             }
+            if (!EnsureMedia(request)) {
+                return DecodeStatus::RetryableFailure;
+            }
+
+            PreviewVideoContext& videoContext = *videoContext_;
+            // Invalidate on every return path, including cancellation,
+            // timeout and exceptions. A callback from a released player owns
+            // a different context and can never acquire this request's token.
+            struct CaptureReset final {
+                PreviewVideoContext& context;
+                ~CaptureReset() { context.SetCaptureToken(0, 0, 0); }
+            } captureReset{videoContext};
+            videoContext.SetCaptureToken(0, 0, 0);
 
             const LibVlcRuntime::Api& api = runtime_.Functions();
             api.audioSetVolume(player_.get(), 0);
             api.audioSetMute(player_.get(), 1);
 
-            std::int64_t decodeTarget = request.timestampMs;
-            if (request.durationMs > 0) {
-                decodeTarget = (std::min)(
-                    decodeTarget,
-                    request.durationMs > 1 ? request.durationMs - 1 : std::int64_t{0});
-            }
-            decodeTarget = (std::max)(std::int64_t{0}, decodeTarget);
-
-            if (!started_) {
-                if (api.mediaPlayerPlay(player_.get()) != 0) {
-                    return DecodeStatus::Failed;
-                }
-                started_ = true;
-            } else {
-                api.mediaPlayerSetPause(player_.get(), 0);
-            }
-
             const auto deadline = std::chrono::steady_clock::now() + kFrameWaitTimeout;
-            api.mediaPlayerSetTime(player_.get(), static_cast<libvlc_time_t>(decodeTarget));
-            std::uint64_t sequence = videoContext_.Sequence();
-            // Activate the token only after the asynchronous seek request.
-            // A buffer already locked by LibVLC keeps the previous token and
-            // is rejected by WaitForFrame.
-            videoContext_.SetCaptureToken(
-                request.mediaGeneration,
-                request.requestId,
-                1);
+            std::uint64_t sequence = videoContext.Sequence();
+            // EnsureMedia drains the prior input and sets start-time before
+            // playback. An asynchronous set_time can report the new timeline
+            // while still delivering old pixels, so it is deliberately absent
+            // here. Every callback now belongs to this request's fresh input.
+            videoContext.SetCaptureToken(request.mediaGeneration, request.requestId, 1);
+            if (api.mediaPlayerPlay(player_.get()) != 0) {
+                return DecodeStatus::RetryableFailure;
+            }
             CapturedFrame captured;
-            unsigned int seekAttempt = 1;
+            bool discardedPrerollFrame = false;
             for (;;) {
-                const FrameWaitResult waitResult = videoContext_.WaitForFrame(
+                const FrameWaitResult waitResult = videoContext.WaitForFrame(
                     sequence,
                     deadline,
                     request.requestId,
                     request.mediaGeneration,
-                    seekAttempt,
-                    stopping,
-                    cancelEpoch,
-                    request.cancelEpoch,
-                    activeMediaGeneration,
+                    1,
+                    cancellation,
+                    request,
                     captured);
                 if (waitResult == FrameWaitResult::Cancelled) {
                     api.mediaPlayerSetPause(player_.get(), 1);
                     return DecodeStatus::Cancelled;
                 }
                 if (waitResult == FrameWaitResult::TimedOut) {
+                    const auto finalState = api.mediaPlayerGetState(player_.get());
+                    // Only a running input with a populated timeline and an
+                    // explicit zero video-track count is negatively cached.
+                    // An opening decoder, failed seek, or lone timeout is not.
+                    const bool confirmedNoVideo = finalState == libvlc_Playing &&
+                        api.mediaPlayerGetTime(player_.get()) >= 1000 &&
+                        api.videoGetTrackCount(player_.get()) == 0;
                     api.mediaPlayerSetPause(player_.get(), 1);
-                    return DecodeStatus::Failed;
+                    return confirmedNoVideo ? DecodeStatus::UnsupportedMedia
+                        : DecodeStatus::RetryableFailure;
                 }
 
-                const libvlc_time_t reportedTime = api.mediaPlayerGetTime(player_.get());
-                const std::int64_t distance = reportedTime >= 0
-                    ? (std::max)(
-                        static_cast<std::int64_t>(reportedTime),
-                        decodeTarget) -
-                        (std::min)(
-                            static_cast<std::int64_t>(reportedTime),
-                            decodeTarget)
-                    : 0;
-                if (reportedTime < 0 || distance <= kAcceptedSeekToleranceMs) {
-                    break;
+                // This displayed frame belongs to the fresh player's own
+                // callback context. Do not qualify its pixels with get_time:
+                // LibVLC's cached clock can lag burned-in displayed PTS by
+                // several seconds or remain zero while the frame is correct.
+                // LibVLC can still display one common preroll buffer inside a
+                // fresh input before the start-time target. Never publish that
+                // first buffer as an exact thumbnail; wait for the next display
+                // callback. If there is no second frame, the bounded attempt
+                // fails with a placeholder instead of mislabelling old pixels.
+                if (!PassPreviewPrerollBarrier(
+                        discardedPrerollFrame, captured.sequence, sequence)) {
+                    captured = {};
+                    continue;
                 }
-                if (seekAttempt >= 3) {
-                    api.mediaPlayerSetPause(player_.get(), 1);
-                    return DecodeStatus::Failed;
-                }
-                // Deactivate the old attempt before the retry seek. A buffer
-                // already locked for that attempt can finish, but its token
-                // cannot satisfy the next WaitForFrame call.
-                videoContext_.SetCaptureToken(0, 0, 0);
-                ++seekAttempt;
-                sequence = videoContext_.Sequence();
-                api.mediaPlayerSetTime(
-                    player_.get(),
-                    static_cast<libvlc_time_t>(decodeTarget));
-                videoContext_.SetCaptureToken(
-                    request.mediaGeneration,
-                    request.requestId,
-                    seekAttempt);
+                break;
             }
             api.mediaPlayerSetPause(player_.get(), 1);
 
@@ -658,33 +704,40 @@ public:
             mutableFrame->topDown = true;
             mutableFrame->pixels = std::move(captured.pixels);
             if (!mutableFrame->IsValid()) {
-                return DecodeStatus::Failed;
+                return DecodeStatus::RetryableFailure;
             }
             result = std::move(mutableFrame);
             return DecodeStatus::Ready;
         } catch (...) {
-            return DecodeStatus::Failed;
+            return DecodeStatus::RuntimeFailure;
         }
     }
 
-    void ReleaseMedia() noexcept {
+    void ReleaseMedia() noexcept override {
+        const std::shared_ptr<PreviewVideoContext> context = videoContext_;
+        if (context) {
+            context->SetCaptureToken(0, 0, 0);
+        }
         try {
             if (player_ && runtime_.IsLoaded()) {
                 const LibVlcRuntime::Api& api = runtime_.Functions();
                 api.mediaPlayerStop(player_.get());
                 api.mediaPlayerSetMedia(player_.get(), nullptr);
             }
+            player_.reset();
+            // Player release is the callback lifetime boundary. Only after it
+            // returns may this player's private opaque/buffers be retired.
+            wakeRelay_.Clear(context);
+            if (context) {
+                context->Cleanup();
+            }
+            videoContext_.reset();
             media_.reset();
             mediaSource_.reset();
             loadedPath_.clear();
             loadedGeneration_ = 0;
-            started_ = false;
         } catch (...) {
         }
-    }
-
-    void WakeVideoWait() noexcept {
-        videoContext_.Wake();
     }
 
     void Shutdown() noexcept {
@@ -692,24 +745,11 @@ public:
         // LibVLC 3 has no documented callback-detach operation: lock/setup
         // callbacks are required to be non-null. Releasing the stopped player
         // synchronously closes its vout while videoContext_ is still alive.
-        player_.reset();
-        videoContext_.Cleanup();
         instance_.reset();
         runtime_.Unload();
     }
 
 private:
-    static bool IsCancelled(
-        const DecodeRequest& request,
-        const std::atomic<bool>& stopping,
-        const std::atomic<std::uint64_t>& cancelEpoch,
-        const std::atomic<std::uint32_t>& activeMediaGeneration) noexcept {
-        return stopping.load(std::memory_order_acquire) ||
-            cancelEpoch.load(std::memory_order_acquire) != request.cancelEpoch ||
-            activeMediaGeneration.load(std::memory_order_acquire) !=
-                request.mediaGeneration;
-    }
-
     bool EnsurePlayer() {
         if (player_) {
             return true;
@@ -720,46 +760,48 @@ private:
         }
         const LibVlcRuntime::Api& api = runtime_.Functions();
 
-        std::array<const char*, kPrivateLibVlcArguments.size() + 1> arguments{};
-        std::copy(
-            kPrivateLibVlcArguments.begin(),
-            kPrivateLibVlcArguments.end(),
-            arguments.begin());
-        arguments.back() = "--no-audio";
-        libvlc_instance_t* rawInstance = api.newInstance(
-            static_cast<int>(arguments.size()),
-            arguments.data());
-        if (rawInstance == nullptr) {
-            return false;
+        if (!instance_) {
+            std::array<const char*, kPrivateLibVlcArguments.size() + 2> arguments{};
+            std::copy(kPrivateLibVlcArguments.begin(), kPrivateLibVlcArguments.end(),
+                arguments.begin());
+            arguments[kPrivateLibVlcArguments.size()] = "--no-audio";
+            // Thumbnails are CPU RV32 buffers. GPU decoder/converter surfaces
+            // provide no benefit here and complicate repeated vmem restarts.
+            arguments.back() = "--avcodec-hw=none";
+            libvlc_instance_t* rawInstance = api.newInstance(
+                static_cast<int>(arguments.size()), arguments.data());
+            if (rawInstance == nullptr) {
+                return false;
+            }
+            instance_ = InstancePtr(rawInstance, InstanceReleaser{api.releaseInstance});
         }
-        instance_ = InstancePtr(rawInstance, InstanceReleaser{api.releaseInstance});
 
+        auto context = std::make_shared<PreviewVideoContext>();
         libvlc_media_player_t* rawPlayer = api.mediaPlayerNew(instance_.get());
         if (rawPlayer == nullptr) {
             return false;
         }
         player_ = PlayerPtr(rawPlayer, PlayerReleaser{api.mediaPlayerRelease});
+        videoContext_ = std::move(context);
         api.videoSetCallbacks(
             player_.get(),
             &LockVideo,
-            &UnlockVideo,
             nullptr,
-            &videoContext_);
+            &DisplayVideo,
+            videoContext_.get());
         api.videoSetFormatCallbacks(
             player_.get(),
             &ConfigureVideo,
             &CleanupVideo);
+        wakeRelay_.Set(videoContext_);
         api.audioSetVolume(player_.get(), 0);
         api.audioSetMute(player_.get(), 1);
         return true;
     }
 
     bool EnsureMedia(const DecodeRequest& request) {
-        if (media_ && loadedGeneration_ == request.mediaGeneration &&
-            loadedPath_ == request.path) {
-            return true;
-        }
-        ReleaseMedia();
+        // Decode has already released the preceding player/vout. A fresh
+        // player/input also recovers Ended/Stopped/Error without set_pause(0).
         if (request.path.empty() || !player_ || !instance_) {
             return false;
         }
@@ -778,6 +820,11 @@ private:
             return false;
         }
         media_ = MediaPtr(rawMedia, MediaReleaser{api.mediaRelease});
+        const auto target = PreviewDecodeTarget(request);
+        const auto milliseconds = std::to_string(1000 + target % 1000).substr(1);
+        const std::string startTime = ":start-time=" +
+            std::to_string(target / 1000) + "." + milliseconds;
+        api.mediaAddOption(media_.get(), startTime.c_str());
         api.mediaPlayerSetMedia(player_.get(), media_.get());
         loadedPath_ = request.path;
         loadedGeneration_ = request.mediaGeneration;
@@ -789,24 +836,190 @@ private:
     PlayerPtr player_;
     MediaPtr media_;
     std::unique_ptr<FileMediaSource> mediaSource_;
-    PreviewVideoContext& videoContext_;
+    std::shared_ptr<PreviewVideoContext> videoContext_;
+    PreviewContextWakeRelay& wakeRelay_;
     std::wstring loadedPath_;
     std::uint32_t loadedGeneration_ = 0;
-    bool started_ = false;
 };
 
 }  // namespace
 
+#if defined(VIDEOPLAYER_TESTING)
+bool VerifyPreviewCaptureIsolationForTesting() {
+    bool discardedPrerollFrame = false;
+    std::uint64_t barrierSequence = 7;
+    if (PassPreviewPrerollBarrier(discardedPrerollFrame, 8, barrierSequence) ||
+        barrierSequence != 8 ||
+        !PassPreviewPrerollBarrier(discardedPrerollFrame, 9, barrierSequence) ||
+        barrierSequence != 8) {
+        return false;
+    }
+
+    PreviewVideoContext context;
+    char chroma[4]{};
+    unsigned int width = 2, height = 2, pitch = 0, lines = 0;
+    if (context.Configure(chroma, &width, &height, &pitch, &lines) == 0) {
+        return false;
+    }
+    std::atomic<bool> stopping{false};
+    std::atomic<std::uint64_t> epoch{1}, latest{2};
+    std::atomic<std::uint32_t> generation{1};
+    PreviewCancellation cancellation{stopping, epoch, generation, latest};
+    PreviewDecodeRequest request{L"A", 1, 2, 1, 1000, 10000};
+    context.SetCaptureToken(1, 1, 1);
+    void* oldPlane = nullptr;
+    void* oldPicture = context.Lock(&oldPlane);
+    context.SetCaptureToken(0, 0, 0);
+    context.SetCaptureToken(1, 2, 1);
+    context.Unlock(oldPicture);
+    CapturedFrame frame;
+    const auto stale = context.WaitForFrame(0, std::chrono::steady_clock::now(),
+        2, 1, 1, cancellation, request, frame);
+    if (stale != FrameWaitResult::TimedOut || !frame.pixels.empty()) {
+        return false;
+    }
+    const auto sequence = context.Sequence();
+    void* newPlane = nullptr;
+    void* newPicture = context.Lock(&newPlane);
+    context.Unlock(newPicture);
+    if (context.WaitForFrame(sequence, std::chrono::steady_clock::now(),
+        2, 1, 1, cancellation, request, frame) != FrameWaitResult::Ready) {
+        return false;
+    }
+    // A seek retry with the same request ID must reject the earlier attempt.
+    oldPicture = context.Lock(&oldPlane);
+    const auto retrySequence = context.Sequence();
+    context.SetCaptureToken(0, 0, 0);
+    context.SetCaptureToken(1, 2, 2);
+    context.Unlock(oldPicture);
+    frame = {};
+    if (context.WaitForFrame(retrySequence, std::chrono::steady_clock::now(),
+            2, 1, 2, cancellation, request, frame) != FrameWaitResult::TimedOut ||
+        !frame.pixels.empty()) {
+        return false;
+    }
+
+    auto oldContext = std::make_shared<PreviewVideoContext>();
+    auto currentContext = std::make_shared<PreviewVideoContext>();
+    width = height = 2;
+    if (oldContext->Configure(chroma, &width, &height, &pitch, &lines) == 0) {
+        return false;
+    }
+    width = height = 2;
+    if (currentContext->Configure(chroma, &width, &height, &pitch, &lines) == 0) {
+        return false;
+    }
+    PreviewContextWakeRelay relay;
+    relay.Set(oldContext);
+    oldContext->SetCaptureToken(1, 2, 1);
+    void* latePlane = nullptr;
+    void* latePicture = oldContext->Lock(&latePlane);
+    relay.Set(currentContext);
+    relay.Clear(oldContext);
+    if (!relay.TargetsForTesting(currentContext)) {
+        return false;
+    }
+    oldContext->Unlock(latePicture);
+    const auto currentSequence = currentContext->Sequence();
+    frame = {};
+    if (currentContext->WaitForFrame(currentSequence,
+            std::chrono::steady_clock::now(), 2, 1, 1,
+            cancellation, request, frame) != FrameWaitResult::TimedOut ||
+        !frame.pixels.empty()) {
+        return false;
+    }
+    currentContext->SetCaptureToken(1, 2, 1);
+    void* currentPlane = nullptr;
+    void* currentPicture = currentContext->Lock(&currentPlane);
+    currentContext->Unlock(currentPicture);
+    return currentContext->WaitForFrame(currentSequence,
+        std::chrono::steady_clock::now(), 2, 1, 1,
+        cancellation, request, frame) == FrameWaitResult::Ready;
+}
+#endif
+
 class PreviewEngine::Impl final {
 public:
+    explicit Impl(PreviewBackendFactory factory = {})
+        : backendFactory(std::move(factory)) {
+    }
+
+    PreviewCancellation Cancellation() const noexcept {
+        return {stopping, cancelEpoch, activeMediaGeneration, latestRequestId};
+    }
+
+    bool IsCurrentLocked(const DecodeRequest& request) const noexcept {
+        return initialized && accepting && !Cancellation().IsCancelled(request);
+    }
+
+    void Notify() {
+        HWND target = nullptr;
+        UINT message = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (initialized && accepting) {
+                target = notificationWindow;
+                message = resultMessage;
+            }
+        }
+        if (target != nullptr && message != 0) {
+            ::PostMessageW(target, message, 0, 0);
+        }
+    }
+
+    void Publish(const DecodeRequest& request, PreviewFramePtr frame) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!IsCurrentLocked(request) || !frame || !frame->IsValid() ||
+                frame->mediaGeneration != request.mediaGeneration ||
+                frame->timestampMs != request.timestampMs) {
+                return;
+            }
+            // Cache and publication are both guarded by current epoch/request.
+            // Cancelled/stale frames never poison the current media cache.
+            cache.Put(frame);
+            requestState = PreviewRequestState::Ready;
+            readyResult = PreviewResult{request.mediaGeneration,
+                request.requestId, request.timestampMs, std::move(frame)};
+        }
+        Notify();
+    }
+
+    void CompleteFailure(const DecodeRequest& request, const DecodeStatus status) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!IsCurrentLocked(request)) {
+                return;
+            }
+            readyResult.reset();
+            switch (status) {
+            case DecodeStatus::Cancelled:
+                requestState = PreviewRequestState::Cancelled;
+                break;
+            case DecodeStatus::UnsupportedMedia:
+                requestState = PreviewRequestState::UnsupportedMedia;
+                unsupportedGeneration = request.mediaGeneration;
+                break;
+            case DecodeStatus::RuntimeFailure:
+                requestState = PreviewRequestState::RuntimeFailure;
+                break;
+            default:
+                requestState = PreviewRequestState::RetryableFailure;
+                break;
+            }
+        }
+        // Notification is a wake-up, not a heap-owned result. Failure leaves
+        // no frame; UI queries state and permits the next explicit hover.
+        Notify();
+    }
+
     void WorkerMain() noexcept {
         ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        WorkerResources resources(videoContext);
+        std::unique_ptr<PreviewBackend> backend;
         try {
             for (;;) {
                 DecodeRequest request;
                 bool releaseOnly = false;
-                std::uint64_t releaseSerial = 0;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     condition.wait(lock, [this] {
@@ -816,120 +1029,154 @@ public:
                     if (stopping.load(std::memory_order_acquire)) {
                         break;
                     }
-
-                    if (!pending.has_value() && mediaResetRequested) {
+                    if (mediaResetRequested) {
                         mediaResetRequested = false;
                         releaseOnly = true;
-                        releaseSerial = mediaResetSerial;
                     } else {
-                        const auto now = std::chrono::steady_clock::now();
-                        if (now < nextDecodeAllowed) {
-                            condition.wait_until(lock, nextDecodeAllowed, [this] {
-                                return stopping.load(std::memory_order_acquire);
-                            });
-                            if (stopping.load(std::memory_order_acquire)) {
-                                break;
-                            }
+                        condition.wait_until(lock, nextDecodeAllowed, [this] {
+                            return stopping.load(std::memory_order_acquire) ||
+                                mediaResetRequested;
+                        });
+                        if (stopping.load(std::memory_order_acquire)) {
+                            break;
                         }
-                        if (!pending.has_value()) {
+                        if (mediaResetRequested || !pending.has_value()) {
                             continue;
                         }
-                        request = *pending;
+                        request = std::move(*pending);
                         pending.reset();
-                        mediaResetRequested = false;
+                        requestState = PreviewRequestState::Decoding;
+                        workerState = backend ? PreviewWorkerState::Running
+                            : PreviewWorkerState::Recovering;
                         nextDecodeAllowed =
                             std::chrono::steady_clock::now() + kDecodeThrottle;
                     }
                 }
-
                 if (releaseOnly) {
-                    resources.ReleaseMedia();
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        completedMediaResetSerial = (std::max)(
-                            completedMediaResetSerial, releaseSerial);
+                    if (backend) {
+                        backend->ReleaseMedia();
                     }
-                    condition.notify_all();
                     continue;
                 }
 
-                PreviewFramePtr frame = cache.Find(
-                    request.mediaGeneration,
-                    request.timestampMs);
-                DecodeStatus status = DecodeStatus::Ready;
-                if (!frame) {
-                    status = resources.Decode(
-                        request,
-                        stopping,
-                        cancelEpoch,
-                        activeMediaGeneration,
-                        frame);
-                    if (status == DecodeStatus::Ready && frame) {
-                        cache.Put(frame);
+                DecodeStatus status = DecodeStatus::Cancelled;
+                PreviewFramePtr frame;
+                try {
+                    for (unsigned int attempt = 0;
+                        attempt < kMaximumDecodeAttempts; ++attempt) {
+                        if (Cancellation().IsCancelled(request)) {
+                            status = DecodeStatus::Cancelled;
+                            break;
+                        }
+                        if (!backend) {
+                            backend = backendFactory ? backendFactory()
+                                : std::make_unique<WorkerResources>(videoWakeRelay);
+                        }
+                        if (!backend) {
+                            status = DecodeStatus::RuntimeFailure;
+                            break;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            if (!stopping.load(std::memory_order_acquire)) {
+                                workerState = PreviewWorkerState::Running;
+                            }
+                        }
+                        frame.reset();
+                        status = backend->Decode(request, Cancellation(), frame);
+                        if (Cancellation().IsCancelled(request)) {
+                            frame.reset();
+                            status = DecodeStatus::Cancelled;
+                            break;
+                        }
+                        if (status == DecodeStatus::Ready && (!frame ||
+                            !frame->IsValid() ||
+                            frame->mediaGeneration != request.mediaGeneration ||
+                            frame->timestampMs != request.timestampMs)) {
+                            frame.reset();
+                            status = DecodeStatus::RetryableFailure;
+                        }
+                        if (status != DecodeStatus::RetryableFailure) {
+                            break;
+                        }
+                        // Only preview media restarts. Source and callback
+                        // buffers remain alive until synchronous stop drains.
+                        backend->ReleaseMedia();
+                        if (attempt + 1 >= kMaximumDecodeAttempts) {
+                            break;
+                        }
+                        std::unique_lock<std::mutex> lock(mutex);
+                        if (!stopping.load(std::memory_order_acquire)) {
+                            workerState = PreviewWorkerState::Recovering;
+                        }
+                        condition.wait_for(lock, kRetryBackoff, [this, &request] {
+                            return Cancellation().IsCancelled(request);
+                        });
                     }
+                } catch (...) {
+                    status = DecodeStatus::RuntimeFailure;
+                    frame.reset();
                 }
 
-                if (status == DecodeStatus::Failed) {
+                if (status == DecodeStatus::RuntimeFailure) {
+                    // Cleanup stays on the worker. Next explicit request uses
+                    // this same thread and creates a fresh preview backend.
+                    backend.reset();
+                }
+                {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if (activeMediaGeneration.load(std::memory_order_acquire) ==
-                            request.mediaGeneration &&
-                        latestRequestId.load(std::memory_order_acquire) ==
-                            request.requestId) {
-                        failedGeneration = request.mediaGeneration;
+                    if (!stopping.load(std::memory_order_acquire)) {
+                        workerState = status == DecodeStatus::RuntimeFailure
+                            ? PreviewWorkerState::Faulted : PreviewWorkerState::Running;
                     }
-                } else if (status == DecodeStatus::Ready && frame) {
+                }
+                if (status == DecodeStatus::Ready) {
+#if defined(VIDEOPLAYER_TESTING)
+                    if (failNextPublicationForTesting.exchange(false, std::memory_order_acq_rel)) {
+                        // Deliberately cover a fatal outer-loop exception,
+                        // rather than the per-request Decode catch.
+                        throw std::bad_alloc{};
+                    }
+#endif
                     Publish(request, std::move(frame));
+                } else {
+                    CompleteFailure(request, status);
                 }
             }
         } catch (...) {
-        }
-        resources.Shutdown();
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            completedMediaResetSerial = (std::max)(
-                completedMediaResetSerial, mediaResetSerial);
-        }
-        condition.notify_all();
-    }
-
-    void Publish(const DecodeRequest& request, PreviewFramePtr frame) noexcept {
-        HWND targetWindow = nullptr;
-        UINT targetMessage = 0;
-        try {
+            // An exception outside Decode cannot leave a live-looking queue.
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (!initialized || !accepting ||
-                    activeMediaGeneration.load(std::memory_order_acquire) !=
-                        request.mediaGeneration ||
-                    cancelEpoch.load(std::memory_order_acquire) !=
-                        request.cancelEpoch ||
-                    request.requestId <= latestPublishedRequestId) {
-                    return;
-                }
-                latestPublishedRequestId = request.requestId;
-                readyResult = PreviewResult{
-                    request.mediaGeneration,
-                    request.requestId,
-                    request.timestampMs,
-                    std::move(frame)};
-                targetWindow = notificationWindow;
-                targetMessage = resultMessage;
+                pending.reset();
+                readyResult.reset();
+                requestState = PreviewRequestState::RuntimeFailure;
+                workerState = PreviewWorkerState::Faulted;
+                workerExiting = true;
             }
-            if (targetWindow != nullptr && targetMessage != 0) {
-                ::PostMessageW(targetWindow, targetMessage, 0, 0);
-            }
-        } catch (...) {
+            Notify();
         }
+        // Sources/players/callbacks die before DLL unload. No mutex is held.
+        backend.reset();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping.load(std::memory_order_acquire)) {
+                workerState = PreviewWorkerState::Stopped;
+            }
+            workerExited = true;
+        }
+        condition.notify_all();
     }
 
     mutable std::mutex mutex;
     std::mutex shutdownMutex;
     std::condition_variable condition;
-    PreviewVideoContext videoContext;
+    PreviewContextWakeRelay videoWakeRelay;
     PreviewCache cache{24};
+    PreviewBackendFactory backendFactory;
     std::thread worker;
     std::optional<DecodeRequest> pending;
     std::optional<PreviewResult> readyResult;
+    std::optional<std::uint32_t> unsupportedGeneration;
     std::wstring mediaPath;
     HWND notificationWindow = nullptr;
     UINT resultMessage = kPreviewFrameReadyMessage;
@@ -939,18 +1186,25 @@ public:
     std::atomic<std::uint64_t> cancelEpoch{0};
     std::atomic<std::uint32_t> activeMediaGeneration{0};
     std::uint64_t nextRequestId = 0;
-    std::uint64_t latestPublishedRequestId = 0;
-    std::uint64_t mediaResetSerial = 0;
-    std::uint64_t completedMediaResetSerial = 0;
-    std::uint32_t failedGeneration = 0;
+    PreviewWorkerState workerState = PreviewWorkerState::NotStarted;
+    PreviewRequestState requestState = PreviewRequestState::Idle;
     bool initialized = false;
     bool accepting = false;
-    bool workerStarted = false;
+    bool workerExited = true;
+    bool workerExiting = false;
     bool mediaResetRequested = false;
+#if defined(VIDEOPLAYER_TESTING)
+    std::atomic<bool> failNextPublicationForTesting{false};
+    unsigned int workerLaunchCountForTesting = 0;
+#endif
 };
 
 PreviewEngine::PreviewEngine()
-    : impl_(std::make_unique<Impl>()) {
+    : PreviewEngine(PreviewBackendFactory{}) {
+}
+
+PreviewEngine::PreviewEngine(PreviewBackendFactory backendFactory)
+    : impl_(std::make_unique<Impl>(std::move(backendFactory))) {
 }
 
 PreviewEngine::~PreviewEngine() {
@@ -982,41 +1236,49 @@ void PreviewEngine::SetMedia(
     const std::wstring& ioPath,
     const std::uint32_t mediaGeneration) noexcept {
     try {
-        std::uint64_t resetSerial = 0;
-        bool waitForRelease = false;
+        std::wstring nextPath(ioPath);
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->mediaPath = ioPath;
-            impl_->activeMediaGeneration.store(
-                mediaGeneration,
-                std::memory_order_release);
+            impl_->mediaPath = std::move(nextPath);
+            impl_->activeMediaGeneration.store(mediaGeneration, std::memory_order_release);
             impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
-            ++impl_->nextRequestId;
-            impl_->latestRequestId.store(
-                impl_->nextRequestId,
-                std::memory_order_release);
+            impl_->latestRequestId.store(++impl_->nextRequestId, std::memory_order_release);
             impl_->pending.reset();
             impl_->readyResult.reset();
-            impl_->latestPublishedRequestId = 0;
-            impl_->failedGeneration = 0;
+            impl_->requestState = PreviewRequestState::Idle;
+            impl_->unsupportedGeneration.reset();
             impl_->mediaResetRequested = true;
-            resetSerial = ++impl_->mediaResetSerial;
-            waitForRelease = ioPath.empty() && impl_->workerStarted;
-            if (!impl_->workerStarted) {
-                impl_->completedMediaResetSerial = resetSerial;
-            }
+            impl_->cache.ClearForMedia(mediaGeneration);
         }
-        impl_->cache.ClearForMedia(mediaGeneration);
         impl_->condition.notify_all();
-        impl_->videoContext.Wake();
-        if (waitForRelease) {
-            std::unique_lock<std::mutex> lock(impl_->mutex);
-            impl_->condition.wait(lock, [implementation = impl_.get(), resetSerial] {
-                return implementation->completedMediaResetSerial >= resetSerial ||
-                    implementation->stopping.load(std::memory_order_acquire);
-            });
-        }
+        impl_->videoWakeRelay.Wake();
+        // No decoder cleanup or wait on the UI thread. DecodeRequest owns its
+        // path; FileMediaSource remains alive until worker stop/release ends.
     } catch (...) {
+        // Allocation failure must not keep the previous file eligible for
+        // preview after the main player has already switched media.
+        try {
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->mediaPath.clear();
+                impl_->activeMediaGeneration.store(mediaGeneration, std::memory_order_release);
+                impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
+                impl_->latestRequestId.store(++impl_->nextRequestId, std::memory_order_release);
+                impl_->pending.reset();
+                impl_->readyResult.reset();
+                impl_->requestState = PreviewRequestState::RuntimeFailure;
+                impl_->mediaResetRequested = true;
+                impl_->cache.ClearForMedia(mediaGeneration);
+            }
+            impl_->condition.notify_all();
+            impl_->videoWakeRelay.Wake();
+            impl_->Notify();
+        } catch (...) {
+            // Synchronization itself is unavailable; cooperative shutdown
+            // still observes these atomics without requiring this mutex.
+            impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
+            impl_->condition.notify_all();
+        }
     }
 }
 
@@ -1024,61 +1286,98 @@ std::uint64_t PreviewEngine::RequestFrame(
     const std::int64_t timestampMs,
     const std::int64_t durationMs) noexcept {
     try {
+        // Serialize thread creation/join with Shutdown, never with decoding.
+        std::lock_guard<std::mutex> shutdownLock(impl_->shutdownMutex);
         DecodeRequest request;
+        PreviewFramePtr cached;
+        bool rejected = false;
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            ++impl_->nextRequestId;
-            request.requestId = impl_->nextRequestId;
+            request.requestId = ++impl_->nextRequestId;
             impl_->latestRequestId.store(request.requestId, std::memory_order_release);
-            request.mediaGeneration =
-                impl_->activeMediaGeneration.load(std::memory_order_acquire);
+            request.mediaGeneration = impl_->activeMediaGeneration.load(std::memory_order_acquire);
             request.cancelEpoch = impl_->cancelEpoch.load(std::memory_order_acquire);
             request.timestampMs = QuantizePreviewTimestamp(timestampMs, durationMs);
             request.durationMs = (std::max)(std::int64_t{0}, durationMs);
             request.path = impl_->mediaPath;
             impl_->pending.reset();
-
+            impl_->readyResult.reset();
+            impl_->requestState = PreviewRequestState::Cancelled;
             if (!impl_->initialized || !impl_->accepting || request.path.empty() ||
-                request.durationMs <= 0 ||
-                impl_->failedGeneration == request.mediaGeneration) {
-                return request.requestId;
+                request.durationMs <= 0) {
+                rejected = true;
+            } else if (impl_->workerExiting && !impl_->workerExited) {
+                impl_->requestState = PreviewRequestState::RuntimeFailure;
+                rejected = true;
+            } else if (impl_->unsupportedGeneration == request.mediaGeneration) {
+                impl_->requestState = PreviewRequestState::UnsupportedMedia;
+                rejected = true;
+            } else {
+                cached = impl_->cache.Find(request.mediaGeneration, request.timestampMs);
+                impl_->requestState = PreviewRequestState::Pending;
             }
         }
-
-        PreviewFramePtr cached = impl_->cache.Find(
-            request.mediaGeneration,
-            request.timestampMs);
+        impl_->videoWakeRelay.Wake();
+        if (rejected) {
+            impl_->condition.notify_all();
+            impl_->Notify();
+            return request.requestId;
+        }
         if (cached) {
             impl_->Publish(request, std::move(cached));
             return request.requestId;
         }
-
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            if (!impl_->initialized || !impl_->accepting ||
-                impl_->latestRequestId.load(std::memory_order_acquire) !=
-                    request.requestId ||
-                impl_->activeMediaGeneration.load(std::memory_order_acquire) !=
-                    request.mediaGeneration) {
+            if (!impl_->IsCurrentLocked(request)) {
                 return request.requestId;
             }
             impl_->pending = request;
-            if (!impl_->workerStarted) {
+            if (impl_->workerExited) {
+                // Set only after backend/callback destruction; this join
+                // cannot wait for a decoder or for its cleanup.
+                if (impl_->worker.joinable()) {
+                    impl_->worker.join();
+                }
                 try {
+                    impl_->workerExited = false;
+                    impl_->workerExiting = false;
+                    impl_->workerState = PreviewWorkerState::Recovering;
                     impl_->worker = std::thread([implementation = impl_.get()] {
                         implementation->WorkerMain();
                     });
-                    impl_->workerStarted = true;
+#if defined(VIDEOPLAYER_TESTING)
+                    ++impl_->workerLaunchCountForTesting;
+#endif
                 } catch (...) {
+                    impl_->workerExited = true;
+                    impl_->workerState = PreviewWorkerState::Faulted;
                     impl_->pending.reset();
-                    impl_->failedGeneration = request.mediaGeneration;
-                    return request.requestId;
+                    impl_->requestState = PreviewRequestState::RuntimeFailure;
                 }
+            } else if (impl_->workerState == PreviewWorkerState::Faulted) {
+                impl_->workerState = PreviewWorkerState::Recovering;
             }
         }
         impl_->condition.notify_all();
+        impl_->Notify();
         return request.requestId;
     } catch (...) {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->pending.reset();
+                impl_->readyResult.reset();
+                impl_->requestState = PreviewRequestState::RuntimeFailure;
+                impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
+            }
+            impl_->condition.notify_all();
+            impl_->videoWakeRelay.Wake();
+            impl_->Notify();
+        } catch (...) {
+            impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
+            impl_->condition.notify_all();
+        }
         return impl_->latestRequestId.load(std::memory_order_acquire);
     }
 }
@@ -1087,16 +1386,14 @@ void PreviewEngine::CancelRequests() noexcept {
     try {
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            ++impl_->nextRequestId;
-            impl_->latestRequestId.store(
-                impl_->nextRequestId,
-                std::memory_order_release);
+            impl_->latestRequestId.store(++impl_->nextRequestId, std::memory_order_release);
             impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
             impl_->pending.reset();
             impl_->readyResult.reset();
+            impl_->requestState = PreviewRequestState::Cancelled;
         }
         impl_->condition.notify_all();
-        impl_->videoContext.Wake();
+        impl_->videoWakeRelay.Wake();
     } catch (...) {
     }
 }
@@ -1104,9 +1401,6 @@ void PreviewEngine::CancelRequests() noexcept {
 std::optional<PreviewResult> PreviewEngine::TakeLatestResult() noexcept {
     try {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->readyResult.has_value()) {
-            return std::nullopt;
-        }
         std::optional<PreviewResult> result = std::move(impl_->readyResult);
         impl_->readyResult.reset();
         return result;
@@ -1116,63 +1410,79 @@ std::optional<PreviewResult> PreviewEngine::TakeLatestResult() noexcept {
 }
 
 bool PreviewEngine::IsInitialized() const noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        return impl_->initialized;
-    } catch (...) {
-        return false;
-    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->initialized;
 }
 
 bool PreviewEngine::HasWorker() const noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        return impl_->workerStarted;
-    } catch (...) {
-        return false;
-    }
+    const auto state = GetWorkerState();
+    return state == PreviewWorkerState::Running || state == PreviewWorkerState::Recovering;
 }
+
+PreviewWorkerState PreviewEngine::GetWorkerState() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->workerState;
+}
+
+PreviewRequestState PreviewEngine::GetRequestState(const std::uint64_t requestId) const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return requestId != 0 && requestId == impl_->latestRequestId.load(std::memory_order_acquire)
+        ? impl_->requestState : PreviewRequestState::Cancelled;
+}
+
+bool PreviewEngine::IsRequestPending(const std::uint64_t requestId) const noexcept {
+    const auto state = GetRequestState(requestId);
+    return state == PreviewRequestState::Pending || state == PreviewRequestState::Decoding;
+}
+
+#if defined(VIDEOPLAYER_TESTING)
+void PreviewEngine::FailNextWorkerPublicationForTesting() noexcept {
+    impl_->failNextPublicationForTesting.store(true, std::memory_order_release);
+}
+
+bool PreviewEngine::WorkerHasExitedForTesting() const noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->workerExited;
+}
+
+unsigned int PreviewEngine::WorkerLaunchCountForTesting() const noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->workerLaunchCountForTesting;
+}
+#endif
 
 void PreviewEngine::Shutdown() noexcept {
     if (!impl_) {
         return;
     }
-    try {
-        std::lock_guard<std::mutex> shutdownLock(impl_->shutdownMutex);
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            if (!impl_->initialized && !impl_->worker.joinable()) {
-                impl_->cache.Clear();
-                return;
-            }
-            impl_->accepting = false;
-            impl_->initialized = false;
-            impl_->stopping.store(true, std::memory_order_release);
-            impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
-            impl_->activeMediaGeneration.fetch_add(1, std::memory_order_acq_rel);
-            ++impl_->nextRequestId;
-            impl_->latestRequestId.store(
-                impl_->nextRequestId,
-                std::memory_order_release);
-            impl_->pending.reset();
-            impl_->readyResult.reset();
-            impl_->latestPublishedRequestId = 0;
-            impl_->mediaResetRequested = false;
-            impl_->notificationWindow = nullptr;
-        }
-        impl_->condition.notify_all();
-        impl_->videoContext.Wake();
-        if (impl_->worker.joinable()) {
-            impl_->worker.join();
-        }
+    std::lock_guard<std::mutex> shutdownLock(impl_->shutdownMutex);
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->accepting = false;
+        impl_->initialized = false;
+        impl_->stopping.store(true, std::memory_order_release);
+        impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
+        impl_->activeMediaGeneration.fetch_add(1, std::memory_order_acq_rel);
+        impl_->latestRequestId.store(++impl_->nextRequestId, std::memory_order_release);
+        impl_->pending.reset();
+        impl_->readyResult.reset();
+        impl_->requestState = PreviewRequestState::Cancelled;
+        impl_->workerState = PreviewWorkerState::Stopping;
+        impl_->mediaResetRequested = false;
+        impl_->notificationWindow = nullptr;
+    }
+    impl_->condition.notify_all();
+    impl_->videoWakeRelay.Wake();
+    if (impl_->worker.joinable()) {
+        impl_->worker.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->cache.Clear();
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->workerStarted = false;
-            impl_->mediaPath.clear();
-            impl_->failedGeneration = 0;
-        }
-    } catch (...) {
+        impl_->workerExited = true;
+        impl_->workerState = PreviewWorkerState::Stopped;
+        impl_->mediaPath.clear();
+        impl_->unsupportedGeneration.reset();
     }
 }
 
