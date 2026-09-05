@@ -74,6 +74,57 @@ std::int64_t PreviewTimeFromChannelX(
     return (whole * offset) + static_cast<std::int64_t>(fractional);
 }
 
+RECT TrackbarPointerRange(
+    const RECT& channel,
+    const RECT& thumb) noexcept {
+    const std::int64_t channelLeft = channel.left;
+    const std::int64_t channelRight = channel.right;
+    const std::int64_t thumbWidth =
+        static_cast<std::int64_t>(thumb.right) - thumb.left;
+    if (channelRight <= channelLeft || thumbWidth <= 0) {
+        return {};
+    }
+
+    const std::int64_t leadingHalf = thumbWidth / 2;
+    const std::int64_t trailingHalf = thumbWidth - leadingHalf;
+    const std::int64_t left = channelLeft + leadingHalf;
+    const std::int64_t right = channelRight - trailingHalf;
+    if (right <= left ||
+        left < (std::numeric_limits<LONG>::min)() ||
+        right > (std::numeric_limits<LONG>::max)()) {
+        return {};
+    }
+    return RECT{
+        static_cast<LONG>(left),
+        channel.top,
+        static_cast<LONG>(right),
+        channel.bottom};
+}
+
+int TrackbarPositionFromPointerX(
+    const int mouseX,
+    const RECT& pointerRange,
+    const int minimum,
+    const int maximum) noexcept {
+    if (maximum <= minimum || pointerRange.right <= pointerRange.left) {
+        return minimum;
+    }
+
+    const std::int64_t left = pointerRange.left;
+    const std::int64_t right = pointerRange.right;
+    const std::int64_t clampedX = (std::max)(
+        left,
+        (std::min)(static_cast<std::int64_t>(mouseX), right));
+    const std::uint64_t offset = static_cast<std::uint64_t>(clampedX - left);
+    const std::uint64_t span = static_cast<std::uint64_t>(right - left);
+    const std::uint64_t valueSpan = static_cast<std::uint64_t>(
+        static_cast<std::int64_t>(maximum) - minimum);
+    const std::uint64_t rounded =
+        ((valueSpan * offset) + (span / 2U)) / span;
+    return static_cast<int>(
+        static_cast<std::int64_t>(minimum) + static_cast<std::int64_t>(rounded));
+}
+
 SIZE FitPreviewSize(
     const unsigned int sourceWidth,
     const unsigned int sourceHeight,

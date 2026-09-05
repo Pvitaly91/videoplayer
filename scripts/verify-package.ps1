@@ -15,6 +15,8 @@ $packageArchitecture = if ($Platform -eq 'Win32') { 'win32' } else { 'x64' }
 $packageName = "VideoPlayer-$packageArchitecture-portable"
 $packageDirectory = Join-Path $repositoryRoot "artifacts\$packageName"
 $zipPath = Join-Path $repositoryRoot "artifacts\$packageName.zip"
+$releaseApplication = Join-Path $repositoryRoot "build\$Platform\Release\VideoPlayer.exe"
+$nativeTests = Join-Path $repositoryRoot "build\$Platform\Release\VideoPlayer.Tests.exe"
 $application = Join-Path $packageDirectory 'VideoPlayer.exe'
 $libvlc = Join-Path $packageDirectory 'libvlc.dll'
 $libvlccore = Join-Path $packageDirectory 'libvlccore.dll'
@@ -50,6 +52,46 @@ function Get-PeMachine {
         throw "Invalid PE header: $Path"
     }
     return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+}
+
+function Get-StreamSha256 {
+    param([Parameter(Mandatory = $true)][IO.Stream]$Stream)
+
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $algorithm.ComputeHash($Stream)
+        return [BitConverter]::ToString($hash).Replace('-', '')
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        return Get-StreamSha256 -Stream $stream
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-FileContentsEqual {
+    param(
+        [Parameter(Mandatory = $true)][string]$Expected,
+        [Parameter(Mandatory = $true)][string]$Actual,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $expectedInfo = Get-Item -LiteralPath $Expected
+    $actualInfo = Get-Item -LiteralPath $Actual
+    if ($expectedInfo.Length -ne $actualInfo.Length -or
+        (Get-FileSha256 -Path $Expected) -ne (Get-FileSha256 -Path $Actual)) {
+        throw "$Description does not match: $Actual"
+    }
 }
 
 function Find-DumpBin {
@@ -140,9 +182,10 @@ function Assert-PrivateProductionSource {
 
     $privacyPolicyPath = Join-Path $sourceRoot 'PrivacyPolicy.h'
     $mainWindowPath = Join-Path $sourceRoot 'MainWindow.cpp'
+    $mediaOpenPath = Join-Path $sourceRoot 'MediaOpen.cpp'
     $playerEnginePath = Join-Path $sourceRoot 'PlayerEngine.cpp'
     $previewEnginePath = Join-Path $sourceRoot 'PreviewEngine.cpp'
-    foreach ($requiredSource in @($privacyPolicyPath, $mainWindowPath, $playerEnginePath, $previewEnginePath)) {
+    foreach ($requiredSource in @($privacyPolicyPath, $mainWindowPath, $mediaOpenPath, $playerEnginePath, $previewEnginePath)) {
         if (-not (Test-Path -LiteralPath $requiredSource -PathType Leaf)) {
             throw "Privacy-critical production source is missing: $requiredSource"
         }
@@ -162,6 +205,24 @@ function Assert-PrivateProductionSource {
     $mainWindowSource = Remove-CppComments -Text ([IO.File]::ReadAllText($mainWindowPath))
     if ($mainWindowSource -notmatch '\bkPrivateOpenDialogFlags\b') {
         throw 'GetOpenFileNameW does not consume kPrivateOpenDialogFlags/OFN_DONTADDTORECENT.'
+    }
+
+    $mediaOpenSource = Remove-CppComments -Text ([IO.File]::ReadAllText($mediaOpenPath))
+    foreach ($requiredToken in @(
+        'CreateFileMappingW',
+        'INVALID_HANDLE_VALUE',
+        'PAGE_READWRITE',
+        'MapViewOfFile',
+        'FILE_MAP_READ',
+        'FILE_MAP_WRITE',
+        'PROC_THREAD_ATTRIBUTE_HANDLE_LIST',
+        '--media-map=')) {
+        if ($mediaOpenSource.IndexOf($requiredToken, [StringComparison]::Ordinal) -lt 0) {
+            throw "MediaOpen.cpp is missing anonymous shared-memory privacy control: $requiredToken"
+        }
+    }
+    if ($mediaOpenSource -notmatch '\bCreateFileMappingW\s*\(\s*INVALID_HANDLE_VALUE\s*,') {
+        throw 'MediaOpen.cpp IPC mapping is not explicitly pagefile-backed.'
     }
     foreach ($playerSourcePath in @($playerEnginePath, $previewEnginePath)) {
         $playerSource = Remove-CppComments -Text ([IO.File]::ReadAllText($playerSourcePath))
@@ -211,6 +272,8 @@ function Test-BannedRelativePath {
 
 Assert-PrivateProductionSource
 
+Assert-Path -Path $releaseApplication -Kind Leaf
+Assert-Path -Path $nativeTests -Kind Leaf
 Assert-Path -Path $packageDirectory -Kind Container
 Assert-Path -Path $application -Kind Leaf
 Assert-Path -Path $libvlc -Kind Leaf
@@ -230,6 +293,34 @@ foreach ($document in @($libVlcLicense, $portableReadme, $thirdPartyNotices)) {
 }
 if (-not $FolderOnly) {
     Assert-Path -Path $zipPath -Kind Leaf
+}
+
+Assert-FileContentsEqual `
+    -Expected $releaseApplication `
+    -Actual $application `
+    -Description 'Portable VideoPlayer.exe and the current Release build'
+
+$buildInputs = @(
+    Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'src') -File -Recurse
+    Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'tests') -File -Recurse
+) | Where-Object {
+    $_.Extension.ToLowerInvariant() -in @(
+        '.cpp', '.cxx', '.h', '.hpp', '.rc', '.vcxproj', '.props', '.targets')
+}
+$latestBuildInput = $buildInputs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+if ($null -eq $latestBuildInput) {
+    throw 'No native build inputs were found for freshness verification.'
+}
+foreach ($buildOutput in @($releaseApplication, $nativeTests)) {
+    if ((Get-Item -LiteralPath $buildOutput).LastWriteTimeUtc -lt $latestBuildInput.LastWriteTimeUtc) {
+        throw "Native build output is older than $($latestBuildInput.FullName): $buildOutput. Re-run scripts\build.ps1."
+    }
+}
+
+Write-Host "Running native tests, including multi-instance IPC: $nativeTests"
+& $nativeTests
+if ($LASTEXITCODE -ne 0) {
+    throw "Native tests failed for $Platform with exit code $LASTEXITCODE."
 }
 
 $pluginFile = Get-ChildItem -LiteralPath $plugins -Filter '*.dll' -File -Recurse | Select-Object -First 1
@@ -308,6 +399,56 @@ if (-not $FolderOnly) {
         foreach ($entryName in $entryNames) {
             if (Test-BannedRelativePath -RelativePath $entryName) {
                 throw "Banned file in portable ZIP: $entryName"
+            }
+        }
+
+        $folderFilesByPath = @{}
+        foreach ($file in Get-ChildItem -LiteralPath $packageDirectory -File -Recurse) {
+            $relative = $file.FullName.Substring($packagePrefix.Length).Replace('/', '\').TrimStart('\')
+            if ($folderFilesByPath.ContainsKey($relative)) {
+                throw "Duplicate case-insensitive path in portable folder: $relative"
+            }
+            $folderFilesByPath[$relative] = $file
+        }
+
+        $zipEntriesByPath = @{}
+        foreach ($entry in $archive.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) }) {
+            $relative = $entry.FullName.Replace('/', '\').TrimStart('\')
+            if ($zipEntriesByPath.ContainsKey($relative)) {
+                throw "Duplicate case-insensitive path in portable ZIP: $relative"
+            }
+            $zipEntriesByPath[$relative] = $entry
+        }
+
+        foreach ($relative in $folderFilesByPath.Keys) {
+            if (-not $zipEntriesByPath.ContainsKey($relative)) {
+                throw "Portable ZIP is missing folder file: $relative"
+            }
+
+            $file = $folderFilesByPath[$relative]
+            $entry = $zipEntriesByPath[$relative]
+            if ($entry.Length -ne $file.Length) {
+                throw "Portable ZIP entry length differs from folder file: $relative"
+            }
+
+            $folderStream = [IO.File]::OpenRead($file.FullName)
+            $entryStream = $entry.Open()
+            try {
+                $folderHash = Get-StreamSha256 -Stream $folderStream
+                $entryHash = Get-StreamSha256 -Stream $entryStream
+                if ($folderHash -ne $entryHash) {
+                    throw "Portable ZIP entry content differs from folder file: $relative"
+                }
+            }
+            finally {
+                $entryStream.Dispose()
+                $folderStream.Dispose()
+            }
+        }
+
+        foreach ($relative in $zipEntriesByPath.Keys) {
+            if (-not $folderFilesByPath.ContainsKey($relative)) {
+                throw "Portable ZIP contains a file absent from the portable folder: $relative"
             }
         }
     }

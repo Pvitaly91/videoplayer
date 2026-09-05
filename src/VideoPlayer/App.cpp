@@ -3,6 +3,7 @@
 
 #include "LibVlcRuntime.h"
 #include "MainWindow.h"
+#include "MediaOpen.h"
 
 #include <commctrl.h>
 #include <objbase.h>
@@ -10,6 +11,8 @@
 
 #include <cwchar>
 #include <string>
+#include <utility>
+#include <vector>
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Ole32.lib")
@@ -97,6 +100,19 @@ int App::Run(const HINSTANCE instance, PWSTR commandLine, const int showCommand)
         return RunLibVlcSelfTest(ignoredError);
     }
 
+    std::wstring inheritedMediaPath;
+    std::wstring inheritedMediaError;
+    const InheritedMediaPathStatus inheritedMediaStatus =
+        ReadInheritedMediaPath(
+            arguments.Count(),
+            arguments.Values(),
+            inheritedMediaPath,
+            inheritedMediaError);
+    if (inheritedMediaStatus == InheritedMediaPathStatus::Error) {
+        ShowStartupError(inheritedMediaError);
+        return 3;
+    }
+
     ComApartment com;
     std::wstring error;
     if (!com.Initialize(error)) {
@@ -119,10 +135,14 @@ int App::Run(const HINSTANCE instance, PWSTR commandLine, const int showCommand)
     }
 
     window.Show(showCommand);
-    const std::wstring initialFile = FirstFileArgument(arguments.Count(), arguments.Values());
-    if (!initialFile.empty()) {
-        window.OpenFile(initialFile);
+    std::vector<std::wstring> mediaPaths;
+    if (inheritedMediaStatus == InheritedMediaPathStatus::Ready) {
+        mediaPaths.emplace_back(std::move(inheritedMediaPath));
+    } else {
+        mediaPaths = CollectMediaFileArguments(
+            arguments.Count(), arguments.Values());
     }
+    window.OpenFiles(mediaPaths);
 
     return window.RunMessageLoop();
 }

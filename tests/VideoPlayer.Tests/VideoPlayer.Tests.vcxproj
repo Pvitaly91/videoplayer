@@ -69,10 +69,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Tests.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\MediaOpen.cpp"><Link>Shared\MediaOpen.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Link>Shared\PathUtils.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PlaybackMath.cpp"><Link>Shared\PlaybackMath.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PreviewCache.cpp"><Link>Shared\PreviewCache.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PreviewMath.cpp"><Link>Shared\PreviewMath.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ProgressStrip.cpp"><Link>Shared\ProgressStrip.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\TimeFormatter.cpp"><Link>Shared\TimeFormatter.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ToolbarVisibility.cpp"><Link>Shared\ToolbarVisibility.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\Utf8.cpp"><Link>Shared\Utf8.cpp</Link></ClCompile>
@@ -80,11 +82,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\VideoPlayer\App.h"><Link>Shared\App.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\MediaOpen.h"><Link>Shared\MediaOpen.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PathUtils.h"><Link>Shared\PathUtils.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PlaybackMath.h"><Link>Shared\PlaybackMath.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PreviewCache.h"><Link>Shared\PreviewCache.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PreviewFrame.h"><Link>Shared\PreviewFrame.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PreviewMath.h"><Link>Shared\PreviewMath.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ProgressStrip.h"><Link>Shared\ProgressStrip.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PrivacyPolicy.h"><Link>Shared\PrivacyPolicy.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\TimeFormatter.h"><Link>Shared\TimeFormatter.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ToolbarVisibility.h"><Link>Shared\ToolbarVisibility.h</Link></ClInclude>

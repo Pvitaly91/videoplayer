@@ -782,7 +782,7 @@ bool PlayerEngine::ApplyVideoCrop(const VideoCrop& crop) noexcept {
             return false;
         }
 
-        const std::string geometry = FormatVideoCropGeometry(crop);
+        const std::string geometry = FormatLibVlc3CropGeometry(crop);
         if (geometry.empty()) {
             return false;
         }

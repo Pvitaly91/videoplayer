@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace videoplayer {
 
@@ -35,6 +36,7 @@ public:
     void Show(int showCommand) const;
     int RunMessageLoop();
     bool OpenFile(const std::wstring& path);
+    void OpenFiles(const std::vector<std::wstring>& paths);
 
 private:
     static LRESULT CALLBACK StaticWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -58,6 +60,10 @@ private:
     void ApplySystemFont();
     void LayoutChildren(int width, int height);
     int Scale(int value) const noexcept;
+    HWND ActiveControlBar() const noexcept;
+    bool ReparentControlBarControls(HWND parent) noexcept;
+    void ApplyFullscreenControlBarOpacity() noexcept;
+    void UpdateProgressStrip() noexcept;
 
     bool ProcessKeyboardMessage(const MSG& message);
     bool HandleHotKey(UINT key, bool controlDown, bool repeated);
@@ -69,6 +75,7 @@ private:
     void SeekBy(std::int64_t deltaMs);
     void CommitSeekFromSlider();
     void UpdateSeekLabel();
+    bool SetSeekSliderFromPointer(int mouseX);
     void HandleSeekPointer(int mouseX);
     void HideSeekPreview(bool cancelRequest = true) noexcept;
     void HandlePreviewResult();
@@ -108,6 +115,8 @@ private:
     HWND window_ = nullptr;
     HWND videoWindow_ = nullptr;
     HWND controlBar_ = nullptr;
+    HWND fullscreenControlBar_ = nullptr;
+    HWND progressStrip_ = nullptr;
     HWND openButton_ = nullptr;
     HWND playButton_ = nullptr;
     HWND stopButton_ = nullptr;

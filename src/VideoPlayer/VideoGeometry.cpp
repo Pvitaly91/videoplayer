@@ -266,11 +266,24 @@ VideoCropMapping MapSelectionToVideoCrop(
     return result;
 }
 
-std::string FormatVideoCropGeometry(const VideoCrop& crop) {
+std::string FormatLibVlc3CropGeometry(const VideoCrop& crop) {
     if (!crop.IsValid()) {
         return {};
     }
-    return std::to_string(crop.width) + "x" + std::to_string(crop.height) +
+
+    const std::uint64_t right =
+        static_cast<std::uint64_t>(crop.x) + crop.width;
+    const std::uint64_t bottom =
+        static_cast<std::uint64_t>(crop.y) + crop.height;
+    const std::uint64_t maximum = (std::numeric_limits<unsigned>::max)();
+    if (right > maximum || bottom > maximum) {
+        return {};
+    }
+
+    // VLC 3.0's crop-window path forwards these two parsed values as the
+    // absolute right/bottom edges. Supplying extents loses the selected
+    // right and bottom portions whenever x or y is non-zero.
+    return std::to_string(right) + "x" + std::to_string(bottom) +
         "+" + std::to_string(crop.x) + "+" + std::to_string(crop.y);
 }
 

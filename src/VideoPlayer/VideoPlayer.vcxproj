@@ -188,6 +188,7 @@
     <ClCompile Include="App.cpp" />
     <ClCompile Include="LibVlcRuntime.cpp" />
     <ClCompile Include="MainWindow.cpp" />
+    <ClCompile Include="MediaOpen.cpp" />
     <ClCompile Include="PathUtils.cpp" />
     <ClCompile Include="PlaybackMath.cpp" />
     <ClCompile Include="PlayerEngine.cpp" />
@@ -195,6 +196,7 @@
     <ClCompile Include="PreviewEngine.cpp" />
     <ClCompile Include="PreviewMath.cpp" />
     <ClCompile Include="PreviewPopup.cpp" />
+    <ClCompile Include="ProgressStrip.cpp" />
     <ClCompile Include="SelectionOverlay.cpp" />
     <ClCompile Include="TimeFormatter.cpp" />
     <ClCompile Include="ToolbarVisibility.cpp" />
@@ -205,6 +207,7 @@
     <ClInclude Include="App.h" />
     <ClInclude Include="LibVlcRuntime.h" />
     <ClInclude Include="MainWindow.h" />
+    <ClInclude Include="MediaOpen.h" />
     <ClInclude Include="PathUtils.h" />
     <ClInclude Include="PlaybackMath.h" />
     <ClInclude Include="PlaybackState.h" />
@@ -214,6 +217,7 @@
     <ClInclude Include="PreviewFrame.h" />
     <ClInclude Include="PreviewMath.h" />
     <ClInclude Include="PreviewPopup.h" />
+    <ClInclude Include="ProgressStrip.h" />
     <ClInclude Include="PrivacyPolicy.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="SelectionOverlay.h" />

@@ -18,6 +18,7 @@
     <ClCompile Include="App.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="LibVlcRuntime.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="MainWindow.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="MediaOpen.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PathUtils.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PlaybackMath.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PlayerEngine.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -25,6 +26,7 @@
     <ClCompile Include="PreviewEngine.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PreviewMath.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PreviewPopup.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ProgressStrip.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="SelectionOverlay.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="TimeFormatter.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="ToolbarVisibility.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -35,6 +37,7 @@
     <ClInclude Include="App.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LibVlcRuntime.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="MainWindow.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="MediaOpen.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PathUtils.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PlaybackMath.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PlaybackState.h"><Filter>Header Files</Filter></ClInclude>
@@ -44,6 +47,7 @@
     <ClInclude Include="PreviewFrame.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PreviewMath.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PreviewPopup.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ProgressStrip.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PrivacyPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Resource.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="SelectionOverlay.h"><Filter>Header Files</Filter></ClInclude>

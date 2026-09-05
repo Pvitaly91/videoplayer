@@ -81,7 +81,8 @@ VideoCropMapping MapSelectionToVideoCrop(
     GeometryRect selection,
     int minimumSelectionPixels) noexcept;
 
-// LibVLC crop geometry: <width>x<height>+<x>+<y>.
-std::string FormatVideoCropGeometry(const VideoCrop& crop);
+// LibVLC 3.x internally consumes the first two crop values as absolute
+// right/bottom coordinates even though its public syntax documents extents.
+std::string FormatLibVlc3CropGeometry(const VideoCrop& crop);
 
 }  // namespace videoplayer

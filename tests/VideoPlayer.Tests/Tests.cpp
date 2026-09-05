@@ -1,8 +1,10 @@
 #include "../../src/VideoPlayer/App.h"
+#include "../../src/VideoPlayer/MediaOpen.h"
 #include "../../src/VideoPlayer/PathUtils.h"
 #include "../../src/VideoPlayer/PlaybackMath.h"
 #include "../../src/VideoPlayer/PreviewCache.h"
 #include "../../src/VideoPlayer/PreviewMath.h"
+#include "../../src/VideoPlayer/ProgressStrip.h"
 #include "../../src/VideoPlayer/PrivacyPolicy.h"
 #include "../../src/VideoPlayer/TimeFormatter.h"
 #include "../../src/VideoPlayer/ToolbarVisibility.h"
@@ -15,14 +17,79 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace {
+
+constexpr wchar_t kMediaOpenIntegrationPrefix[] =
+    L"VideoPlayer.Tests.SharedMemory:";
+constexpr wchar_t kMediaOpenIntegrationSensitivePath[] =
+    LR"(C:\Media Files\приватне відео з пробілами\тест.mkv)";
+
+std::wstring MediaOpenIntegrationObjectName(
+    const wchar_t* const role,
+    const std::wstring_view identifier) {
+    return std::wstring(L"Local\\VideoPlayer.Tests.MediaOpen.") +
+        role + L"." + std::wstring(identifier);
+}
+
+std::wstring BuildMediaOpenIntegrationPayload(
+    const std::wstring_view identifier) {
+    return std::wstring(kMediaOpenIntegrationPrefix) +
+        std::wstring(identifier) + L"|" +
+        kMediaOpenIntegrationSensitivePath;
+}
+
+int RunMediaOpenIntegrationChild(const std::wstring_view payload) {
+    const std::size_t prefixLength =
+        std::size(kMediaOpenIntegrationPrefix) - 1;
+    const std::size_t separator = payload.find(L'|', prefixLength);
+    if (separator == std::wstring_view::npos ||
+        payload.substr(0, prefixLength) != kMediaOpenIntegrationPrefix) {
+        return 80;
+    }
+
+    const std::wstring_view identifier = payload.substr(
+        prefixLength, separator - prefixLength);
+    const bool exactPayload =
+        payload == BuildMediaOpenIntegrationPayload(identifier);
+    const bool absentFromCommandLine =
+        std::wstring_view(GetCommandLineW()).find(
+            kMediaOpenIntegrationSensitivePath) == std::wstring_view::npos;
+
+    const HANDLE done = OpenEventW(
+        EVENT_MODIFY_STATE,
+        FALSE,
+        MediaOpenIntegrationObjectName(L"Done", identifier).c_str());
+    const HANDLE success = OpenEventW(
+        EVENT_MODIFY_STATE,
+        FALSE,
+        MediaOpenIntegrationObjectName(L"Success", identifier).c_str());
+    if (done == nullptr || success == nullptr) {
+        if (done != nullptr) {
+            CloseHandle(done);
+        }
+        if (success != nullptr) {
+            CloseHandle(success);
+        }
+        return 81;
+    }
+
+    if (exactPayload && absentFromCommandLine) {
+        SetEvent(success);
+    }
+    SetEvent(done);
+    CloseHandle(done);
+    CloseHandle(success);
+    return exactPayload && absentFromCommandLine ? 0 : 82;
+}
 
 class TestRunner final {
 public:
@@ -86,6 +153,97 @@ void TestPlaybackMath(TestRunner& runner)
     runner.Equal(ClampVolume(101), 100, L"volume upper bound");
 }
 
+void TestProgressStrip(TestRunner& runner)
+{
+    using videoplayer::EvaluateProgressStrip;
+    using videoplayer::ProgressStripInput;
+
+    ProgressStripInput input{};
+    input.fullscreen = true;
+    input.toolbarVisible = false;
+    input.hasMedia = true;
+    input.availableWidth = 1920;
+    input.positionMs = 30'000;
+    input.durationMs = 60'000;
+
+    auto decision = EvaluateProgressStrip(input);
+    runner.True(decision.visible, L"fullscreen hidden-toolbar progress strip is visible");
+    runner.Equal(decision.completedWidth, 960, L"progress strip maps midpoint to half width");
+
+    input.fullscreen = false;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"windowed mode hides compact progress strip");
+    runner.Equal(decision.completedWidth, 0, L"hidden windowed strip has no completed width");
+
+    input.fullscreen = true;
+    input.toolbarVisible = true;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"visible toolbar hides compact progress strip");
+
+    input.toolbarVisible = false;
+    input.hasMedia = false;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"no media hides compact progress strip");
+
+    input.hasMedia = true;
+    input.availableWidth = 0;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"zero available width hides compact progress strip");
+
+    input.availableWidth = -1;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"negative available width hides compact progress strip");
+
+    input.availableWidth = 1920;
+    input.durationMs = 0;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"unknown zero duration hides compact progress strip");
+
+    input.durationMs = -1;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"negative duration hides compact progress strip");
+
+    input.durationMs = 60'000;
+    input.positionMs = -1;
+    decision = EvaluateProgressStrip(input);
+    runner.True(!decision.visible, L"non-positive progress has no completed strip to show");
+    runner.Equal(decision.completedWidth, 0, L"negative progress clamps to zero width");
+
+    input.positionMs = 1;
+    input.durationMs = (std::numeric_limits<std::int64_t>::max)();
+    decision = EvaluateProgressStrip(input);
+    runner.Equal(decision.completedWidth, 1, L"positive progress receives a one-pixel minimum");
+
+    input.availableWidth = 1001;
+    input.positionMs = 1;
+    input.durationMs = 3;
+    decision = EvaluateProgressStrip(input);
+    runner.Equal(decision.completedWidth, 333, L"progress strip uses exact floor scaling");
+
+    input.positionMs = 2;
+    decision = EvaluateProgressStrip(input);
+    runner.Equal(decision.completedWidth, 667, L"progress strip preserves fractional scaling");
+
+    input.availableWidth = 1920;
+    input.positionMs = 60'000;
+    input.durationMs = 60'000;
+    decision = EvaluateProgressStrip(input);
+    runner.Equal(decision.completedWidth, 1920, L"ended playback fills the progress strip");
+
+    input.positionMs = 90'000;
+    decision = EvaluateProgressStrip(input);
+    runner.Equal(decision.completedWidth, 1920, L"over-reported playback clamps to full width");
+
+    input.availableWidth = (std::numeric_limits<int>::max)();
+    input.positionMs = (std::numeric_limits<std::int64_t>::max)() - 1;
+    input.durationMs = (std::numeric_limits<std::int64_t>::max)();
+    decision = EvaluateProgressStrip(input);
+    runner.Equal(
+        decision.completedWidth,
+        (std::numeric_limits<int>::max)() - 1,
+        L"extreme duration scaling is exact and overflow-safe");
+}
+
 void TestUtf8(TestRunner& runner)
 {
     std::string utf8;
@@ -106,19 +264,156 @@ void TestUtf8(TestRunner& runner)
         L"path with spaces conversion is exact");
 }
 
-void TestCommandLineArgument(TestRunner& runner)
+void TestMediaOpen(TestRunner& runner)
 {
     wchar_t executable[] = L"VideoPlayer.exe";
-    wchar_t filePath[] = LR"(C:\Відео з пробілами\фільм.mkv)";
-    wchar_t* arguments[] = {executable, filePath};
+    wchar_t firstPath[] = LR"(C:\Відео з пробілами\фільм.mkv)";
+    wchar_t secondPath[] = LR"(D:\Media\друге відео.mp4)";
+    wchar_t internalMap[] = L"--media-map=12345";
+    wchar_t empty[] = L"";
+    wchar_t* arguments[] = {
+        executable, firstPath, nullptr, empty, internalMap, secondPath};
+    const std::vector<std::wstring> files =
+        videoplayer::CollectMediaFileArguments(6, arguments);
+    runner.Equal(files.size(), std::size_t{2}, L"all non-empty command-line files collected");
+    runner.Equal(
+        files[0],
+        std::wstring(firstPath),
+        L"first command-line video is preserved");
+    runner.Equal(
+        files[1],
+        std::wstring(secondPath),
+        L"additional command-line video is preserved");
+    runner.True(
+        videoplayer::CollectMediaFileArguments(1, arguments).empty(),
+        L"missing command-line media arguments");
+
+    std::wstring inheritedPath = L"stale path";
+    std::wstring inheritedError = L"stale error";
+    runner.Equal(
+        videoplayer::ReadInheritedMediaPath(
+            1, arguments, inheritedPath, inheritedError),
+        videoplayer::InheritedMediaPathStatus::NotRequested,
+        L"ordinary command line does not request inherited media");
+    runner.True(
+        inheritedPath.empty() && inheritedError.empty(),
+        L"inherited media outputs are cleared when not requested");
+
+    wchar_t malformedMap[] =
+        L"--media-map=184467440737095516160000";
+    wchar_t* malformedArguments[] = {executable, malformedMap};
+    runner.Equal(
+        videoplayer::ReadInheritedMediaPath(
+            2, malformedArguments, inheritedPath, inheritedError),
+        videoplayer::InheritedMediaPathStatus::Error,
+        L"overflowing inherited mapping handle is rejected");
+    runner.True(
+        inheritedPath.empty() && !inheritedError.empty(),
+        L"invalid inherited mapping reports an error without a path");
+
+    wchar_t duplicateMap[] = L"--media-map=67890";
+    wchar_t* duplicateArguments[] = {
+        executable, internalMap, duplicateMap};
+    runner.Equal(
+        videoplayer::ReadInheritedMediaPath(
+            3, duplicateArguments, inheritedPath, inheritedError),
+        videoplayer::InheritedMediaPathStatus::Error,
+        L"duplicate inherited mapping arguments are rejected");
+
+    const wchar_t singleSelection[] =
+        L"C:\\Відео з пробілами\\один.mp4\0";
+    runner.Equal(
+        videoplayer::ParseOpenDialogPaths(
+            singleSelection, std::size(singleSelection)),
+        std::vector<std::wstring>{LR"(C:\Відео з пробілами\один.mp4)"},
+        L"single Open dialog selection parses as one full path");
+
+    const wchar_t multipleSelection[] =
+        L"D:\\Media\0one.mp4\0два відео.mkv\0";
+    runner.Equal(
+        videoplayer::ParseOpenDialogPaths(
+            multipleSelection, std::size(multipleSelection)),
+        std::vector<std::wstring>{
+            LR"(D:\Media\one.mp4)",
+            LR"(D:\Media\два відео.mkv)"},
+        L"Explorer multi-select buffer expands every file path");
+
+    const wchar_t malformedSelection[] = {L'C', L':'};
+    runner.True(
+        videoplayer::ParseOpenDialogPaths(
+            malformedSelection, std::size(malformedSelection)).empty(),
+        L"unterminated Open dialog buffer is rejected");
 
     runner.Equal(
-        videoplayer::FirstFileArgument(2, arguments),
-        std::wstring(arguments[1]),
-        L"first command-line file argument");
+        videoplayer::QuoteWindowsCommandLineArgument(
+            LR"(C:\Media Files\clip.mkv)"),
+        std::wstring(L"\"C:\\Media Files\\clip.mkv\""),
+        L"instance command-line path with spaces is quoted");
+    runner.Equal(
+        videoplayer::QuoteWindowsCommandLineArgument(
+            LR"(C:\Folder With Space\)"),
+        std::wstring(L"\"C:\\Folder With Space\\\\\""),
+        L"trailing backslash is escaped before closing quote");
+    runner.Equal(
+        videoplayer::QuoteWindowsCommandLineArgument(L"a\"b"),
+        std::wstring(L"\"a\\\"b\""),
+        L"embedded quote follows CommandLineToArgvW escaping");
+    runner.Equal(
+        videoplayer::QuoteWindowsCommandLineArgument(L""),
+        std::wstring(L"\"\""),
+        L"empty command-line argument remains representable");
     runner.True(
-        videoplayer::FirstFileArgument(1, arguments).empty(),
-        L"missing command-line file argument");
+        videoplayer::QuoteWindowsCommandLineArgument(
+            std::wstring_view(L"a\0b", 3)).empty(),
+        L"embedded null command-line argument is rejected");
+}
+
+void TestMediaOpenLaunchIntegration(TestRunner& runner)
+{
+    const std::wstring identifier =
+        std::to_wstring(GetCurrentProcessId()) + L"." +
+        std::to_wstring(GetTickCount64());
+    const std::wstring doneName =
+        MediaOpenIntegrationObjectName(L"Done", identifier);
+    const std::wstring successName =
+        MediaOpenIntegrationObjectName(L"Success", identifier);
+    const HANDLE done = CreateEventW(
+        nullptr, TRUE, FALSE, doneName.c_str());
+    const HANDLE success = CreateEventW(
+        nullptr, TRUE, FALSE, successName.c_str());
+    const bool eventsCreated = done != nullptr && success != nullptr;
+    runner.True(eventsCreated, L"shared-memory integration events are created");
+    if (!eventsCreated) {
+        if (done != nullptr) {
+            CloseHandle(done);
+        }
+        if (success != nullptr) {
+            CloseHandle(success);
+        }
+        return;
+    }
+
+    std::wstring launchError;
+    const bool launched = videoplayer::LaunchMediaInNewInstance(
+        BuildMediaOpenIntegrationPayload(identifier), launchError);
+    runner.True(
+        launched && launchError.empty(),
+        L"shared-memory integration child launches without error");
+
+    const DWORD completion = launched
+        ? WaitForSingleObject(done, 10'000)
+        : WAIT_FAILED;
+    runner.Equal(
+        completion,
+        static_cast<DWORD>(WAIT_OBJECT_0),
+        L"shared-memory integration child completes within timeout");
+    runner.Equal(
+        WaitForSingleObject(success, 0),
+        static_cast<DWORD>(WAIT_OBJECT_0),
+        L"exact Unicode path round-trips outside the child command line");
+
+    CloseHandle(done);
+    CloseHandle(success);
 }
 
 void TestLongPaths(TestRunner& runner)
@@ -339,13 +634,38 @@ void TestVideoCropMapping(TestRunner& runner)
         VideoCrop{0, 0, 4, 4},
         L"odd source crop expands to even boundaries when possible");
 
-    runner.Equal(
-        FormatVideoCropGeometry({480, 300, 960, 480}),
-        std::string("960x480+480+300"),
-        L"LibVLC crop geometry format");
+    const VideoCropMapping formerToolbarArea = MapSelectionToVideoCrop(
+        video,
+        {0, 0, 1920, 1080},
+        {0, 992, 1920, 1080},
+        32);
     runner.True(
-        FormatVideoCropGeometry({1, 2, 0, 4}).empty(),
+        formerToolbarArea.valid,
+        L"video formerly under fullscreen toolbar remains selectable");
+    runner.Equal(
+        formerToolbarArea.crop,
+        VideoCrop{0, 992, 1920, 88},
+        L"selection reaches decoded pixels behind the hidden toolbar");
+
+    runner.Equal(
+        FormatLibVlc3CropGeometry(reverse.crop),
+        std::string("1440x780+480+300"),
+        L"mapped crop uses LibVLC 3 absolute right and bottom edges");
+    runner.Equal(
+        FormatLibVlc3CropGeometry({0, 0, 960, 480}),
+        std::string("960x480+0+0"),
+        L"zero-origin crop keeps its extents as endpoints");
+    runner.Equal(
+        FormatLibVlc3CropGeometry({1280, 720, 640, 360}),
+        std::string("1920x1080+1280+720"),
+        L"crop ending at source right and bottom preserves the edge");
+    runner.True(
+        FormatLibVlc3CropGeometry({1, 2, 0, 4}).empty(),
         L"invalid crop has no geometry string");
+    runner.True(
+        FormatLibVlc3CropGeometry(
+            {(std::numeric_limits<unsigned>::max)(), 0, 1, 1}).empty(),
+        L"overflowing LibVLC crop endpoint is rejected");
 }
 
 void TestPreviewMath(TestRunner& runner)
@@ -374,6 +694,32 @@ void TestPreviewMath(TestRunner& runner)
         PreviewTimeFromChannelX(60, RECT{10, 0, 10, 10}, 10'000),
         std::int64_t{0},
         L"empty channel rejects mapping");
+
+    const RECT pointerRange = TrackbarPointerRange(
+        RECT{8, 2, 592, 12},
+        RECT{295, 0, 306, 20});
+    runner.Equal(pointerRange.left, 13L, L"trackbar range starts at minimum thumb center");
+    runner.Equal(pointerRange.right, 586L, L"trackbar range ends at maximum thumb center");
+    runner.Equal(
+        TrackbarPositionFromPointerX(13, pointerRange, 0, 10'000),
+        0,
+        L"track click at start maps to minimum");
+    runner.Equal(
+        TrackbarPositionFromPointerX(154, pointerRange, 0, 10'000),
+        2'461,
+        L"track click maps to its exact pixel-derived position");
+    runner.Equal(
+        TrackbarPositionFromPointerX(442, pointerRange, 0, 10'000),
+        7'487,
+        L"track click near three quarters maps without a page step");
+    runner.Equal(
+        TrackbarPositionFromPointerX(1'000, pointerRange, 0, 10'000),
+        10'000,
+        L"track click past end clamps to maximum");
+    runner.Equal(
+        TrackbarPositionFromPointerX(50, RECT{}, -10, 10),
+        -10,
+        L"empty pointer range returns slider minimum");
 
     const SIZE widescreen = FitPreviewSize(1920, 1080);
     runner.Equal(widescreen.cx, 320L, L"16:9 preview maximum width");
@@ -648,7 +994,26 @@ void TestToolbarVisibility(TestRunner& runner)
     verifyBlocker(input, L"preview popup blocks hide", L"preview blocker is reported");
     input = FullscreenPlayingToolbarInput();
     input.zoomSelecting = true;
-    verifyBlocker(input, L"zoom selection blocks hide", L"zoom blocker is reported");
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.shouldBeVisible, L"zoom selection hides fullscreen toolbar");
+    runner.Equal(decision.action, ToolbarVisibilityAction::Hide, L"zoom selection emits hide action");
+    runner.True(!decision.interactionBlocksHide, L"zoom selection is a force-hide mode");
+    input.currentlyVisible = false;
+    input.playing = false;
+    input.cursorMoved = true;
+    input.pointerOverToolbar = true;
+    input.controlHasFocus = true;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.shouldBeVisible, L"paused zoom selection keeps toolbar hidden");
+    runner.Equal(decision.action, ToolbarVisibilityAction::None, L"hidden zoom toolbar stays hidden");
+
+    input = FullscreenPlayingToolbarInput();
+    input.fullscreen = false;
+    input.zoomSelecting = true;
+    input.currentlyVisible = false;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(decision.shouldBeVisible, L"windowed zoom keeps non-overlapping toolbar visible");
+    runner.Equal(decision.action, ToolbarVisibilityAction::Show, L"windowed zoom restores toolbar");
     input = FullscreenPlayingToolbarInput();
     input.controlHasFocus = true;
     verifyBlocker(input, L"focused control blocks hide", L"focus blocker is reported");
@@ -717,7 +1082,8 @@ void TestPrivacyPolicy(TestRunner& runner)
         kPrivateOpenDialogFlags,
         static_cast<DWORD>(
             OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
-            OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT),
+            OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT |
+            OFN_ALLOWMULTISELECT),
         L"private file dialog flag set is exact");
     runner.True(
         (kPrivateOpenDialogFlags & OFN_DONTADDTORECENT) != 0,
@@ -728,17 +1094,34 @@ void TestPrivacyPolicy(TestRunner& runner)
     runner.True(
         (kPrivateOpenDialogFlags & OFN_FILEMUSTEXIST) != 0,
         L"private file dialog requires existing media");
+    runner.True(
+        (kPrivateOpenDialogFlags & OFN_ALLOWMULTISELECT) != 0,
+        L"file dialog accepts several videos in one selection");
 }
 
 } // namespace
 
-int wmain()
+int wmain(const int argc, wchar_t* const* const argv)
 {
+    std::wstring inheritedMediaPath;
+    std::wstring inheritedMediaError;
+    const videoplayer::InheritedMediaPathStatus inheritedStatus =
+        videoplayer::ReadInheritedMediaPath(
+            argc, argv, inheritedMediaPath, inheritedMediaError);
+    if (inheritedStatus == videoplayer::InheritedMediaPathStatus::Error) {
+        return 83;
+    }
+    if (inheritedStatus == videoplayer::InheritedMediaPathStatus::Ready) {
+        return RunMediaOpenIntegrationChild(inheritedMediaPath);
+    }
+
     TestRunner runner;
     TestTimeFormatting(runner);
     TestPlaybackMath(runner);
+    TestProgressStrip(runner);
     TestUtf8(runner);
-    TestCommandLineArgument(runner);
+    TestMediaOpen(runner);
+    TestMediaOpenLaunchIntegration(runner);
     TestLongPaths(runner);
     TestFileExistence(runner);
     TestVideoGeometryBasics(runner);

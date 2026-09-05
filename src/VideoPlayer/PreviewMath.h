@@ -23,6 +23,18 @@ std::int64_t PreviewTimeFromChannelX(
     const RECT& channel,
     std::int64_t durationMs) noexcept;
 
+// TBM_GETCHANNELRECT reports the outside channel edges, while the thumb
+// center can only travel inside those edges by half of its width.
+RECT TrackbarPointerRange(
+    const RECT& channel,
+    const RECT& thumb) noexcept;
+
+int TrackbarPositionFromPointerX(
+    int mouseX,
+    const RECT& pointerRange,
+    int minimum,
+    int maximum) noexcept;
+
 SIZE FitPreviewSize(
     unsigned int sourceWidth,
     unsigned int sourceHeight,

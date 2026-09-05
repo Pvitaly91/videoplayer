@@ -23,6 +23,7 @@ inline constexpr std::array<const char*, 3> kPrivateLibVlcArguments{
 
 inline constexpr DWORD kPrivateOpenDialogFlags =
     OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
-    OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT |
+    OFN_ALLOWMULTISELECT;
 
 }  // namespace videoplayer

@@ -36,12 +36,21 @@ ToolbarVisibilityDecision EvaluateToolbarVisibility(
         input.cursorY >= activationTop && input.cursorY < input.clientHeight;
     decision.interactionBlocksHide =
         input.pointerOverToolbar || input.seekDragging || input.volumeDragging ||
-        input.previewVisible || input.zoomSelecting || input.controlHasFocus;
+        input.previewVisible || input.controlHasFocus;
 
-    // Windowed mode, fullscreen transitions, and every non-playing state must
-    // leave the controls visible.
-    if (!input.fullscreen || (!input.wasFullscreen && input.fullscreen) ||
-        !input.playing || decision.interactionBlocksHide) {
+    if (!input.fullscreen) {
+        return FinishDecision(input, decision, true);
+    }
+
+    // Area selection must include the video under the fullscreen toolbar.
+    // This overrides pause/focus/mouse reveal rules until selection ends.
+    if (input.zoomSelecting) {
+        return FinishDecision(input, decision, false);
+    }
+
+    // Fullscreen transitions and every non-playing state normally leave the
+    // controls visible.
+    if (!input.wasFullscreen || !input.playing || decision.interactionBlocksHide) {
         return FinishDecision(input, decision, true);
     }
 
