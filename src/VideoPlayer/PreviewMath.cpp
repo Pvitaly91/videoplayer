@@ -15,6 +15,22 @@ LONG ClampLongLong(const long long value, const LONG minimum, const LONG maximum
 
 }  // namespace
 
+std::int64_t PreviewTimestampQuantum(const std::int64_t durationMs) noexcept {
+    constexpr std::int64_t intervals = 120;
+    constexpr std::int64_t maximumQuantum = 30'000;
+    // Clamp before adding/rounding, including int64-max durations.
+    const std::int64_t bounded = std::clamp(
+        durationMs, std::int64_t{0}, maximumQuantum * intervals);
+    const std::int64_t interval = (bounded + intervals - 1) / intervals;
+    return std::clamp(((interval + 999) / 1000) * 1000,
+        kPreviewTimestampQuantumMs, maximumQuantum);
+}
+
+std::int64_t QuantizePreviewTimestamp(
+    const std::int64_t timestampMs, const std::int64_t durationMs) noexcept {
+    return QuantizePreviewTimestamp(timestampMs, durationMs, PreviewTimestampQuantum(durationMs));
+}
+
 std::int64_t QuantizePreviewTimestamp(
     const std::int64_t timestampMs,
     const std::int64_t durationMs,

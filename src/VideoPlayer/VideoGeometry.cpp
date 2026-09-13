@@ -1,6 +1,7 @@
 #include "VideoGeometry.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -69,6 +70,143 @@ std::pair<unsigned, unsigned> AlignRangeToEvenPixels(
         return {start, end};
     }
     return {evenStart, evenEnd};
+}
+
+constexpr unsigned kMinimumInteractiveCropSide = 16U;
+
+bool IsCropWithinVideo(
+    const VideoDimensions video,
+    const VideoCrop crop) noexcept {
+    return video.IsValid() && crop.IsValid() &&
+        crop.x < video.width && crop.y < video.height &&
+        crop.width <= video.width - crop.x &&
+        crop.height <= video.height - crop.y;
+}
+
+unsigned RoundAndClampOffset(
+    const unsigned origin,
+    const unsigned extent,
+    const unsigned limit,
+    const double delta) noexcept {
+    const unsigned maximumOrigin = limit - extent;
+    if (delta >= static_cast<double>(maximumOrigin - origin)) {
+        return maximumOrigin;
+    }
+    if (delta <= -static_cast<double>(origin)) {
+        return 0U;
+    }
+
+    const double roundedDelta = delta < 0.0
+        ? std::ceil(delta - 0.5)
+        : std::floor(delta + 0.5);
+    const std::int64_t candidate = static_cast<std::int64_t>(origin) +
+        static_cast<std::int64_t>(roundedDelta);
+    const unsigned roundedOrigin = static_cast<unsigned>((std::clamp)(
+        candidate,
+        std::int64_t{0},
+        static_cast<std::int64_t>(maximumOrigin)));
+    if ((roundedOrigin & 1U) == 0U || roundedOrigin == maximumOrigin ||
+        roundedDelta == 0.0) {
+        return roundedOrigin;
+    }
+
+    // Preserve a clamped source edge. Away from an edge, choose the closest
+    // chroma-friendly even origin to the requested continuous source point.
+    const unsigned lower = roundedOrigin - 1U;
+    const unsigned upper = roundedOrigin + 1U;
+    if (upper > maximumOrigin) {
+        return lower;
+    }
+    const double requested = static_cast<double>(origin) + delta;
+    const double lowerDistance = requested - static_cast<double>(lower);
+    const double upperDistance = static_cast<double>(upper) - requested;
+    if (lowerDistance < upperDistance) {
+        return lower;
+    }
+    if (upperDistance < lowerDistance) {
+        return upper;
+    }
+    return delta > 0.0 ? upper : lower;
+}
+
+unsigned ScaleCropExtent(
+    const unsigned current,
+    const unsigned maximum,
+    const double scale) noexcept {
+    const bool zoomingIn = scale < 1.0;
+    // The caller enforces the minimum with one aspect-preserving scale.
+    // A per-axis 16-pixel floor here would stretch very narrow selections
+    // when their other axis reaches the source edge first.
+    constexpr unsigned minimum = 1U;
+
+    const double scaled = static_cast<double>(current) * scale;
+    unsigned target = maximum;
+    if (std::isfinite(scaled) && scaled < static_cast<double>(maximum)) {
+        const double rounded = std::floor(scaled + 0.5);
+        target = rounded <= 0.0
+            ? 0U
+            : static_cast<unsigned>(rounded);
+    }
+    if (zoomingIn) {
+        target = (std::clamp)(target, minimum, current);
+    } else {
+        target = (std::clamp)(target, (std::max)(minimum, current), maximum);
+    }
+
+    if (target == maximum || (target & 1U) == 0U) {
+        return target;
+    }
+
+    // Keep each integer step in the requested zoom direction. Full odd-sized
+    // maximum extents remain reachable instead of being permanently rounded inward.
+    if (zoomingIn) {
+        if (target > minimum) {
+            return target - 1U;
+        }
+        return target + 1U <= current ? target + 1U : target;
+    }
+    if (target < maximum) {
+        return target + 1U;
+    }
+    return target;
+}
+
+unsigned PlaceScaledCropAxis(
+    const unsigned origin,
+    const unsigned oldExtent,
+    const unsigned newExtent,
+    const unsigned sourceExtent,
+    const double anchor) noexcept {
+    if (oldExtent == newExtent) {
+        return origin;
+    }
+
+    const double anchoredSourcePoint = static_cast<double>(origin) +
+        anchor * static_cast<double>(oldExtent);
+    const double requestedOrigin = anchoredSourcePoint -
+        anchor * static_cast<double>(newExtent);
+    const unsigned maximumOrigin = sourceExtent - newExtent;
+    if (requestedOrigin <= 0.0) {
+        return 0U;
+    }
+    if (requestedOrigin >= static_cast<double>(maximumOrigin)) {
+        return maximumOrigin;
+    }
+
+    const unsigned roundedOrigin = static_cast<unsigned>(
+        std::floor(requestedOrigin + 0.5));
+    if ((roundedOrigin & 1U) == 0U || roundedOrigin == maximumOrigin) {
+        return roundedOrigin;
+    }
+    const unsigned lower = roundedOrigin - 1U;
+    const unsigned upper = roundedOrigin + 1U;
+    if (upper > maximumOrigin) {
+        return lower;
+    }
+    return requestedOrigin - static_cast<double>(lower) <=
+            static_cast<double>(upper) - requestedOrigin
+        ? lower
+        : upper;
 }
 
 }  // namespace
@@ -264,6 +402,83 @@ VideoCropMapping MapSelectionToVideoCrop(
         sourceBottom - sourceTop};
     result.valid = result.crop.IsValid();
     return result;
+}
+
+VideoCrop PanVideoCrop(
+    const VideoDimensions video,
+    const VideoCrop crop,
+    const double deltaX,
+    const double deltaY) noexcept {
+    if (!IsCropWithinVideo(video, crop) ||
+        !std::isfinite(deltaX) || !std::isfinite(deltaY)) {
+        return crop;
+    }
+    if (deltaX == 0.0 && deltaY == 0.0) {
+        return crop;
+    }
+
+    return {
+        RoundAndClampOffset(crop.x, crop.width, video.width, deltaX),
+        RoundAndClampOffset(crop.y, crop.height, video.height, deltaY),
+        crop.width,
+        crop.height};
+}
+
+VideoCrop ZoomVideoCrop(
+    const VideoDimensions video,
+    const VideoCrop crop,
+    const double scale,
+    const double anchorX,
+    const double anchorY,
+    const VideoDimensions aspectReference) noexcept {
+    if (!IsCropWithinVideo(video, crop) || !std::isfinite(scale) ||
+        scale <= 0.0 || !std::isfinite(anchorX) || !std::isfinite(anchorY) ||
+        anchorX < 0.0 || anchorX > 1.0 ||
+        anchorY < 0.0 || anchorY > 1.0) {
+        return crop;
+    }
+
+    if (scale == 1.0) {
+        return crop;
+    }
+
+    const VideoDimensions reference = aspectReference.IsValid()
+        ? aspectReference : VideoDimensions{crop.width, crop.height};
+    // Derive both extents from one scale and the original proportions. Merely
+    // clamping each current axis to the source eventually changes a narrow
+    // selection into the full frame, and repeated pixel rounding adds drift.
+    const double currentScale = reference.width >= reference.height
+        ? static_cast<double>(crop.width) / reference.width
+        : static_cast<double>(crop.height) / reference.height;
+    const double maximumScale = (std::min)(
+        static_cast<double>(video.width) / reference.width,
+        static_cast<double>(video.height) / reference.height);
+    const double minimumScale = (std::max)(
+        static_cast<double>(kMinimumInteractiveCropSide) / reference.width,
+        static_cast<double>(kMinimumInteractiveCropSide) / reference.height);
+    double targetScale = currentScale * scale;
+    if (scale < 1.0) {
+        targetScale = (std::max)(targetScale, (std::min)(minimumScale, currentScale));
+        if (targetScale >= currentScale) {
+            return crop;
+        }
+    } else {
+        targetScale = (std::max)(targetScale, minimumScale);
+    }
+    targetScale = (std::min)(targetScale, maximumScale);
+
+    unsigned width = ScaleCropExtent(
+        crop.width, video.width, reference.width * targetScale / crop.width);
+    unsigned height = ScaleCropExtent(
+        crop.height, video.height, reference.height * targetScale / crop.height);
+    // Pixel alignment must not reverse either axis at a zoom boundary.
+    width = scale < 1.0 ? (std::min)(width, crop.width) : (std::max)(width, crop.width);
+    height = scale < 1.0 ? (std::min)(height, crop.height) : (std::max)(height, crop.height);
+    return {
+        PlaceScaledCropAxis(crop.x, crop.width, width, video.width, anchorX),
+        PlaceScaledCropAxis(crop.y, crop.height, height, video.height, anchorY),
+        width,
+        height};
 }
 
 std::string FormatLibVlc3CropGeometry(const VideoCrop& crop) {

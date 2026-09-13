@@ -10,10 +10,17 @@ namespace {
 ToolbarVisibilityDecision FinishDecision(
     const ToolbarVisibilityInput& input,
     ToolbarVisibilityDecision decision,
-    const bool visible) noexcept {
+    const bool visible,
+    const bool restoreVisible = false) noexcept {
     decision.shouldBeVisible = visible;
     if (visible != input.currentlyVisible) {
         decision.action = visible
+            ? ToolbarVisibilityAction::Show
+            : ToolbarVisibilityAction::Hide;
+    }
+    decision.shouldRestoreBeVisible = restoreVisible;
+    if (restoreVisible != input.restoreCurrentlyVisible) {
+        decision.restoreAction = restoreVisible
             ? ToolbarVisibilityAction::Show
             : ToolbarVisibilityAction::Hide;
     }
@@ -26,6 +33,10 @@ int ToolbarActivationHeight(const unsigned dpi) noexcept {
     return ScaleLogicalPixels(kToolbarActivationHeightLogicalPixels, dpi);
 }
 
+int ToolbarRestoreActivationHeight(const unsigned dpi) noexcept {
+    return ScaleLogicalPixels(kToolbarRestoreActivationHeightLogicalPixels, dpi);
+}
+
 ToolbarVisibilityDecision EvaluateToolbarVisibility(
     const ToolbarVisibilityInput& input) noexcept {
     ToolbarVisibilityDecision decision{};
@@ -34,9 +45,26 @@ ToolbarVisibilityDecision EvaluateToolbarVisibility(
     decision.inBottomActivationZone =
         input.cursorInsideClient && input.clientHeight > 0 &&
         input.cursorY >= activationTop && input.cursorY < input.clientHeight;
+    const int restoreActivationHeight = ToolbarRestoreActivationHeight(input.dpi);
+    const int restoreActivationTop =
+        (std::max)(0, input.clientHeight - restoreActivationHeight);
+    decision.inRestoreActivationZone =
+        input.cursorInsideClient && input.clientHeight > 0 &&
+        input.cursorY >= restoreActivationTop && input.cursorY < input.clientHeight;
     decision.interactionBlocksHide =
         input.pointerOverToolbar || input.seekDragging || input.volumeDragging ||
         input.previewVisible || input.controlHasFocus;
+
+    // Manual hiding is an explicit mode rather than a fullscreen-idle state.
+    // Ordinary interaction and non-playing playback must not resurrect the
+    // full toolbar; only the small restore affordance is offered near the
+    // bottom edge (or while the pointer is already over that affordance).
+    if (input.manuallyHidden) {
+        const bool restoreVisible = input.ownedPopupsAllowed &&
+            !input.zoomSelecting &&
+            (decision.inRestoreActivationZone || input.pointerOverRestore);
+        return FinishDecision(input, decision, false, restoreVisible);
+    }
 
     if (!input.fullscreen) {
         return FinishDecision(input, decision, true);

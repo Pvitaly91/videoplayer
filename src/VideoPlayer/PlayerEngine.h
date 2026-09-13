@@ -22,6 +22,7 @@ public:
     bool Initialize(HWND videoWindow, HWND notificationWindow, std::wstring& error);
     bool Open(const std::wstring& path, std::wstring& error);
     bool Play(std::wstring& error);
+    bool Restart(std::wstring& error);
     void Pause() noexcept;
     void Stop() noexcept;
     void Seek(std::int64_t milliseconds) noexcept;
@@ -47,6 +48,7 @@ public:
     void Shutdown() noexcept;
 
 private:
+    bool StartPlayback(bool restart, std::wstring& error);
 #if defined(VIDEOPLAYER_TESTING)
     friend struct PlayerEngineTestAccess;
 #endif

@@ -5,7 +5,7 @@
 namespace videoplayer {
 
 struct ProgressStripInput final {
-    bool fullscreen = false;
+    bool compactMode = false;
     bool toolbarVisible = true;
     bool hasMedia = false;
     int availableWidth = 0;
@@ -18,7 +18,7 @@ struct ProgressStripDecision final {
     int completedWidth = 0;
 };
 
-// Determines whether the compact fullscreen progress strip is needed and how
+// Determines whether the compact hidden-toolbar progress strip is needed and how
 // many pixels of its available width represent completed playback.
 ProgressStripDecision EvaluateProgressStrip(
     const ProgressStripInput& input) noexcept;

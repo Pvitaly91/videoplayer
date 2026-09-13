@@ -9,14 +9,19 @@
 
 namespace videoplayer {
 
-inline constexpr std::int64_t kPreviewTimestampQuantumMs = 750;
+inline constexpr std::int64_t kPreviewTimestampQuantumMs = 5'000;
 inline constexpr unsigned int kPreviewMaximumWidth = 320;
 inline constexpr unsigned int kPreviewMaximumHeight = 180;
 
+// About 120 preview intervals, bounded to 5..30 seconds. Seeking stays exact.
+std::int64_t PreviewTimestampQuantum(std::int64_t durationMs) noexcept;
+std::int64_t QuantizePreviewTimestamp(
+    std::int64_t timestampMs,
+    std::int64_t durationMs) noexcept;
 std::int64_t QuantizePreviewTimestamp(
     std::int64_t timestampMs,
     std::int64_t durationMs,
-    std::int64_t quantumMs = kPreviewTimestampQuantumMs) noexcept;
+    std::int64_t quantumMs) noexcept;
 
 std::int64_t PreviewTimeFromChannelX(
     int mouseX,

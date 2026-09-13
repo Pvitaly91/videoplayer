@@ -20,6 +20,7 @@ struct FakePlayerBackend final {
     int cropCalls = 0;
     int cropResetCalls = 0;
     int stopCalls = 0;
+    int playCalls = 0;
     int volume = 100;
     bool muted = false;
     std::string cropGeometry;
@@ -69,7 +70,9 @@ struct FakePlayerBackend final {
     static void __cdecl SetHwnd(libvlc_media_player_t*, void*) {}
     static void __cdecl SetInput(libvlc_media_player_t*, unsigned) {}
     static int __cdecl Play(libvlc_media_player_t* player) {
-        From(player).backendState = 3;
+        auto& self = From(player);
+        ++self.playCalls;
+        self.backendState = 3;
         return 0;
     }
     static void __cdecl Pause(libvlc_media_player_t* player, int paused) {

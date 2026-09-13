@@ -654,6 +654,14 @@ bool PlayerEngine::Open(const std::wstring& path, std::wstring& error) {
 }
 
 bool PlayerEngine::Play(std::wstring& error) {
+    return StartPlayback(false, error);
+}
+
+bool PlayerEngine::Restart(std::wstring& error) {
+    return StartPlayback(true, error);
+}
+
+bool PlayerEngine::StartPlayback(const bool restart, std::wstring& error) {
     error.clear();
     const EngineOperation lock(impl_->mutex, impl_->mutexOwner);
     if (!lock) {
@@ -671,7 +679,10 @@ bool PlayerEngine::Play(std::wstring& error) {
     if (snapshot.state == PlaybackState::Error) {
         impl_->ResetVideoCropLocked();
     }
-    if (snapshot.state == PlaybackState::Ended) {
+    // A queued Stopped callback can replace cached Ended while VLC still
+    // owns the dead input. An explicit loop restart must release that input
+    // before play; resuming it can otherwise return success without playback.
+    if (restart || snapshot.state == PlaybackState::Ended) {
         api.mediaPlayerStop(impl_->player.get());
         api.mediaPlayerSetTime(impl_->player.get(), 0);
         impl_->context->playback.SetState(snapshot.generation, PlaybackState::Opening);

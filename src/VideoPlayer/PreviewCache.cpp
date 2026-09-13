@@ -38,6 +38,57 @@ PreviewFramePtr PreviewCache::Find(
     }
 }
 
+PreviewFramePtr PreviewCache::FindNearest(
+    const std::uint32_t mediaGeneration,
+    const std::int64_t timestampMs,
+    const std::int64_t maximumDistanceMs) noexcept {
+    if (maximumDistanceMs < 0) {
+        return {};
+    }
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (mediaGeneration != mediaGeneration_) {
+            return {};
+        }
+        auto nearest = entries_.end();
+        std::uint64_t nearestDistance =
+            static_cast<std::uint64_t>(maximumDistanceMs);
+        for (auto candidate = entries_.begin(); candidate != entries_.end();
+             ++candidate) {
+            const PreviewFramePtr& frame = candidate->frame;
+            if (!frame || !frame->IsValid() ||
+                frame->mediaGeneration != mediaGeneration) {
+                continue;
+            }
+            // Ordered unsigned subtraction represents the full mathematical
+            // distance, even between INT64_MIN and INT64_MAX. Signed subtraction
+            // or abs() would overflow for otherwise valid cached timestamps.
+            const std::uint64_t frameTime =
+                static_cast<std::uint64_t>(frame->timestampMs);
+            const std::uint64_t requestedTime =
+                static_cast<std::uint64_t>(timestampMs);
+            const std::uint64_t distance = frame->timestampMs >= timestampMs
+                ? frameTime - requestedTime
+                : requestedTime - frameTime;
+            if (distance > nearestDistance ||
+                (nearest != entries_.end() && distance == nearestDistance &&
+                 frame->timestampMs >= nearest->frame->timestampMs)) {
+                continue;
+            }
+            nearest = candidate;
+            nearestDistance = distance;
+        }
+        if (nearest == entries_.end()) {
+            return {};
+        }
+        PreviewFramePtr result = nearest->frame;
+        entries_.splice(entries_.begin(), entries_, nearest);
+        return result;
+    } catch (...) {
+        return {};
+    }
+}
+
 void PreviewCache::Put(PreviewFramePtr frame) noexcept {
     if (!frame || !frame->IsValid() || capacity_ == 0 ||
         frame->width > kPreviewMaximumWidth ||

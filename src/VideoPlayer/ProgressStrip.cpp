@@ -43,7 +43,7 @@ std::uint64_t MultiplyFractionByWidth(
 ProgressStripDecision EvaluateProgressStrip(
     const ProgressStripInput& input) noexcept {
     ProgressStripDecision decision{};
-    if (!input.fullscreen || input.toolbarVisible || !input.hasMedia ||
+    if (!input.compactMode || input.toolbarVisible || !input.hasMedia ||
         input.availableWidth <= 0 || input.durationMs <= 0) {
         return decision;
     }

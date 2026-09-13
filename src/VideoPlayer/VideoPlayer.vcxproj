@@ -202,6 +202,7 @@
     <ClCompile Include="ToolbarVisibility.cpp" />
     <ClCompile Include="Utf8.cpp" />
     <ClCompile Include="VideoGeometry.cpp" />
+    <ClCompile Include="VideoDisplayGeometry.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="App.h" />
@@ -210,6 +211,7 @@
     <ClInclude Include="MediaOpen.h" />
     <ClInclude Include="PathUtils.h" />
     <ClInclude Include="PlaybackMath.h" />
+    <ClInclude Include="PlaybackLoop.h" />
     <ClInclude Include="PlaybackState.h" />
     <ClInclude Include="PlaybackSnapshot.h" />
     <ClInclude Include="PlayerEngine.h" />
@@ -227,6 +229,7 @@
     <ClInclude Include="ToolbarVisibility.h" />
     <ClInclude Include="Utf8.h" />
     <ClInclude Include="VideoGeometry.h" />
+    <ClInclude Include="VideoDisplayGeometry.h" />
     <ClInclude Include="ZoomState.h" />
   </ItemGroup>
   <ItemGroup>

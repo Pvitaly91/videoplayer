@@ -81,6 +81,33 @@ VideoCropMapping MapSelectionToVideoCrop(
     GeometryRect selection,
     int minimumSelectionPixels) noexcept;
 
+// Moves an existing source-pixel crop by rounded source deltas while retaining
+// its exact extents. Results use even origins where an unclamped source edge
+// permits it. Invalid dimensions, crops, or non-finite deltas leave the crop
+// unchanged.
+VideoCrop PanVideoCrop(
+    VideoDimensions video,
+    VideoCrop crop,
+    double deltaX,
+    double deltaY) noexcept;
+
+// Scales an existing source-pixel crop around a normalized point inside it.
+// Values below one zoom in and values above one zoom out. The source point
+// under the anchor remains stationary unless a decoded-source edge is reached.
+// Ordinary results have even geometry and a 16-source-pixel minimum per axis;
+// zoom-in never enlarges an already smaller crop just to meet that minimum.
+// aspectReference supplies the original selection proportions, preventing
+// accumulated rounding drift over repeated wheel steps. Empty dimensions use
+// the current crop. Zoom-out reaches the largest same-aspect crop that fits
+// the decoded source, not merely the original selection size.
+VideoCrop ZoomVideoCrop(
+    VideoDimensions video,
+    VideoCrop crop,
+    double scale,
+    double anchorX,
+    double anchorY,
+    VideoDimensions aspectReference = {}) noexcept;
+
 // LibVLC 3.x internally consumes the first two crop values as absolute
 // right/bottom coordinates even though its public syntax documents extents.
 std::string FormatLibVlc3CropGeometry(const VideoCrop& crop);

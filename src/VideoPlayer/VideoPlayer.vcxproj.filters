@@ -32,6 +32,7 @@
     <ClCompile Include="ToolbarVisibility.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="Utf8.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="VideoGeometry.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="VideoDisplayGeometry.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="App.h"><Filter>Header Files</Filter></ClInclude>
@@ -56,6 +57,7 @@
     <ClInclude Include="ToolbarVisibility.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Utf8.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="VideoGeometry.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="VideoDisplayGeometry.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ZoomState.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>

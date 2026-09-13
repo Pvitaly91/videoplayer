@@ -1,6 +1,7 @@
 #include "../../src/VideoPlayer/App.h"
 #include "../../src/VideoPlayer/MediaOpen.h"
 #include "../../src/VideoPlayer/PathUtils.h"
+#include "../../src/VideoPlayer/PlaybackLoop.h"
 #include "../../src/VideoPlayer/PlaybackMath.h"
 #include "../../src/VideoPlayer/PreviewCache.h"
 #include "../../src/VideoPlayer/PreviewMath.h"
@@ -9,6 +10,7 @@
 #include "../../src/VideoPlayer/TimeFormatter.h"
 #include "../../src/VideoPlayer/ToolbarVisibility.h"
 #include "../../src/VideoPlayer/Utf8.h"
+#include "../../src/VideoPlayer/VideoDisplayGeometry.h"
 #include "../../src/VideoPlayer/VideoGeometry.h"
 #include "../../src/VideoPlayer/ZoomState.h"
 #include "PlaybackSnapshotTests.h"
@@ -162,13 +164,286 @@ void TestPlaybackMath(TestRunner& runner)
     runner.Equal(ClampVolume(101), 100, L"volume upper bound");
 }
 
+void TestPlaybackLoop(TestRunner& runner)
+{
+    using namespace videoplayer;
+    constexpr std::int64_t duration = 10'000;
+    const LoopAction none{};
+    const auto snapshot = [](
+        const std::uint32_t generation,
+        const PlaybackState state,
+        const std::int64_t positionMs,
+        const std::int64_t durationMs,
+        const bool seekable) {
+        return PlaybackSnapshot{generation, state, positionMs, durationMs, seekable};
+    };
+
+    PlaybackLoop markers;
+    runner.Equal(markers.Mode(), LoopMode::Off, L"loop starts disabled");
+    runner.Equal(markers.StartMs(), std::int64_t{-1}, L"loop A marker starts unset");
+    runner.Equal(markers.EndMs(), std::int64_t{-1}, L"loop B marker starts unset");
+    runner.True(!markers.SetStart(0, 0), L"A marker rejects unknown duration");
+    runner.True(markers.SetStart(-250, duration), L"A marker accepts and clamps negative time");
+    runner.Equal(markers.StartMs(), std::int64_t{0}, L"A marker clamps to media start");
+    runner.True(!markers.SetEnd(499, duration), L"B marker enforces 500 ms minimum");
+    runner.True(markers.SetEnd(500, duration), L"B marker accepts exact minimum segment");
+    runner.True(markers.HasSegment(duration) && markers.Mode() == LoopMode::Segment,
+        L"valid B marker enables segment loop");
+    runner.True(!markers.SetEnd(duration + 1, duration), L"B marker rejects past-duration time");
+    runner.Equal(markers.EndMs(), std::int64_t{500}, L"invalid B edit is atomic");
+    runner.True(markers.ToggleSegment(duration) && markers.Mode() == LoopMode::Off,
+        L"valid segment toggles off without deleting markers");
+    runner.True(markers.ToggleSegment(duration) && markers.Mode() == LoopMode::Segment,
+        L"stored valid segment toggles back on");
+    runner.True(markers.ToggleSegment(0) && markers.Mode() == LoopMode::Off,
+        L"active segment can always be switched off during a temporary unknown duration");
+    runner.True(markers.ToggleSegment(duration) && markers.Mode() == LoopMode::Segment,
+        L"switching segment off retains valid endpoints for later enabling");
+    markers.ToggleWholeVideo();
+    runner.Equal(markers.Mode(), LoopMode::WholeVideo, L"whole-video mode replaces segment mode");
+    markers.ClearSegment();
+    runner.True(markers.Mode() == LoopMode::WholeVideo && markers.StartMs() == -1 &&
+        markers.EndMs() == -1, L"clearing markers disables only segment mode");
+    runner.True(!markers.ToggleSegment(duration) && markers.Mode() == LoopMode::WholeVideo,
+        L"invalid segment toggle leaves whole-video mode unchanged");
+    markers.ToggleWholeVideo();
+    runner.Equal(markers.Mode(), LoopMode::Off, L"whole-video mode toggles off");
+    runner.True(markers.SetStart((std::numeric_limits<std::int64_t>::max)(), duration),
+        L"A marker accepts a huge position with bounded clamping");
+    runner.Equal(markers.StartMs(), duration - 1, L"A marker remains strictly before duration");
+    runner.Equal(markers.EndMs(), std::int64_t{-1}, L"editing A clears B");
+    markers.Reset();
+    runner.True(markers.Mode() == LoopMode::Off && markers.StartMs() == -1 &&
+        markers.EndMs() == -1, L"loop reset clears mode and both markers");
+
+    PlaybackLoop whole;
+    whole.ToggleWholeVideo();
+    runner.Equal(whole.Update(
+        snapshot(1, PlaybackState::Playing, 1000, duration, true), 0), none,
+        L"first generation bind preserves configured whole-video mode");
+    const PlaybackSnapshot unknownEnded =
+        snapshot(1, PlaybackState::Ended, 0, 0, false);
+    runner.Equal(whole.Update(unknownEnded, 100),
+        LoopAction{LoopActionKind::Play, 0},
+        L"whole-video loop restarts Ended without duration or seekability");
+    runner.Equal(whole.Update(unknownEnded, 200), none,
+        L"stale Ended snapshot cannot repeat whole-video Play");
+    runner.Equal(whole.Update(
+        snapshot(1, PlaybackState::Opening, 0, 0, false), 300), none,
+        L"whole-video restart survives Opening acknowledgement gap");
+    runner.Equal(whole.Update(
+        snapshot(1, PlaybackState::Stopped, 0, 0, false), 400), none,
+        L"whole-video restart survives transient Stopped state");
+    runner.Equal(whole.Update(
+        snapshot(1, PlaybackState::Playing, 0, 0, false), 500), none,
+        L"Playing acknowledges whole-video restart");
+    runner.Equal(whole.Update(unknownEnded, 600),
+        LoopAction{LoopActionKind::Play, 0},
+        L"a later Ended transition can restart again after acknowledgement");
+    whole.ClearSegment();
+    runner.Equal(whole.Update(unknownEnded, 700), none,
+        L"clearing unrelated markers preserves whole-video one-shot guard");
+    runner.Equal(whole.Update(
+        snapshot(1, PlaybackState::Paused, 0, 0, false), 800), none,
+        L"Paused never autonomously resumes playback");
+    runner.Equal(whole.Update(unknownEnded, 900),
+        LoopAction{LoopActionKind::Play, 0},
+        L"Paused cancels the old pending restart");
+    whole.CancelPending();
+    runner.Equal(whole.Update(
+        snapshot(1, PlaybackState::Stopped, 0, 0, false), 1000), none,
+        L"manual-stop pending cancellation prevents autonomous Play");
+
+    PlaybackLoop segment;
+    runner.True(segment.SetStart(1000, duration) && segment.SetEnd(3000, duration),
+        L"configure segment loop for stale-snapshot tests");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Playing, 1500, duration, true), 0), none,
+        L"first generation bind preserves configured segment");
+    const PlaybackSnapshot outside =
+        snapshot(2, PlaybackState::Playing, 3000, duration, true);
+    runner.Equal(segment.Update(outside, 10),
+        LoopAction{LoopActionKind::Seek, 1000},
+        L"segment end emits one seek to A");
+    runner.Equal(segment.Update(outside, 20), none,
+        L"stale outside snapshot cannot emit a seek storm");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Ended, duration, duration, false), 30),
+        LoopAction{LoopActionKind::Play, 0},
+        L"Ended replaces an unacknowledged segment seek with one restart Play");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Opening, 3000, duration, false), 40), none,
+        L"pending segment seek survives transient Opening");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Stopped, 0, duration, false), 50), none,
+        L"pending segment seek survives transient Stopped");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Playing, 1000, duration, true), 60),
+        LoopAction{LoopActionKind::Seek, 1000},
+        L"Playing and seekable after restart defers the segment seek");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Playing, 1000, duration, true), 70), none,
+        L"first in-range snapshot starts deferred-restart seek acknowledgement");
+    runner.Equal(segment.Update(
+        snapshot(2, PlaybackState::Playing, 1100, duration, true), 80), none,
+        L"forward in-range progress acknowledges deferred-restart seek");
+    runner.Equal(segment.Update(outside, 100),
+        LoopAction{LoopActionKind::Seek, 1000},
+        L"later segment boundary can emit a new seek after acknowledgement");
+    runner.Equal(segment.Update(outside, 5099), none,
+        L"pending segment seek remains gated at 4999 ms");
+    runner.Equal(segment.Update(outside, 5100), none,
+        L"unacknowledged segment seek times out at 5000 ms");
+    runner.True(segment.Mode() == LoopMode::Off && segment.StartMs() == 1000 &&
+        segment.EndMs() == 3000, L"pending timeout disables mode without deleting markers");
+    runner.Equal(segment.Update(outside, 5200), none,
+        L"timed-out segment never retries automatically");
+
+    PlaybackLoop restart;
+    runner.True(restart.SetStart(2000, duration) && restart.SetEnd(4000, duration),
+        L"configure segment loop for asynchronous restart");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 2500, duration, true), 0), none,
+        L"in-range segment playback is idle");
+    const PlaybackSnapshot segmentEnded =
+        snapshot(3, PlaybackState::Ended, duration, duration, false);
+    runner.Equal(restart.Update(segmentEnded, 100),
+        LoopAction{LoopActionKind::Play, 0},
+        L"Ended segment requests Play even after seekability has disappeared");
+    runner.Equal(restart.Update(segmentEnded, 150), none,
+        L"stale Ended snapshot cannot repeat segment Play");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Opening, 0, duration, false), 200), none,
+        L"segment restart waits through Opening");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Stopped, 0, duration, false), 250), none,
+        L"segment restart waits through transient Stopped");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 0, duration, false), 300), none,
+        L"segment restart waits for seekability after Playing");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 0, duration, true), 350),
+        LoopAction{LoopActionKind::Seek, 2000},
+        L"Playing and seekable restart defers exactly one seek to A");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 2000, duration, true), 400), none,
+        L"first A snapshot does not prematurely release deferred seek guard");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 0, duration, true), 450), none,
+        L"stale restart position cannot repeat deferred seek");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 2000, duration, true), 500), none,
+        L"A after restart regression begins a fresh acknowledgement");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 2100, duration, true), 550), none,
+        L"A then forward progress acknowledges without a duplicate seek");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 4000, duration, true), 600),
+        LoopAction{LoopActionKind::Seek, 2000},
+        L"segment B boundary repeats after the prior cycle acknowledged");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Paused, 4000, duration, true), 650), none,
+        L"Paused cancels a pending segment seek");
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Playing, 4000, duration, true), 700),
+        LoopAction{LoopActionKind::Seek, 2000},
+        L"resume outside segment starts a fresh seek after pause cancellation");
+    restart.CancelPending();
+    runner.Equal(restart.Update(
+        snapshot(3, PlaybackState::Stopped, 0, duration, true), 750), none,
+        L"explicit pending cancellation keeps manual Stop stopped");
+
+    PlaybackLoop restartTimeout;
+    runner.True(restartTimeout.SetStart(2000, duration) &&
+        restartTimeout.SetEnd(4000, duration),
+        L"configure deferred-restart acknowledgement timeout");
+    restartTimeout.Update(
+        snapshot(31, PlaybackState::Playing, 2500, duration, true), 0);
+    restartTimeout.Update(
+        snapshot(31, PlaybackState::Ended, duration, duration, false), 100);
+    runner.Equal(restartTimeout.Update(
+        snapshot(31, PlaybackState::Playing, 0, duration, true), 200),
+        LoopAction{LoopActionKind::Seek, 2000},
+        L"restart timeout scenario emits its deferred seek");
+    runner.Equal(restartTimeout.Update(
+        snapshot(31, PlaybackState::Playing, 2000, duration, true), 300), none,
+        L"constant A starts but cannot complete progress acknowledgement");
+    runner.Equal(restartTimeout.Update(
+        snapshot(31, PlaybackState::Playing, 2000, duration, true), 5200), none,
+        L"constant A remains action-free at the bounded timeout");
+    runner.True(restartTimeout.Mode() == LoopMode::Off &&
+        restartTimeout.StartMs() == 2000 && restartTimeout.EndMs() == 4000,
+        L"unacknowledged restart seek disables at 5000 ms without losing markers");
+
+    PlaybackLoop gated;
+    runner.True(gated.SetStart(1000, duration) && gated.SetEnd(3000, duration),
+        L"configure gated segment loop");
+    runner.Equal(gated.Update(
+        snapshot(4, PlaybackState::Playing, 3000, 0, true), 0), none,
+        L"segment loop waits for a known duration");
+    runner.Equal(gated.Update(
+        snapshot(4, PlaybackState::Playing, 3000, duration, false), 10), none,
+        L"segment loop waits for seekability");
+    runner.Equal(gated.Update(
+        snapshot(4, PlaybackState::Playing, 3000, duration, true), 20, true), none,
+        L"suspended seek dragging suppresses loop action");
+    runner.Equal(gated.Update(
+        snapshot(4, PlaybackState::Playing, 3000, duration, true), 30),
+        LoopAction{LoopActionKind::Seek, 1000},
+        L"segment enforcement resumes after seek dragging");
+
+    PlaybackLoop failed;
+    runner.True(failed.SetStart(1000, duration) && failed.SetEnd(3000, duration),
+        L"configure loop before playback error");
+    failed.Update(snapshot(5, PlaybackState::Playing, 3000, duration, true), 0);
+    runner.Equal(failed.Update(
+        snapshot(5, PlaybackState::Error, 3000, duration, false), 10), none,
+        L"playback error emits no loop action");
+    runner.True(failed.Mode() == LoopMode::Off && failed.StartMs() == -1 &&
+        failed.EndMs() == -1,
+        L"playback error resets loop configuration and pending action");
+
+    PlaybackLoop generation;
+    runner.True(generation.SetStart(1000, duration) && generation.SetEnd(3000, duration),
+        L"configure segment before any generation is bound");
+    runner.Equal(generation.Update(
+        snapshot(20, PlaybackState::Playing, 3000, duration, true), 0),
+        LoopAction{LoopActionKind::Seek, 1000},
+        L"first Update binds generation without discarding configuration");
+    runner.Equal(generation.Update(
+        snapshot(21, PlaybackState::Playing, 3000, duration, true), 10), none,
+        L"changed media generation emits no stale loop action");
+    runner.True(generation.Mode() == LoopMode::Off && generation.StartMs() == -1 &&
+        generation.EndMs() == -1,
+        L"changed generation resets loop mode, markers and pending action");
+
+    PlaybackLoop first;
+    PlaybackLoop second;
+    first.ToggleWholeVideo();
+    second.SetStart(1000, duration);
+    second.SetEnd(3000, duration);
+    first.Update(snapshot(30, PlaybackState::Playing, 0, duration, true), 0);
+    second.Update(snapshot(30, PlaybackState::Playing, 1500, duration, true), 0);
+    runner.Equal(first.Update(
+        snapshot(30, PlaybackState::Ended, duration, duration, false), 100),
+        LoopAction{LoopActionKind::Play, 0},
+        L"first loop instance independently requests whole-video Play");
+    runner.Equal(second.Update(
+        snapshot(30, PlaybackState::Playing, 3000, duration, true), 100),
+        LoopAction{LoopActionKind::Seek, 1000},
+        L"second loop instance independently requests segment Seek");
+    runner.True(first.Mode() == LoopMode::WholeVideo &&
+        second.Mode() == LoopMode::Segment,
+        L"independent loop controllers do not share mode or pending state");
+}
+
 void TestProgressStrip(TestRunner& runner)
 {
     using videoplayer::EvaluateProgressStrip;
     using videoplayer::ProgressStripInput;
 
     ProgressStripInput input{};
-    input.fullscreen = true;
+    input.compactMode = true;
     input.toolbarVisible = false;
     input.hasMedia = true;
     input.availableWidth = 1920;
@@ -179,12 +454,16 @@ void TestProgressStrip(TestRunner& runner)
     runner.True(decision.visible, L"fullscreen hidden-toolbar progress strip is visible");
     runner.Equal(decision.completedWidth, 960, L"progress strip maps midpoint to half width");
 
-    input.fullscreen = false;
+    input.compactMode = false;
     decision = EvaluateProgressStrip(input);
-    runner.True(!decision.visible, L"windowed mode hides compact progress strip");
-    runner.Equal(decision.completedWidth, 0, L"hidden windowed strip has no completed width");
+    runner.True(!decision.visible, L"ordinary windowed mode hides compact progress strip");
+    runner.Equal(decision.completedWidth, 0, L"non-compact windowed strip has no completed width");
 
-    input.fullscreen = true;
+    input.compactMode = true;
+    decision = EvaluateProgressStrip(input);
+    runner.True(decision.visible, L"manually hidden windowed toolbar enables compact progress strip");
+    runner.Equal(decision.completedWidth, 960, L"windowed compact progress uses the fullscreen mapping");
+
     input.toolbarVisible = true;
     decision = EvaluateProgressStrip(input);
     runner.True(!decision.visible, L"visible toolbar hides compact progress strip");
@@ -561,6 +840,442 @@ void TestVideoContentFit(TestRunner& runner)
         L"empty viewport rejects fit");
 }
 
+void TestVideoDisplayGeometry(TestRunner& runner)
+{
+    using namespace videoplayer;
+
+    const VideoDimensions widescreen{1600, 900};
+    const GeometryRect wideViewport{0, 0, 1000, 400};
+    const GeometryRect fittedWide{144, 0, 855, 400};
+    runner.Equal(
+        ComputeVideoDisplayRect(widescreen, wideViewport, {}),
+        fittedWide,
+        L"default display state is the ordinary fitted crop rectangle");
+
+    const VideoDisplayState fillWide = ResizeVideoDisplay(
+        {}, widescreen, wideViewport, fittedWide, VideoEdge::Right,
+        {fittedWide.right, 200}, {wideViewport.right, 200});
+    runner.Near(
+        fillWide.scale,
+        1000.0 / 711.0,
+        0.000001,
+        L"outward edge resize reaches pillarbox cover scale");
+    const GeometryRect filledWide =
+        ComputeVideoDisplayRect(widescreen, wideViewport, fillWide);
+    runner.True(
+        filledWide.left == wideViewport.left &&
+            filledWide.right == wideViewport.right &&
+            filledWide.top <= wideViewport.top &&
+            filledWide.bottom >= wideViewport.bottom,
+        L"16:9 presentation fills a wider viewport without blank gaps");
+
+    const GeometryRect matchingViewport{0, 0, 800, 450};
+    const GeometryRect matchingGrip{0, 0, 800, 450};
+    const VideoDisplayState shrunk = ResizeVideoDisplay(
+        {}, {800, 450}, matchingViewport, matchingGrip, VideoEdge::Right,
+        {800, 225}, {600, 225});
+    runner.Near(shrunk.scale, 0.5, 0.000001,
+        L"inward edge drag shrinks symmetrically from immutable start geometry");
+    runner.Equal(
+        ComputeVideoDisplayRect({800, 450}, matchingViewport, shrunk),
+        GeometryRect{200, 112, 600, 337},
+        L"shrunk presentation stays centered on both smaller axes");
+
+    runner.Equal(
+        ComputeVideoDisplayRect(
+            {1080, 1920}, {0, 0, 1000, 500}, {1.5, 0.5, 0.5}),
+        GeometryRect{289, -125, 711, 625},
+        L"portrait presentation scales uniformly around the viewport center");
+
+    const VideoDisplayState clampedCenter = NormalizeVideoDisplayState(
+        {1920, 1080}, {0, 0, 800, 600}, {2.0, -5.0, 9.0});
+    runner.Near(clampedCenter.centerX, 0.25, 0.000001,
+        L"oversized horizontal center clamps against the left blank-gap limit");
+    runner.Near(clampedCenter.centerY, 2.0 / 3.0, 0.000001,
+        L"oversized vertical center clamps against the bottom blank-gap limit");
+    runner.Equal(
+        ComputeVideoDisplayRect(
+            {1920, 1080}, {0, 0, 800, 600}, clampedCenter),
+        GeometryRect{0, -300, 1600, 600},
+        L"clamped source fractions place their crop point under viewport center");
+
+    const VideoDisplayState centeredSmall = NormalizeVideoDisplayState(
+        {1920, 1080}, {0, 0, 800, 600}, {0.5, 0.0, 1.0});
+    runner.Near(centeredSmall.centerX, 0.5, 0.000001,
+        L"smaller horizontal presentation ignores stale pan center");
+    runner.Near(centeredSmall.centerY, 0.5, 0.000001,
+        L"smaller vertical presentation ignores stale pan center");
+    runner.Near(
+        NormalizeVideoDisplayState(
+            {800, 450}, matchingViewport, {-100.0, 0.5, 0.5}).scale,
+        0.25,
+        0.000001,
+        L"display scale clamps to one quarter");
+    runner.Near(
+        NormalizeVideoDisplayState(
+            {100, 100}, {0, 0, 100, 100}, {100.0, 0.5, 0.5}).scale,
+        8.0,
+        0.000001,
+        L"ordinary display scale clamps to eight");
+
+    const VideoDisplayState canvasBound = NormalizeVideoDisplayState(
+        {1, 1}, {0, 0, 4096, 4096}, {8.0, 0.5, 0.5});
+    runner.Near(canvasBound.scale, 4.0, 0.000001,
+        L"canvas allocation bound lowers the maximum scale");
+    const GeometryRect canvasRect = ComputeVideoDisplayRect(
+        {1, 1}, {0, 0, 4096, 4096}, canvasBound);
+    runner.True(
+        canvasRect.Width() == 16384 && canvasRect.Height() == 16384,
+        L"display canvas dimensions never exceed 16384 pixels");
+
+    const GeometryRect content{100, 100, 700, 500};
+    const GeometryRect viewport{0, 0, 800, 600};
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {104, 105}, 8),
+        VideoEdge::TopLeft,
+        L"edge hit testing gives visible corners priority");
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {696, 300}, 8),
+        VideoEdge::Right,
+        L"edge hit testing recognizes a visible side");
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {300, 493}, 8),
+        VideoEdge::Bottom,
+        L"edge hit testing recognizes a visible bottom border");
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {-1, 100}, 8),
+        VideoEdge::None,
+        L"edge hit testing rejects points outside the viewport");
+
+    const GeometryRect clippedContent{-200, 50, 600, 450};
+    runner.Equal(
+        HitTestVideoEdge(clippedContent, {0, 0, 500, 500}, {0, 200}, 8),
+        VideoEdge::Left,
+        L"visible intersection boundary remains a grip for clipped content");
+    runner.Equal(
+        HitTestVideoEdge(clippedContent, {0, 0, 500, 500}, {250, 54}, 8),
+        VideoEdge::Top,
+        L"visible portion of a partially clipped content border remains hittable");
+    runner.Equal(
+        HitTestVideoEdge(
+            {-200, 50, 300, 450}, {0, 0, 500, 500}, {296, 54}, 8),
+        VideoEdge::TopRight,
+        L"visible clipped-border corner still has corner priority");
+    runner.Equal(
+        HitTestVideoEdge(
+            {-100, -100, 900, 700}, viewport, {0, 300}, 8),
+        VideoEdge::Left,
+        L"oversized content on both axes retains a visible resize grip");
+    runner.Equal(
+        HitTestVideoEdge(
+            {-100, -100, 900, 700}, viewport, {799, 599}, 0),
+        VideoEdge::BottomRight,
+        L"half-open visible border supports exact zero-tolerance corner hits");
+    runner.Equal(
+        HitTestVideoEdge(
+            {-100, -100, 900, 700}, viewport, {800, 599}, 8),
+        VideoEdge::None,
+        L"oversized visible grip still rejects a point outside viewport");
+    runner.Equal(
+        HitTestVideoEdge(
+            {100, 100, 110, 110}, viewport, {108, 108}, 20),
+        VideoEdge::BottomRight,
+        L"overlapping tolerance selects nearest opposing borders");
+
+    const int dpiTolerance = ScaleLogicalPixels(6, 144);
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {91, 300}, dpiTolerance),
+        VideoEdge::Left,
+        L"caller-provided DPI-scaled device-pixel tolerance is honored exactly");
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {90, 300}, dpiTolerance),
+        VideoEdge::None,
+        L"one pixel beyond supplied hit tolerance is rejected");
+
+    const VideoDimensions twoToOne{800, 400};
+    const GeometryRect resizeViewport{0, 0, 800, 600};
+    const VideoDisplayState halfSize{0.5, 0.5, 0.5};
+    const GeometryRect halfGrip{200, 200, 600, 400};
+    const VideoDisplayState cornerResize = ResizeVideoDisplay(
+        halfSize, twoToOne, resizeViewport, halfGrip,
+        VideoEdge::BottomRight, {600, 400}, {700, 450});
+    runner.Near(cornerResize.scale, 0.75, 0.000001,
+        L"corner drag projects both pointer axes onto one uniform scale");
+    runner.Equal(
+        ComputeVideoDisplayRect(twoToOne, resizeViewport, cornerResize),
+        GeometryRect{100, 150, 700, 450},
+        L"corner resizing preserves crop aspect ratio and fixed center");
+
+    const VideoDisplayState topResize = ResizeVideoDisplay(
+        halfSize, twoToOne, resizeViewport, halfGrip,
+        VideoEdge::Top, {400, 200}, {400, 150});
+    runner.Near(topResize.scale, 0.75, 0.000001,
+        L"top-edge outward sign increases scale");
+    const VideoDisplayState minimumResize = ResizeVideoDisplay(
+        halfSize, twoToOne, resizeViewport, halfGrip,
+        VideoEdge::Right, {600, 300}, {-5000, 300});
+    runner.Near(minimumResize.scale, 0.25, 0.000001,
+        L"current pointer clamps into viewport before minimum-scale clamp");
+    const VideoDisplayState coverLimited = ResizeVideoDisplay(
+        {}, twoToOne, resizeViewport, {0, 100, 800, 500},
+        VideoEdge::Top, {400, 100}, {400, 0});
+    runner.Near(coverLimited.scale, 1.5, 0.000001,
+        L"outward resize stops at the crop cover scale");
+    const VideoDisplayState existingLarger{2.0, 0.5, 0.5};
+    const VideoDisplayState cannotGrowPastStart = ResizeVideoDisplay(
+        existingLarger, twoToOne, resizeViewport,
+        ComputeVideoDisplayRect(twoToOne, resizeViewport, existingLarger),
+        VideoEdge::Right, {799, 300}, {800, 300});
+    runner.Near(cannotGrowPastStart.scale, 2.0, 0.000001,
+        L"resize never grows beyond an already-larger drag-start scale");
+
+    const GeometryRect negativeViewport{-500, -200, 500, 200};
+    const GeometryRect negativeGrip{-356, -200, 355, 200};
+    const VideoDisplayState negativeFill = ResizeVideoDisplay(
+        {}, widescreen, negativeViewport, negativeGrip, VideoEdge::Right,
+        {negativeGrip.right, 0}, {negativeViewport.right, 0});
+    runner.Equal(
+        ComputeVideoDisplayRect(widescreen, negativeViewport, negativeFill),
+        GeometryRect{-500, -282, 500, 281},
+        L"negative screen coordinates retain bounded cover geometry");
+
+    const VideoDisplayState anchored = NormalizeVideoDisplayState(
+        {1920, 1080}, viewport, {1.5, 0.0, 0.5});
+    const GeometryRect anchoredRect =
+        ComputeVideoDisplayRect({1920, 1080}, viewport, anchored);
+    const VideoDisplayState unchangedAnchor = ResizeVideoDisplay(
+        anchored, {1920, 1080}, viewport, anchoredRect, VideoEdge::Left,
+        {anchoredRect.left, 300}, {anchoredRect.left, 300});
+    runner.Near(unchangedAnchor.scale, anchored.scale, 0.000001,
+        L"returning to immutable mouse anchor restores exact start scale");
+    runner.Near(unchangedAnchor.centerX, anchored.centerX, 0.000001,
+        L"returning to mouse anchor has no horizontal center drift");
+    runner.Near(unchangedAnchor.centerY, anchored.centerY, 0.000001,
+        L"returning to mouse anchor has no vertical center drift");
+
+    const double nan = (std::numeric_limits<double>::quiet_NaN)();
+    const VideoDisplayState sanitized = NormalizeVideoDisplayState(
+        {800, 450}, matchingViewport,
+        {nan, (std::numeric_limits<double>::infinity)(), nan});
+    runner.True(
+        std::isfinite(sanitized.scale) && sanitized.scale == 1.0 &&
+            sanitized.centerX == 0.5 && sanitized.centerY == 0.5,
+        L"non-finite display state sanitizes to safe defaults");
+    runner.Equal(
+        ComputeVideoDisplayRect({}, viewport, {}),
+        GeometryRect{},
+        L"invalid crop size has no display rectangle");
+    runner.Equal(
+        HitTestVideoEdge(content, viewport, {100, 300}, -1),
+        VideoEdge::None,
+        L"negative hit tolerance is invalid");
+    const VideoDisplayState invalidResize = ResizeVideoDisplay(
+        {nan, nan, nan}, {}, viewport, {}, VideoEdge::None, {}, {});
+    runner.True(
+        std::isfinite(invalidResize.scale) && invalidResize.scale == 1.0 &&
+            invalidResize.centerX == 0.5 && invalidResize.centerY == 0.5,
+        L"invalid resize input returns a finite normalized default state");
+}
+
+void TestVideoAreaResize(TestRunner& runner)
+{
+    using namespace videoplayer;
+
+    const auto nearRect = [&runner](
+        const GeometryRect actual,
+        const GeometryRect expected,
+        const wchar_t* const name) {
+        runner.True(
+            std::abs(actual.left - expected.left) <= 2 &&
+                std::abs(actual.top - expected.top) <= 2 &&
+                std::abs(actual.right - expected.right) <= 2 &&
+                std::abs(actual.bottom - expected.bottom) <= 2,
+            name);
+    };
+    const auto cropIsBounded = [](const VideoDimensions video, const VideoCrop crop) {
+        return crop.IsValid() && crop.x < video.width && crop.y < video.height &&
+            crop.width <= video.width - crop.x &&
+            crop.height <= video.height - crop.y;
+    };
+
+    const VideoDimensions video{1920, 1080};
+    const GeometryRect viewport{0, 0, 800, 600};
+    const VideoCrop startCrop{760, 390, 400, 300};
+    const VideoDisplayState startState{0.5, 0.5, 0.5};
+    const GeometryRect startContent{200, 150, 600, 450};
+
+    const VideoAreaResizeResult right = ResizeVideoArea(
+        video, startCrop, startState, viewport, startContent,
+        VideoEdge::Right, {600, 300}, {700, 300});
+    runner.True(right.valid, L"right-edge area resize produces a result");
+    runner.Equal(
+        right.crop, VideoCrop{660, 390, 600, 300},
+        L"right-edge area resize changes source width but preserves height");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {right.crop.width, right.crop.height}, viewport, right.display),
+        {100, 150, 700, 450},
+        L"right-edge area resize changes only the rendered width");
+
+    const VideoAreaResizeResult top = ResizeVideoArea(
+        video, startCrop, startState, viewport, startContent,
+        VideoEdge::Top, {400, 150}, {400, 100});
+    runner.True(top.valid, L"top-edge area resize produces a result");
+    runner.Equal(
+        top.crop, VideoCrop{760, 340, 400, 400},
+        L"top-edge area resize changes source height but preserves width");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {top.crop.width, top.crop.height}, viewport, top.display),
+        {200, 100, 600, 500},
+        L"top-edge area resize changes only the rendered height");
+
+    const VideoAreaResizeResult corner = ResizeVideoArea(
+        video, startCrop, startState, viewport, startContent,
+        VideoEdge::BottomRight, {600, 450}, {700, 500});
+    runner.True(corner.valid, L"corner area resize produces a result");
+    runner.Equal(
+        corner.crop, VideoCrop{660, 340, 600, 400},
+        L"corner area resize changes width and height independently");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {corner.crop.width, corner.crop.height}, viewport, corner.display),
+        {100, 100, 700, 500},
+        L"corner resize remains an undistorted uniform-density rectangle");
+
+    const VideoAreaResizeResult shrink = ResizeVideoArea(
+        video, startCrop, startState, viewport, startContent,
+        VideoEdge::Right, {600, 300}, {500, 300});
+    runner.Equal(
+        shrink.crop, VideoCrop{860, 390, 200, 300},
+        L"inward area resize symmetrically shrinks the affected crop axis");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {shrink.crop.width, shrink.crop.height}, viewport, shrink.display),
+        {300, 150, 500, 450},
+        L"inward area resize preserves the unaffected rendered height");
+
+    const VideoCrop zoomedOut = ZoomVideoCrop(
+        video, right.crop, (std::numeric_limits<double>::max)(),
+        0.5, 0.5, {right.crop.width, right.crop.height});
+    runner.Equal(
+        zoomedOut, VideoCrop{0, 60, 1920, 960},
+        L"wheel zoom can expand a resized user aspect to its source limit");
+
+    const GeometryRect wideViewport{0, 0, 800, 450};
+    const VideoAreaResizeResult sourceLimited = ResizeVideoArea(
+        video, {0, 0, 1920, 1080}, {}, wideViewport, wideViewport,
+        VideoEdge::Top, {400, 0}, {400, 75});
+    runner.True(sourceLimited.valid,
+        L"area resize remains valid when one source axis is already full");
+    runner.Equal(
+        sourceLimited.crop, VideoCrop{0, 180, 1920, 720},
+        L"full-source axis forces uniform density and crops the other axis");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {sourceLimited.crop.width, sourceLimited.crop.height},
+            wideViewport, sourceLimited.display),
+        {0, 75, 800, 375},
+        L"source-limited resize does not distort either axis");
+
+    const GeometryRect floorViewport{0, 0, 1000, 400};
+    const VideoCrop floorCrop{210, 340, 1500, 400};
+    const VideoDisplayState floorState{0.3, 0.5, 0.5};
+    const GeometryRect floorContent{350, 160, 650, 240};
+    const VideoAreaResizeResult scaleFloor = ResizeVideoArea(
+        video, floorCrop, floorState, floorViewport, floorContent,
+        VideoEdge::Right, {650, 200}, {500, 200});
+    runner.True(scaleFloor.valid,
+        L"area resize remains valid at the display scale floor");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {scaleFloor.crop.width, scaleFloor.crop.height},
+            floorViewport, scaleFloor.display),
+        {375, 160, 625, 240},
+        L"scale-floor clamping never enlarges the unaffected short axis");
+
+    const VideoDisplayState overscanState{2.0, 0.25, 2.0 / 3.0};
+    const GeometryRect overscanContent = ComputeVideoDisplayRect(
+        video, viewport, overscanState);
+    const VideoAreaResizeResult perpendicularOnly = ResizeVideoArea(
+        video, {0, 0, 1920, 1080}, overscanState, viewport,
+        overscanContent, VideoEdge::Right, {799, 300}, {799, 100});
+    runner.True(perpendicularOnly.valid,
+        L"perpendicular-only edge motion is a valid no-op");
+    runner.Equal(
+        perpendicularOnly.crop, VideoCrop{0, 0, 1920, 1080},
+        L"perpendicular-only edge motion preserves exact source crop");
+    runner.True(
+        perpendicularOnly.display.scale == overscanState.scale &&
+            perpendicularOnly.display.centerX == overscanState.centerX &&
+            perpendicularOnly.display.centerY == overscanState.centerY,
+        L"perpendicular-only edge motion preserves exact display state");
+
+    const GeometryRect negativeViewport{-500, -300, 300, 300};
+    const VideoCrop oddStart{760, 340, 400, 400};
+    const VideoDisplayState negativeState{2.0 / 3.0, 0.5, 0.5};
+    const GeometryRect negativeContent{-300, -200, 100, 200};
+    const VideoAreaResizeResult negative = ResizeVideoArea(
+        {1919, 1079}, oddStart, negativeState, negativeViewport,
+        negativeContent, VideoEdge::Right, {100, 0}, {200, 0});
+    runner.True(
+        negative.valid && cropIsBounded({1919, 1079}, negative.crop) &&
+            (negative.crop.width == 1919U || (negative.crop.width & 1U) == 0U) &&
+            (negative.crop.height == 1079U || (negative.crop.height & 1U) == 0U),
+        L"negative coordinates and odd source bounds yield an aligned valid crop");
+    nearRect(
+        ComputeVideoDisplayRect(
+            {negative.crop.width, negative.crop.height},
+            negativeViewport, negative.display),
+        {-400, -200, 200, 200},
+        L"negative viewport coordinates preserve the requested frame");
+
+    const VideoDimensions tinyVideo{15, 11};
+    const GeometryRect tinyViewport{0, 0, 120, 100};
+    const GeometryRect tinyContent = ComputeVideoDisplayRect(
+        tinyVideo, tinyViewport, {0.5, 0.5, 0.5});
+    const VideoAreaResizeResult tiny = ResizeVideoArea(
+        tinyVideo, {0, 0, 15, 11}, {0.5, 0.5, 0.5}, tinyViewport,
+        tinyContent, VideoEdge::Right,
+        {tinyContent.right - 1, 50}, {120, 50});
+    runner.True(
+        tiny.valid && cropIsBounded(tinyVideo, tiny.crop) &&
+            tiny.crop.width <= tinyVideo.width &&
+            tiny.crop.height <= tinyVideo.height &&
+            std::isfinite(tiny.display.scale),
+        L"tiny odd sources remain finite and are never promoted past bounds");
+
+    const VideoAreaResizeResult clampedPointer = ResizeVideoArea(
+        video, startCrop, startState, viewport, startContent,
+        VideoEdge::BottomRight, {600, 450},
+        {(std::numeric_limits<int>::max)(), (std::numeric_limits<int>::max)()});
+    runner.True(
+        clampedPointer.valid && cropIsBounded(video, clampedPointer.crop),
+        L"huge drag coordinates clamp to a bounded source crop");
+
+    const double nan = (std::numeric_limits<double>::quiet_NaN)();
+    runner.True(
+        !ResizeVideoArea(
+            video, startCrop, startState, viewport, startContent,
+            VideoEdge::None, {600, 300}, {700, 300}).valid,
+        L"missing area resize edge is invalid");
+    runner.True(
+        !ResizeVideoArea(
+            video, {1800, 900, 400, 300}, startState, viewport, startContent,
+            VideoEdge::Right, {600, 300}, {700, 300}).valid,
+        L"out-of-source starting crop is invalid");
+    runner.True(
+        !ResizeVideoArea(
+            video, startCrop, {nan, 0.5, 0.5}, viewport, startContent,
+            VideoEdge::Right, {600, 300}, {700, 300}).valid,
+        L"non-finite starting display state is invalid");
+    runner.True(
+        !ResizeVideoArea(
+            video, startCrop, startState, viewport, startContent,
+            VideoEdge::Right, {-1, 300}, {700, 300}).valid,
+        L"drag anchor outside the viewport is invalid");
+}
+
 void TestVideoCropMapping(TestRunner& runner)
 {
     using namespace videoplayer;
@@ -677,20 +1392,289 @@ void TestVideoCropMapping(TestRunner& runner)
         L"overflowing LibVLC crop endpoint is rejected");
 }
 
+void TestVideoCropPanAndZoom(TestRunner& runner)
+{
+    using namespace videoplayer;
+    const VideoDimensions video{1920, 1080};
+    const VideoCrop crop{400, 200, 800, 400};
+
+    runner.Equal(
+        PanVideoCrop(video, crop, 11.6, -9.6),
+        VideoCrop{412, 190, 800, 400},
+        L"pan rounds source deltas and preserves crop extents");
+    runner.Equal(
+        PanVideoCrop(video, {101, 101, 801, 401}, 0.5, -0.5),
+        VideoCrop{102, 100, 801, 401},
+        L"pan half-pixel deltas round away from zero");
+    runner.Equal(
+        PanVideoCrop(video, crop, 0.49, -0.49),
+        crop,
+        L"sub-half-pixel pan remains stationary");
+    runner.Equal(
+        PanVideoCrop(video, crop,
+            (std::numeric_limits<double>::max)(),
+            (std::numeric_limits<double>::max)()),
+        VideoCrop{1120, 680, 800, 400},
+        L"huge finite positive pan clamps to bottom-right source corner");
+    runner.Equal(
+        PanVideoCrop(video, crop,
+            -(std::numeric_limits<double>::max)(),
+            -(std::numeric_limits<double>::max)()),
+        VideoCrop{0, 0, 800, 400},
+        L"huge finite negative pan clamps to top-left source corner");
+    runner.Equal(
+        PanVideoCrop({1919, 1079}, {100, 100, 800, 400}, 1.0e30, 1.0e30),
+        VideoCrop{1119, 679, 800, 400},
+        L"pan reaches odd decoded-source edges without changing extents");
+
+    const VideoCrop centeredIn = ZoomVideoCrop(video, crop, 0.5, 0.5, 0.5);
+    runner.Equal(
+        centeredIn,
+        VideoCrop{600, 300, 400, 200},
+        L"center-anchor zoom in halves crop around the same source point");
+    runner.Near(
+        static_cast<double>(centeredIn.x) + centeredIn.width * 0.5,
+        static_cast<double>(crop.x) + crop.width * 0.5,
+        0.000001,
+        L"center anchor source X remains stationary");
+    runner.Near(
+        static_cast<double>(centeredIn.y) + centeredIn.height * 0.5,
+        static_cast<double>(crop.y) + crop.height * 0.5,
+        0.000001,
+        L"center anchor source Y remains stationary");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, 0.5, 0.0, 0.0),
+        VideoCrop{400, 200, 400, 200},
+        L"top-left anchor keeps the crop corner stationary");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, 0.5, 1.0, 1.0),
+        VideoCrop{800, 400, 400, 200},
+        L"bottom-right anchor keeps the crop corner stationary");
+
+    const VideoCrop centeredOut = ZoomVideoCrop(video, crop, 1.5, 0.5, 0.5);
+    runner.Equal(
+        centeredOut,
+        VideoCrop{200, 100, 1200, 600},
+        L"unclamped zoom out preserves ratio around anchor");
+    runner.True(
+        static_cast<std::uint64_t>(centeredOut.width) * crop.height ==
+            static_cast<std::uint64_t>(centeredOut.height) * crop.width,
+        L"zoom keeps crop aspect ratio before a source limit is reached");
+    runner.Equal(
+        ZoomVideoCrop(video, {0, 0, 800, 400}, 2.0, 0.5, 0.5),
+        VideoCrop{0, 0, 1600, 800},
+        L"zoom anchor yields to top-left source bounds");
+
+    VideoCrop independentlyExpanded{400, 400, 800, 100};
+    for (int step = 0; step < 8; ++step) {
+        independentlyExpanded = ZoomVideoCrop(
+            video, independentlyExpanded, 2.0, 0.5, 0.5);
+    }
+    runner.Equal(
+        independentlyExpanded,
+        VideoCrop{0, 330, 1920, 240},
+        L"repeated zoom out stops at source edge without changing narrow selection aspect");
+    runner.True(
+        independentlyExpanded.IsValid(),
+        L"maximum same-aspect zoom result remains a valid applied crop");
+    runner.Equal(
+        ZoomVideoCrop(video, independentlyExpanded, 2.0, 0.5, 0.5),
+        independentlyExpanded,
+        L"extra zoom out keeps maximum same-aspect crop and position");
+
+    const VideoDimensions oddSelectionLimit{321, 179};
+    VideoCrop cappedRoundTrip{500, 300, 321, 179};
+    for (int step = 0; step < 8; ++step) {
+        cappedRoundTrip = ZoomVideoCrop(
+            video, cappedRoundTrip, 0.8, 0.5, 0.5, oddSelectionLimit);
+    }
+    runner.True(
+        cappedRoundTrip.width < oddSelectionLimit.width &&
+            cappedRoundTrip.height < oddSelectionLimit.height,
+        L"reference-aspect zoom can move inward from the selection");
+    bool retainedAspect = true;
+    for (int step = 0; step < 64; ++step) {
+        cappedRoundTrip = ZoomVideoCrop(
+            video, cappedRoundTrip, 1.12, 0.5, 0.5, oddSelectionLimit);
+        retainedAspect = retainedAspect &&
+            std::abs(static_cast<double>(cappedRoundTrip.height) -
+                cappedRoundTrip.width * 179.0 / 321.0) <= 2.0;
+    }
+    runner.True(
+        cappedRoundTrip.width == video.width &&
+            cappedRoundTrip.height > oddSelectionLimit.height &&
+            cappedRoundTrip.x + cappedRoundTrip.width <= video.width &&
+            cappedRoundTrip.y + cappedRoundTrip.height <= video.height,
+        L"repeated zoom-out expands beyond original odd selection within source");
+    runner.True(retainedAspect,
+        L"original odd selection aspect does not accumulate rounding drift");
+
+    runner.Equal(
+        ZoomVideoCrop(
+            video, {1200, 700, 160, 90}, 2.0, 0.0, 0.0, {160, 90}),
+        VideoCrop{1200, 700, 320, 180},
+        L"first outward step expands past the original selection at its panned location");
+    runner.Equal(
+        ZoomVideoCrop(
+            video, {1760, 990, 160, 90}, 8.0, 1.0, 1.0,
+            {320, 180}),
+        VideoCrop{640, 360, 1280, 720},
+        L"zoom beyond original extents preserves bottom-right source anchor");
+    runner.Equal(
+        ZoomVideoCrop(video, {600, 400, 7, 9}, 1.01, 0.0, 0.0, {7, 9}),
+        VideoCrop{600, 400, 16, 22},
+        L"tiny selection can expand beyond its initial extents with bounded rounding");
+    const VideoCrop widerThanLimit{400, 200, 800, 400};
+    runner.Equal(
+        ZoomVideoCrop(video, widerThanLimit, 0.5, 0.5, 0.5, {200, 100}),
+        VideoCrop{600, 300, 400, 200},
+        L"crop larger than original selection can zoom back in");
+    runner.Equal(
+        ZoomVideoCrop(
+            {1919, 1079}, {100, 100, 800, 400},
+            (std::numeric_limits<double>::max)(), 0.5, 0.5,
+            {800, 400}),
+        VideoCrop{0, 0, 1919, 960},
+        L"reference aspect is retained at an odd decoded-source boundary");
+    runner.Equal(
+        ZoomVideoCrop({640, 360}, {220, 80, 200, 200}, 100.0, 0.5, 0.5, {200, 200}),
+        VideoCrop{140, 0, 360, 360},
+        L"square selection reaches source height while retaining horizontal pan room");
+    runner.Equal(
+        ZoomVideoCrop(video, {100, 100, 320, 180}, 100.0, 0.5, 0.5, {320, 180}),
+        VideoCrop{0, 0, 1920, 1080},
+        L"matching source aspect can reach the full frame as an active crop");
+    runner.Equal(
+        ZoomVideoCrop(video, {100, 100, 2, 500}, 100.0, 0.0, 0.0, {2, 500}),
+        VideoCrop{100, 0, 4, 1080},
+        L"source edge overrides minimum without stretching a very narrow selection");
+    runner.Equal(
+        ZoomVideoCrop(video, {100, 100, 500, 2}, 100.0, 0.0, 0.0, {500, 2}),
+        VideoCrop{0, 100, 1920, 8},
+        L"source edge overrides minimum without stretching a very short selection");
+
+    runner.Equal(
+        ZoomVideoCrop(video, {100, 100, 64, 32}, 0.001, 0.5, 0.5),
+        VideoCrop{116, 108, 32, 16},
+        L"zoom in uses one minimum-clamped scale and preserves aspect ratio");
+    const VideoCrop oneTinySide{20, 30, 7, 90};
+    runner.Equal(
+        ZoomVideoCrop(video, oneTinySide, 0.5, 0.5, 0.5),
+        oneTinySide,
+        L"one already tiny side prevents zoom-in from distorting or enlarging crop");
+    const VideoCrop tiny{11, 13, 7, 9};
+    runner.Equal(
+        ZoomVideoCrop(video, tiny, 0.5, 0.5, 0.5),
+        tiny,
+        L"zoom in never enlarges an already tiny crop to the minimum");
+    const VideoCrop tinyZoomOut = ZoomVideoCrop(video, tiny, 1.1, 0.5, 0.5);
+    runner.True(
+        tinyZoomOut.width >= 16U && tinyZoomOut.height >= 16U &&
+            tinyZoomOut.x + tinyZoomOut.width <= video.width &&
+            tinyZoomOut.y + tinyZoomOut.height <= video.height,
+        L"zoom out grows a tiny crop to bounded minimum dimensions");
+
+    const VideoCrop oddAligned = ZoomVideoCrop(
+        video, {101, 99, 801, 401}, 0.75, 0.5, 0.5);
+    runner.Equal(
+        oddAligned,
+        VideoCrop{202, 150, 600, 300},
+        L"zoom aligns ordinary odd crop coordinates and extents to even pixels");
+    const VideoCrop oddFull = ZoomVideoCrop(
+        {1919, 1079}, {100, 100, 800, 400},
+        (std::numeric_limits<double>::max)(), 0.5, 0.5);
+    runner.Equal(
+        oddFull,
+        VideoCrop{0, 0, 1919, 960},
+        L"huge finite zoom reaches the same-aspect limit inside odd source dimensions");
+    runner.True(oddFull.IsValid(), L"odd source-boundary crop remains valid");
+
+    const double nan = (std::numeric_limits<double>::quiet_NaN)();
+    const double infinity = (std::numeric_limits<double>::infinity)();
+    runner.Equal(
+        PanVideoCrop(video, crop, nan, 1.0), crop,
+        L"NaN pan leaves crop unchanged");
+    runner.Equal(
+        PanVideoCrop(video, crop, infinity, 1.0), crop,
+        L"infinite pan leaves crop unchanged");
+    runner.Equal(
+        PanVideoCrop({0, 1080}, crop, 10.0, 10.0), crop,
+        L"pan with invalid video dimensions leaves crop unchanged");
+    const VideoCrop outside{1900, 100, 100, 100};
+    runner.Equal(
+        PanVideoCrop(video, outside, -10.0, 10.0), outside,
+        L"pan with out-of-source crop leaves it unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, 0.0, 0.5, 0.5), crop,
+        L"zero zoom scale leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, -1.0, 0.5, 0.5), crop,
+        L"negative zoom scale leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, infinity, 0.5, 0.5), crop,
+        L"infinite zoom scale leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, nan, 0.5, 0.5), crop,
+        L"NaN zoom scale leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, 0.5, -0.01, 0.5), crop,
+        L"negative normalized anchor leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, 0.5, 0.5, 1.01), crop,
+        L"normalized anchor above one leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, crop, 0.5, nan, 0.5), crop,
+        L"NaN normalized anchor leaves crop unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, {100, 100, 0, 100}, 0.5, 0.5, 0.5),
+        VideoCrop{100, 100, 0, 100},
+        L"zoom with invalid crop leaves it unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, outside, 0.5, 0.5, 0.5), outside,
+        L"zoom with out-of-source crop leaves it unchanged");
+    runner.Equal(
+        ZoomVideoCrop(video, {101, 99, 801, 401}, 1.0, 0.5, 0.5),
+        VideoCrop{101, 99, 801, 401},
+        L"unit zoom preserves odd crop exactly");
+}
+
 void TestPreviewMath(TestRunner& runner)
 {
     using namespace videoplayer;
 
     runner.Equal(QuantizePreviewTimestamp(-10, 10'000), std::int64_t{0}, L"preview time clamps low");
     runner.Equal(QuantizePreviewTimestamp(20'000, 10'000), std::int64_t{10'000}, L"preview time clamps high");
-    runner.Equal(QuantizePreviewTimestamp(374, 10'000), std::int64_t{0}, L"preview quantum below midpoint");
-    runner.Equal(QuantizePreviewTimestamp(375, 10'000), std::int64_t{750}, L"preview quantum midpoint rounds up");
-    runner.Equal(QuantizePreviewTimestamp(1'124, 10'000), std::int64_t{750}, L"preview quantum upper lower-half edge");
-    runner.Equal(QuantizePreviewTimestamp(1'125, 10'000), std::int64_t{1'500}, L"preview quantum upper midpoint");
+    runner.Equal(QuantizePreviewTimestamp(374, 10'000, 750), std::int64_t{0}, L"preview custom quantum below midpoint");
+    runner.Equal(QuantizePreviewTimestamp(375, 10'000, 750), std::int64_t{750}, L"preview custom quantum midpoint rounds up");
+    runner.Equal(QuantizePreviewTimestamp(1'124, 10'000, 750), std::int64_t{750}, L"preview custom quantum upper lower-half edge");
+    runner.Equal(QuantizePreviewTimestamp(1'125, 10'000, 750), std::int64_t{1'500}, L"preview custom quantum upper midpoint");
     runner.Equal(QuantizePreviewTimestamp(1'000, 1'000), std::int64_t{1'000}, L"duration endpoint is preserved");
     runner.Equal(QuantizePreviewTimestamp(500, 10'000, 1'000), std::int64_t{1'000}, L"custom quantum midpoint");
     runner.Equal(QuantizePreviewTimestamp(500, 0), std::int64_t{0}, L"invalid duration rejects quantization");
     runner.Equal(QuantizePreviewTimestamp(500, 1'000, 0), std::int64_t{0}, L"invalid quantum rejects quantization");
+    runner.Equal(PreviewTimestampQuantum(60'000), std::int64_t{5'000}, L"short video uses five-second previews");
+    runner.Equal(PreviewTimestampQuantum(600'000), std::int64_t{5'000}, L"ten-minute video keeps five-second previews");
+    runner.Equal(PreviewTimestampQuantum(600'001), std::int64_t{6'000}, L"adaptive quantum rounds up to whole seconds");
+    runner.Equal(PreviewTimestampQuantum(2'400'000), std::int64_t{20'000}, L"forty-minute video uses twenty-second previews");
+    runner.Equal(PreviewTimestampQuantum(7'200'000), std::int64_t{30'000}, L"long video quantum is capped at thirty seconds");
+    runner.Equal(PreviewTimestampQuantum((std::numeric_limits<std::int64_t>::max)()),
+        std::int64_t{30'000}, L"huge duration quantum does not overflow");
+    runner.Equal(QuantizePreviewTimestamp(2'499, 60'000), std::int64_t{0}, L"coarse preview below midpoint");
+    runner.Equal(QuantizePreviewTimestamp(2'500, 60'000), std::int64_t{5'000}, L"coarse preview midpoint");
+    runner.Equal(QuantizePreviewTimestamp(19'900, 2'400'000), std::int64_t{20'000}, L"long-video bucket used by default");
+    runner.Equal(QuantizePreviewTimestamp(61'234, 61'234), std::int64_t{61'234}, L"non-grid media end stays exact");
+    int coarseBuckets = 0;
+    int fineBuckets = 0;
+    std::int64_t lastCoarse = -1;
+    std::int64_t lastFine = -1;
+    for (std::int64_t time = 0; time <= 2'400'000; time += 100) {
+        const auto coarse = QuantizePreviewTimestamp(time, 2'400'000);
+        const auto fine = QuantizePreviewTimestamp(time, 2'400'000, 750);
+        if (coarse != lastCoarse) { ++coarseBuckets; lastCoarse = coarse; }
+        if (fine != lastFine) { ++fineBuckets; lastFine = fine; }
+    }
+    runner.Equal(coarseBuckets, 121, L"forty-minute sweep has only 121 distinct preview frames");
+    runner.True(fineBuckets > coarseBuckets * 20, L"coarse preview sweep eliminates over twenty times the old requests");
 
     const RECT channel{10, 2, 110, 12};
     runner.Equal(PreviewTimeFromChannelX(10, channel, 10'000), std::int64_t{0}, L"channel left edge maps to zero");
@@ -882,6 +1866,103 @@ void TestPreviewCache(TestRunner& runner)
     runner.Equal(disabled.Size(), std::size_t{0}, L"zero-capacity preview cache stores nothing");
 }
 
+void TestPreviewCacheNearest(TestRunner& runner)
+{
+    using namespace videoplayer;
+    constexpr std::int64_t minimum = (std::numeric_limits<std::int64_t>::min)();
+    constexpr std::int64_t maximum = (std::numeric_limits<std::int64_t>::max)();
+    PreviewCache cache(3);
+    cache.ClearForMedia(4);
+    runner.True(!cache.FindNearest(4, 2'000, maximum), L"nearest preview misses empty cache");
+    const PreviewFramePtr earlier = MakePreviewFrame(4, 1'000, 1);
+    const PreviewFramePtr middle = MakePreviewFrame(4, 3'000, 2);
+    const PreviewFramePtr later = MakePreviewFrame(4, 5'000, 3);
+    cache.Put(earlier);
+    cache.Put(middle);
+    cache.Put(later);
+    runner.True(!cache.FindNearest(5, 1'000, maximum), L"nearest preview rejects another generation");
+    runner.True(!cache.FindNearest(4, 2'000, 999), L"nearest preview respects distance limit");
+    runner.True(cache.FindNearest(4, 2'000, 1'000) == earlier,
+        L"nearest preview includes distance boundary and prefers earlier tie");
+    runner.True(cache.FindNearest(4, 3'000, 0) == middle,
+        L"nearest preview allows exact hit at zero distance");
+    runner.True(!cache.FindNearest(4, 3'001, 0), L"nearest preview zero distance rejects nearby frame");
+    runner.True(!cache.FindNearest(4, 3'000, -1), L"nearest preview rejects negative distance bound");
+    runner.True(!cache.FindNearest(4, 3'000, minimum), L"nearest preview rejects minimum int64 bound");
+    const PreviewFramePtr approximate = cache.FindNearest(4, 2'999, 2);
+    runner.True(approximate == middle, L"nearest preview selects closest frame rather than LRU order");
+    runner.True(approximate && approximate->timestampMs == 3'000,
+        L"nearest preview preserves real frame timestamp");
+    runner.True(cache.FindNearest(4, 2'000, 1'000) == earlier,
+        L"nearest preview earlier tie wins after later frame was promoted");
+
+    // Reset the access order so promotion and misses have independently
+    // observable eviction behavior.
+    cache.ClearForMedia(4);
+    cache.Put(earlier);
+    cache.Put(middle);
+    cache.Put(later);
+    runner.True(cache.FindNearest(4, 1'200, 200) == earlier,
+        L"nearest preview accesses oldest frame");
+    cache.Put(MakePreviewFrame(4, 7'000, 4));
+    runner.True(!cache.Find(4, 3'000), L"nearest preview hit promotes frame before eviction");
+    runner.True(cache.Find(4, 1'000) == earlier, L"nearest preview promoted frame survives eviction");
+    PreviewCache misses(2);
+    misses.ClearForMedia(4);
+    misses.Put(earlier);
+    misses.Put(middle);
+    runner.True(!misses.FindNearest(4, 1'100, 50), L"nearest preview bounded miss finds no fallback");
+    misses.Put(later);
+    runner.True(!misses.Find(4, 1'000), L"nearest preview miss does not promote out-of-bound candidate");
+    cache.ClearForMedia(5);
+    runner.True(!cache.FindNearest(4, 1'000, maximum) &&
+        !cache.FindNearest(5, 1'000, maximum), L"nearest preview cannot leak frames after media reset");
+    PreviewCache disabled(0);
+    disabled.ClearForMedia(4);
+    disabled.Put(earlier);
+    runner.True(!disabled.FindNearest(4, 1'000, maximum), L"nearest preview respects zero capacity");
+    cache.Put(MakePreviewFrame(5, 1'000, 5, 0, 2));
+    runner.True(!cache.FindNearest(5, 1'000, maximum), L"nearest preview never returns invalid pixels");
+
+    // IsValid validates pixel storage, not timestamp sign. Exercise the full
+    // timestamp domain to catch overflow, including distances above INT64_MAX.
+    PreviewCache extremes(2);
+    extremes.ClearForMedia(4);
+    const PreviewFramePtr first = MakePreviewFrame(4, minimum, 1);
+    const PreviewFramePtr last = MakePreviewFrame(4, maximum, 2);
+    runner.True(first->IsValid() && last->IsValid(), L"extreme timestamp frames are valid cache inputs");
+    extremes.Put(first);
+    extremes.Put(last);
+    runner.True(extremes.FindNearest(4, minimum, maximum) == first,
+        L"nearest preview handles minimum timestamp exact hit");
+    runner.True(extremes.FindNearest(4, maximum, maximum) == last,
+        L"nearest preview handles maximum timestamp exact hit");
+    runner.True(extremes.FindNearest(4, 0, maximum) == last,
+        L"nearest preview handles positive inclusive int64 distance limit");
+    runner.True(extremes.FindNearest(4, -1, maximum) == first,
+        L"nearest preview handles negative inclusive int64 distance limit");
+    runner.True(!extremes.FindNearest(4, 0, maximum - 1),
+        L"nearest preview rejects extreme frames beyond large bound");
+    extremes.ClearForMedia(4);
+    extremes.Put(first);
+    runner.True(!extremes.FindNearest(4, maximum, maximum),
+        L"nearest preview does not wrap minimum-to-maximum distance");
+    runner.True(extremes.FindNearest(4, minimum + 1, 1) == first,
+        L"nearest preview safely subtracts nearby minimum timestamps");
+    extremes.ClearForMedia(4);
+    extremes.Put(last);
+    runner.True(!extremes.FindNearest(4, minimum, maximum),
+        L"nearest preview does not wrap maximum-to-minimum distance");
+    runner.True(extremes.FindNearest(4, maximum - 1, 1) == last,
+        L"nearest preview safely subtracts nearby maximum timestamps");
+    extremes.ClearForMedia(4);
+    const PreviewFramePtr negative = MakePreviewFrame(4, -1, 1);
+    extremes.Put(negative);
+    extremes.Put(MakePreviewFrame(4, 1, 2));
+    runner.True(extremes.FindNearest(4, 0, 1) == negative,
+        L"nearest preview equal distance across zero still selects earlier frame");
+}
+
 videoplayer::ToolbarVisibilityInput FullscreenPlayingToolbarInput()
 {
     videoplayer::ToolbarVisibilityInput input{};
@@ -903,13 +1984,128 @@ void TestToolbarVisibility(TestRunner& runner)
     runner.Equal(ToolbarActivationHeight(96), 100, L"toolbar activation zone at 96 DPI");
     runner.Equal(ToolbarActivationHeight(144), 150, L"toolbar activation zone at 144 DPI");
     runner.Equal(ToolbarActivationHeight(0), 100, L"toolbar activation zone invalid DPI fallback");
+    runner.Equal(ToolbarRestoreActivationHeight(96), 48, L"restore activation zone at 96 DPI");
+    runner.Equal(ToolbarRestoreActivationHeight(144), 72, L"restore activation zone at 144 DPI");
+    runner.Equal(ToolbarRestoreActivationHeight(0), 48, L"restore activation zone invalid DPI fallback");
 
     ToolbarVisibilityInput input = FullscreenPlayingToolbarInput();
     input.fullscreen = false;
     input.currentlyVisible = false;
+    input.restoreCurrentlyVisible = true;
     ToolbarVisibilityDecision decision = EvaluateToolbarVisibility(input);
     runner.True(decision.shouldBeVisible, L"windowed toolbar is always visible");
     runner.Equal(decision.action, ToolbarVisibilityAction::Show, L"windowed hidden toolbar receives show action");
+    runner.True(!decision.shouldRestoreBeVisible, L"ordinary windowed mode has no restore affordance");
+    runner.Equal(decision.restoreAction, ToolbarVisibilityAction::Hide,
+        L"leaving manual mode hides a stale restore affordance");
+
+    input = FullscreenPlayingToolbarInput();
+    input.wasFullscreen = false;
+    input.fullscreen = false;
+    input.manuallyHidden = true;
+    input.playing = false;
+    input.currentlyVisible = true;
+    input.cursorInsideClient = true;
+    input.cursorMoved = false;
+    input.cursorY = 952;
+    input.pointerOverToolbar = true;
+    input.seekDragging = true;
+    input.volumeDragging = true;
+    input.previewVisible = true;
+    input.controlHasFocus = true;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.shouldBeVisible,
+        L"manual windowed mode keeps the full toolbar hidden despite every blocker");
+    runner.Equal(decision.action, ToolbarVisibilityAction::Hide,
+        L"manual windowed mode hides an actually visible toolbar");
+    runner.True(decision.interactionBlocksHide,
+        L"manual mode reports ordinary blockers without letting them win");
+    runner.True(decision.inRestoreActivationZone,
+        L"restore activation top edge is inclusive");
+    runner.True(decision.shouldRestoreBeVisible,
+        L"stationary cursor in restore zone shows the restore affordance");
+    runner.Equal(decision.restoreAction, ToolbarVisibilityAction::Show,
+        L"restore-zone hover emits restore show action");
+
+    input.currentlyVisible = false;
+    input.restoreCurrentlyVisible = true;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(decision.shouldRestoreBeVisible,
+        L"stationary cursor in restore zone keeps the restore affordance visible");
+    runner.Equal(decision.restoreAction, ToolbarVisibilityAction::None,
+        L"visible restore affordance needs no repeated show action");
+
+    input.pointerOverToolbar = false;
+    input.seekDragging = false;
+    input.volumeDragging = false;
+    input.previewVisible = false;
+    input.controlHasFocus = false;
+    input.cursorY = 951;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.inRestoreActivationZone,
+        L"pixel above restore activation zone is outside");
+    runner.True(!decision.shouldRestoreBeVisible,
+        L"leaving restore zone hides the affordance");
+    runner.Equal(decision.restoreAction, ToolbarVisibilityAction::Hide,
+        L"leaving restore zone emits hide action");
+
+    input.cursorY = 1'000;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.inRestoreActivationZone,
+        L"client bottom edge is outside restore half-open zone");
+
+    input = FullscreenPlayingToolbarInput();
+    input.manuallyHidden = true;
+    input.currentlyVisible = false;
+    input.cursorInsideClient = true;
+    input.cursorY = 928;
+    input.dpi = 144;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(decision.inRestoreActivationZone,
+        L"DPI-scaled restore activation top edge is inclusive");
+    runner.True(decision.shouldRestoreBeVisible,
+        L"DPI-scaled restore zone shows the affordance");
+    input.cursorY = 927;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.inRestoreActivationZone,
+        L"pixel above DPI-scaled restore zone is outside");
+
+    input = FullscreenPlayingToolbarInput();
+    input.manuallyHidden = true;
+    input.currentlyVisible = false;
+    input.cursorInsideClient = false;
+    input.pointerOverRestore = true;
+    input.restoreCurrentlyVisible = true;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(decision.shouldRestoreBeVisible,
+        L"pointer over restore popup keeps it visible outside the video zone");
+    runner.Equal(decision.restoreAction, ToolbarVisibilityAction::None,
+        L"pointer over restore popup needs no repeated show action");
+
+    input.ownedPopupsAllowed = false;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.shouldRestoreBeVisible,
+        L"lifecycle popup gate suppresses restore affordance");
+    runner.Equal(decision.restoreAction, ToolbarVisibilityAction::Hide,
+        L"lifecycle popup gate hides a visible restore affordance");
+
+    input.ownedPopupsAllowed = true;
+    input.zoomSelecting = true;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.shouldRestoreBeVisible,
+        L"zoom selection suppresses restore affordance");
+    runner.True(!decision.shouldBeVisible,
+        L"zoom selection cannot override explicit manual toolbar hiding");
+
+    input = FullscreenPlayingToolbarInput();
+    input.wasFullscreen = false;
+    input.manuallyHidden = true;
+    input.currentlyVisible = true;
+    decision = EvaluateToolbarVisibility(input);
+    runner.True(!decision.shouldBeVisible,
+        L"fullscreen transition preserves explicit manual toolbar hiding");
+    runner.Equal(decision.action, ToolbarVisibilityAction::Hide,
+        L"manual hiding wins on first fullscreen decision");
 
     input = FullscreenPlayingToolbarInput();
     input.wasFullscreen = false;
@@ -1127,6 +2323,7 @@ int wmain(const int argc, wchar_t* const* const argv)
     TestRunner runner;
     TestTimeFormatting(runner);
     TestPlaybackMath(runner);
+    TestPlaybackLoop(runner);
     TestProgressStrip(runner);
     TestUtf8(runner);
     TestMediaOpen(runner);
@@ -1135,9 +2332,13 @@ int wmain(const int argc, wchar_t* const* const argv)
     TestFileExistence(runner);
     TestVideoGeometryBasics(runner);
     TestVideoContentFit(runner);
+    TestVideoDisplayGeometry(runner);
+    TestVideoAreaResize(runner);
     TestVideoCropMapping(runner);
+    TestVideoCropPanAndZoom(runner);
     TestPreviewMath(runner);
     TestPreviewCache(runner);
+    TestPreviewCacheNearest(runner);
     TestToolbarVisibility(runner);
     TestZoomEscapeHierarchy(runner);
     TestPrivacyPolicy(runner);

@@ -26,16 +26,20 @@ public:
     void ShowPlaceholderAt(
         POINT anchorScreen,
         int dpi,
-        std::int64_t timestampMs) noexcept;
+        std::int64_t timestampMs,
+        bool pending = true) noexcept;
     void ShowFrameAt(
         POINT anchorScreen,
         int dpi,
         std::int64_t timestampMs,
-        PreviewFramePtr frame) noexcept;
+        PreviewFramePtr frame,
+        bool updating = false) noexcept;
     void Hide() noexcept;
     void Destroy() noexcept;
 
     bool IsVisible() const noexcept;
+    bool IsUpdating() const noexcept { return updating_; }
+    bool IsWaitingForFrame() const noexcept { return !frame_ && placeholderPending_; }
     HWND Window() const noexcept;
 
 private:
@@ -54,6 +58,8 @@ private:
     HWND owner_ = nullptr;
     HWND window_ = nullptr;
     PreviewFramePtr frame_;
+    bool updating_ = false;
+    bool placeholderPending_ = false;
     std::int64_t timestampMs_ = 0;
     int dpi_ = USER_DEFAULT_SCREEN_DPI;
 };

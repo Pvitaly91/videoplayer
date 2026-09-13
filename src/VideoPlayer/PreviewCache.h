@@ -19,6 +19,13 @@ public:
     PreviewFramePtr Find(
         std::uint32_t mediaGeneration,
         std::int64_t quantizedTimestampMs) noexcept;
+    // Returns the nearest valid frame within the inclusive distance bound,
+    // preserving its actual timestamp. Ties prefer the earlier frame; hits
+    // promote the frame to MRU. Negative distance bounds always miss.
+    PreviewFramePtr FindNearest(
+        std::uint32_t mediaGeneration,
+        std::int64_t timestampMs,
+        std::int64_t maximumDistanceMs) noexcept;
     void Put(PreviewFramePtr frame) noexcept;
     void ClearForMedia(std::uint32_t mediaGeneration) noexcept;
     void Clear() noexcept;

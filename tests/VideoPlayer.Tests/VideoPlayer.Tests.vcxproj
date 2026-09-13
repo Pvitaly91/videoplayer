@@ -79,6 +79,7 @@
     <ClCompile Include="..\..\src\VideoPlayer\ToolbarVisibility.cpp"><Link>Shared\ToolbarVisibility.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\Utf8.cpp"><Link>Shared\Utf8.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\VideoGeometry.cpp"><Link>Shared\VideoGeometry.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\VideoDisplayGeometry.cpp"><Link>Shared\VideoDisplayGeometry.cpp</Link></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\VideoPlayer\App.h"><Link>Shared\App.h</Link></ClInclude>
@@ -94,6 +95,7 @@
     <ClInclude Include="..\..\src\VideoPlayer\ToolbarVisibility.h"><Link>Shared\ToolbarVisibility.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\Utf8.h"><Link>Shared\Utf8.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\VideoGeometry.h"><Link>Shared\VideoGeometry.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\VideoDisplayGeometry.h"><Link>Shared\VideoDisplayGeometry.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ZoomState.h"><Link>Shared\ZoomState.h</Link></ClInclude>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
@@ -114,6 +116,7 @@
     <ClInclude Include="PreviewLifecycleTests.h" />
     <ClInclude Include="PlaybackSnapshotTests.h" />
     <ClInclude Include="..\..\src\VideoPlayer\PlaybackSnapshot.h" />
+    <ClInclude Include="..\..\src\VideoPlayer\PlaybackLoop.h" />
     <ClInclude Include="..\..\src\VideoPlayer\PlayerEngineTestAccess.h" />
   </ItemGroup>
   <ImportGroup Label="ExtensionTargets" />

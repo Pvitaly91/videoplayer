@@ -96,10 +96,22 @@ public:
         std::uint32_t mediaGeneration) noexcept;
 
     // Returns the monotonically increasing request ID the UI must retain.
-    // A new request replaces any older request that has not started decoding.
+    // A new time bucket replaces older work; the same pending/decoding bucket
+    // returns its existing ID without cancelling or postponing its decoder.
     std::uint64_t RequestFrame(
         std::int64_t timestampMs,
         std::int64_t durationMs) noexcept;
+
+    // Opt-in, RAM-only warming of at most the two adjacent missing buckets
+    // after a foreground decode. Disabling cancels only speculative work.
+    // Cache hits do not start more warming; foreground requests always win.
+    void SetPrefetchEnabled(bool enabled) noexcept;
+
+    // Returns only current-media RAM data, retaining its real timestamp. This
+    // never starts a decoder or alters the foreground request/result state.
+    PreviewFramePtr FindNearestCachedFrame(
+        std::int64_t timestampMs,
+        std::int64_t maximumDistanceMs) noexcept;
 
     void CancelRequests() noexcept;
 

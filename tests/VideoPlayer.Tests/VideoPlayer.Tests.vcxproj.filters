@@ -16,6 +16,7 @@
     <ClCompile Include="..\..\src\VideoPlayer\ToolbarVisibility.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\Utf8.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\VideoGeometry.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\VideoDisplayGeometry.cpp"><Filter>Shared</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\VideoPlayer\App.h"><Filter>Shared</Filter></ClInclude>
@@ -31,6 +32,7 @@
     <ClInclude Include="..\..\src\VideoPlayer\ToolbarVisibility.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\Utf8.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\VideoGeometry.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\VideoDisplayGeometry.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ZoomState.h"><Filter>Shared</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>

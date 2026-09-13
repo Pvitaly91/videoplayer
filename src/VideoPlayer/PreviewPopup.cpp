@@ -89,8 +89,11 @@ bool PreviewPopup::Create(
 void PreviewPopup::ShowPlaceholderAt(
     const POINT anchorScreen,
     const int dpi,
-    const std::int64_t timestampMs) noexcept {
+    const std::int64_t timestampMs,
+    const bool pending) noexcept {
     frame_.reset();
+    updating_ = false;
+    placeholderPending_ = pending;
     timestampMs_ = (std::max)(std::int64_t{0}, timestampMs);
     PositionAndShow(anchorScreen, dpi);
 }
@@ -99,17 +102,22 @@ void PreviewPopup::ShowFrameAt(
     const POINT anchorScreen,
     const int dpi,
     const std::int64_t timestampMs,
-    PreviewFramePtr frame) noexcept {
+    PreviewFramePtr frame,
+    const bool updating) noexcept {
     frame_ = frame && frame->IsValid() &&
             frame->width <= kPreviewMaximumWidth &&
             frame->height <= kPreviewMaximumHeight
         ? std::move(frame)
         : PreviewFramePtr{};
+    updating_ = updating && frame_ != nullptr;
+    placeholderPending_ = false;
     timestampMs_ = (std::max)(std::int64_t{0}, timestampMs);
     PositionAndShow(anchorScreen, dpi);
 }
 
 void PreviewPopup::Hide() noexcept {
+    updating_ = false;
+    placeholderPending_ = false;
     if (window_ != nullptr && ::IsWindowVisible(window_)) {
         ::ShowWindow(window_, SW_HIDE);
     }
@@ -117,6 +125,8 @@ void PreviewPopup::Hide() noexcept {
 }
 
 void PreviewPopup::Destroy() noexcept {
+    updating_ = false;
+    placeholderPending_ = false;
     frame_.reset();
     if (window_ != nullptr) {
         const HWND window = window_;
@@ -321,6 +331,22 @@ void PreviewPopup::Paint() noexcept {
             &bitmap,
             DIB_RGB_COLORS,
             SRCCOPY);
+        if (updating_) {
+            // Keep the old image visible but do not pretend it is the new
+            // target. Its real timestamp remains in the caption below.
+            RECT badge{imageArea.right - ScalePreviewPixels(100, dpi_),
+                imageArea.top + ScalePreviewPixels(4, dpi_),
+                imageArea.right - ScalePreviewPixels(4, dpi_),
+                imageArea.top + ScalePreviewPixels(24, dpi_)};
+            FillSolidRect(dc, badge, kPopupBackground);
+            ::SetBkMode(dc, TRANSPARENT);
+            ::SetTextColor(dc, kPlaceholderColor);
+            const HFONT badgeFont = static_cast<HFONT>(::GetStockObject(DEFAULT_GUI_FONT));
+            const HGDIOBJ oldBadgeFont = badgeFont ? ::SelectObject(dc, badgeFont) : nullptr;
+            ::DrawTextW(dc, L"Оновлюється…", -1, &badge,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if (oldBadgeFont) ::SelectObject(dc, oldBadgeFont);
+        }
     } else {
         ::SetBkMode(dc, TRANSPARENT);
         ::SetTextColor(dc, kPlaceholderColor);
@@ -329,7 +355,7 @@ void PreviewPopup::Paint() noexcept {
         RECT placeholder = imageArea;
         ::DrawTextW(
             dc,
-            L"Очікування кадру…",
+            placeholderPending_ ? L"Очікування кадру…" : L"Кадр недоступний",
             -1,
             &placeholder,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -347,7 +373,13 @@ void PreviewPopup::Paint() noexcept {
     ::SetTextColor(dc, kTextColor);
     const HFONT font = static_cast<HFONT>(::GetStockObject(DEFAULT_GUI_FONT));
     const HGDIOBJ oldFont = font != nullptr ? ::SelectObject(dc, font) : nullptr;
-    const std::wstring timestamp = FormatTime(timestampMs_);
+    std::wstring timestamp = FormatTime(timestampMs_);
+    if (frame_ && frame_->IsValid()) {
+        const std::wstring frameTime = FormatTime(frame_->timestampMs);
+        if (frameTime != timestamp) {
+            timestamp += L"  (кадр ~" + frameTime + L")";
+        }
+    }
     ::DrawTextW(
         dc,
         timestamp.c_str(),

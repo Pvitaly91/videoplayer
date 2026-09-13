@@ -29,6 +29,7 @@ namespace {
 constexpr std::size_t kPreviewBufferCount = 3;
 constexpr std::size_t kPreviewBufferAlignment = 32;
 constexpr auto kDecodeThrottle = std::chrono::milliseconds(120);
+constexpr auto kHoverSettleDelay = std::chrono::milliseconds(100);
 constexpr auto kFrameWaitTimeout = std::chrono::milliseconds(3000);
 constexpr auto kCancellationPollInterval = std::chrono::milliseconds(40);
 constexpr auto kRetryBackoff = std::chrono::milliseconds(80);
@@ -1013,6 +1014,76 @@ public:
         Notify();
     }
 
+    void WarmAdjacentFrames(const DecodeRequest& foreground,
+        std::unique_ptr<PreviewBackend>& backend) noexcept {
+        // Deliberately not another queue or worker. Each successful foreground
+        // miss gets at most two one-shot attempts; successful cache hits and
+        // speculative results never recursively schedule more work.
+        try {
+            DecodeRequest request;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!prefetchEnabled || !backend || !IsCurrentLocked(foreground) ||
+                    requestState != PreviewRequestState::Ready) {
+                    return;
+                }
+                request = foreground;
+                request.cancelEpoch = prefetchEpoch.load(std::memory_order_acquire);
+            }
+            const PreviewCancellation cancellation{
+                stopping, prefetchEpoch, activeMediaGeneration, latestRequestId};
+            const auto quantum = PreviewTimestampQuantum(foreground.durationMs);
+            const auto next = foreground.durationMs - foreground.timestampMs < quantum
+                ? foreground.durationMs : foreground.timestampMs + quantum;
+            const auto previous = foreground.timestampMs == foreground.durationMs
+                ? ((foreground.timestampMs - 1) / quantum) * quantum
+                : (std::max)(std::int64_t{0}, foreground.timestampMs - quantum);
+            for (const auto timestamp : {next, previous}) {
+                request.timestampMs = timestamp;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!prefetchEnabled || !IsCurrentLocked(foreground) ||
+                        cancellation.IsCancelled(request)) {
+                        return;
+                    }
+                    if (timestamp == foreground.timestampMs ||
+                        cache.Find(request.mediaGeneration, timestamp)) {
+                        continue;
+                    }
+                }
+                PreviewFramePtr frame;
+                const auto status = backend->Decode(request, cancellation, frame);
+                if (status == DecodeStatus::RuntimeFailure) {
+                    // Recreate this backend on the next foreground miss, but
+                    // do not turn a displayed, valid result into a UI failure.
+                    backend.reset();
+                    return;
+                }
+                if (status != DecodeStatus::Ready || !frame || !frame->IsValid() ||
+                    frame->mediaGeneration != request.mediaGeneration ||
+                    frame->timestampMs != request.timestampMs ||
+                    cancellation.IsCancelled(request)) {
+                    backend->ReleaseMedia();
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!prefetchEnabled || !IsCurrentLocked(foreground) ||
+                        cancellation.IsCancelled(request)) {
+                        return;
+                    }
+                    // No Publish/Notify/CompleteFailure: a speculative frame
+                    // can only populate this generation's bounded RAM cache.
+                    cache.Put(std::move(frame));
+                }
+            }
+        } catch (...) {
+            // Speculation must not escape into the fatal foreground boundary.
+            // Cleanup remains on the worker and never runs on the UI thread.
+            backend.reset();
+        }
+    }
+
     void WorkerMain() noexcept {
         ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         std::unique_ptr<PreviewBackend> backend;
@@ -1033,10 +1104,18 @@ public:
                         mediaResetRequested = false;
                         releaseOnly = true;
                     } else {
-                        condition.wait_until(lock, nextDecodeAllowed, [this] {
-                            return stopping.load(std::memory_order_acquire) ||
-                                mediaResetRequested;
-                        });
+                        // Only decode a new bucket after a brief hover settle.
+                        // Replacement requests wake this loop and move its
+                        // deadline; duplicates in the same bucket do neither.
+                        while (!stopping.load(std::memory_order_acquire) &&
+                            !mediaResetRequested && pending.has_value()) {
+                            const auto deadline = (std::max)(
+                                nextDecodeAllowed, pendingNotBefore);
+                            if (std::chrono::steady_clock::now() >= deadline) {
+                                break;
+                            }
+                            condition.wait_until(lock, deadline);
+                        }
                         if (stopping.load(std::memory_order_acquire)) {
                             break;
                         }
@@ -1139,6 +1218,7 @@ public:
                     }
 #endif
                     Publish(request, std::move(frame));
+                    WarmAdjacentFrames(request, backend);
                 } else {
                     CompleteFailure(request, status);
                 }
@@ -1181,9 +1261,13 @@ public:
     HWND notificationWindow = nullptr;
     UINT resultMessage = kPreviewFrameReadyMessage;
     std::chrono::steady_clock::time_point nextDecodeAllowed{};
+    std::chrono::steady_clock::time_point pendingNotBefore{};
+    std::int64_t activeRequestTimestampMs = -1;
+    std::int64_t activeRequestDurationMs = 0;
     std::atomic<bool> stopping{false};
     std::atomic<std::uint64_t> latestRequestId{0};
     std::atomic<std::uint64_t> cancelEpoch{0};
+    std::atomic<std::uint64_t> prefetchEpoch{0};
     std::atomic<std::uint32_t> activeMediaGeneration{0};
     std::uint64_t nextRequestId = 0;
     PreviewWorkerState workerState = PreviewWorkerState::NotStarted;
@@ -1193,6 +1277,7 @@ public:
     bool workerExited = true;
     bool workerExiting = false;
     bool mediaResetRequested = false;
+    bool prefetchEnabled = false;
 #if defined(VIDEOPLAYER_TESTING)
     std::atomic<bool> failNextPublicationForTesting{false};
     unsigned int workerLaunchCountForTesting = 0;
@@ -1293,12 +1378,23 @@ std::uint64_t PreviewEngine::RequestFrame(
         bool rejected = false;
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
+            const std::int64_t quantized = QuantizePreviewTimestamp(timestampMs, durationMs);
+            if (impl_->initialized && impl_->accepting && !impl_->mediaPath.empty() &&
+                durationMs > 0 && impl_->activeRequestTimestampMs == quantized &&
+                impl_->activeRequestDurationMs == durationMs &&
+                (impl_->requestState == PreviewRequestState::Pending ||
+                 impl_->requestState == PreviewRequestState::Decoding)) {
+                // Preserve the current capture token and its decode deadline.
+                return impl_->latestRequestId.load(std::memory_order_acquire);
+            }
             request.requestId = ++impl_->nextRequestId;
             impl_->latestRequestId.store(request.requestId, std::memory_order_release);
             request.mediaGeneration = impl_->activeMediaGeneration.load(std::memory_order_acquire);
             request.cancelEpoch = impl_->cancelEpoch.load(std::memory_order_acquire);
-            request.timestampMs = QuantizePreviewTimestamp(timestampMs, durationMs);
+            request.timestampMs = quantized;
             request.durationMs = (std::max)(std::int64_t{0}, durationMs);
+            impl_->activeRequestTimestampMs = request.timestampMs;
+            impl_->activeRequestDurationMs = request.durationMs;
             request.path = impl_->mediaPath;
             impl_->pending.reset();
             impl_->readyResult.reset();
@@ -1333,6 +1429,7 @@ std::uint64_t PreviewEngine::RequestFrame(
                 return request.requestId;
             }
             impl_->pending = request;
+            impl_->pendingNotBefore = std::chrono::steady_clock::now() + kHoverSettleDelay;
             if (impl_->workerExited) {
                 // Set only after backend/callback destruction; this join
                 // cannot wait for a decoder or for its cleanup.
@@ -1379,6 +1476,38 @@ std::uint64_t PreviewEngine::RequestFrame(
             impl_->condition.notify_all();
         }
         return impl_->latestRequestId.load(std::memory_order_acquire);
+    }
+}
+
+void PreviewEngine::SetPrefetchEnabled(const bool enabled) noexcept {
+    try {
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            if (impl_->prefetchEnabled == enabled) {
+                return;
+            }
+            impl_->prefetchEnabled = enabled;
+            impl_->prefetchEpoch.fetch_add(1, std::memory_order_acq_rel);
+        }
+        impl_->condition.notify_all();
+        impl_->videoWakeRelay.Wake();
+    } catch (...) {
+    }
+}
+
+PreviewFramePtr PreviewEngine::FindNearestCachedFrame(
+    const std::int64_t timestampMs,
+    const std::int64_t maximumDistanceMs) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->initialized || !impl_->accepting || impl_->mediaPath.empty()) {
+            return nullptr;
+        }
+        return impl_->cache.FindNearest(
+            impl_->activeMediaGeneration.load(std::memory_order_acquire),
+            timestampMs, maximumDistanceMs);
+    } catch (...) {
+        return nullptr;
     }
 }
 
