@@ -1,6 +1,9 @@
 #include "targetver.h"
 #include "MainWindow.h"
 
+#include "ExportDialog.h"
+#include "ExportJob.h"
+
 #include "MediaOpen.h"
 #include "PlaybackMath.h"
 #include "PathUtils.h"
@@ -557,6 +560,10 @@ LRESULT MainWindow::HandleMessage(
                 StopPlayback();
                 FinishMouseControlInteraction();
                 return 0;
+            case IDC_EXPORT_BUTTON:
+                ShowExportVideoDialog();
+                FinishMouseControlInteraction();
+                return 0;
             case IDC_MUTE_BUTTON:
                 ToggleMute();
                 FinishMouseControlInteraction();
@@ -887,8 +894,8 @@ LRESULT MainWindow::HandleControlBarMessage(
             const HWND hitWindow = GetCursorPos(&cursor) != FALSE
                 ? WindowFromPoint(cursor)
                 : nullptr;
-            const std::array<HWND, 14> interactiveControls{
-                openButton_, playButton_, stopButton_, seekSlider_,
+            const std::array<HWND, 15> interactiveControls{
+                openButton_, playButton_, stopButton_, exportButton_, seekSlider_,
                 muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
                 hideToolbarButton_, loopVideoButton_, loopStartButton_,
                 loopEndButton_, loopSegmentButton_, loopClearButton_};
@@ -1268,6 +1275,9 @@ bool MainWindow::CreateChildWindows() {
     stopButton_ = CreateWindowExW(
         0, L"BUTTON", L"Стоп", child | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, controlBar_, ControlId(IDC_STOP_BUTTON), instance_, nullptr);
+    exportButton_ = CreateWindowExW(
+        0, L"BUTTON", L"Зберегти відео…", child | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 0, 0, controlBar_, ControlId(IDC_EXPORT_BUTTON), instance_, nullptr);
     seekSlider_ = CreateWindowExW(
         0, TRACKBAR_CLASSW, nullptr,
         child | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_ENABLESELRANGE,
@@ -1316,10 +1326,10 @@ bool MainWindow::CreateChildWindows() {
         0, 0, 0, 0, toolbarRestorePopup_,
         ControlId(IDC_RESTORE_TOOLBAR_BUTTON), instance_, nullptr);
 
-    const std::array<HWND, 24> controls{
+    const std::array<HWND, 25> controls{
         videoWindow_, videoRenderWindow_, controlBar_, fullscreenControlBar_, progressStrip_,
         toolbarRestorePopup_, toolbarRestoreButton_,
-        openButton_, playButton_, stopButton_, seekSlider_, currentTimeLabel_,
+        openButton_, playButton_, stopButton_, exportButton_, seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, loopVideoButton_, loopStartButton_, loopEndButton_,
         loopSegmentButton_, loopClearButton_, loopRangeLabel_};
@@ -1381,8 +1391,8 @@ void MainWindow::ApplySystemFont() {
         uiFont_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     }
 
-    const std::array<HWND, 18> controls{
-        openButton_, playButton_, stopButton_, seekSlider_, currentTimeLabel_,
+    const std::array<HWND, 19> controls{
+        openButton_, playButton_, stopButton_, exportButton_, seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, toolbarRestoreButton_, loopVideoButton_, loopStartButton_,
         loopEndButton_, loopSegmentButton_, loopClearButton_, loopRangeLabel_};
@@ -1447,6 +1457,8 @@ void MainWindow::LayoutChildren(const int width, const int height) {
     MoveWindow(playButton_, left, secondRowY, playWidth, rowHeight, TRUE);
     left += playWidth + gap;
     MoveWindow(stopButton_, left, secondRowY, stopWidth, rowHeight, TRUE);
+    left += stopWidth + gap;
+    MoveWindow(exportButton_, left, secondRowY, Scale(132), rowHeight, TRUE);
 
     int right = width - margin;
     right -= fullscreenWidth;
@@ -1502,12 +1514,12 @@ bool MainWindow::ReparentControlBarControls(const HWND parent) noexcept {
         return false;
     }
 
-    const std::array<HWND, 17> controls{
-        openButton_, playButton_, stopButton_, seekSlider_, currentTimeLabel_,
+    const std::array<HWND, 18> controls{
+        openButton_, playButton_, stopButton_, exportButton_, seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, loopVideoButton_, loopStartButton_, loopEndButton_,
         loopSegmentButton_, loopClearButton_, loopRangeLabel_};
-    std::array<HWND, 17> previousParents{};
+    std::array<HWND, 18> previousParents{};
     for (std::size_t index = 0; index < controls.size(); ++index) {
         if (controls[index] == nullptr || IsWindow(controls[index]) == FALSE) {
             return false;
@@ -1862,6 +1874,12 @@ bool MainWindow::HandleHotKey(
         }
         return true;
     }
+    if (controlDown && key == 'E') {
+        if (!repeated) {
+            ShowExportVideoDialog();
+        }
+        return true;
+    }
     switch (key) {
     case VK_SPACE:
         if (!repeated) {
@@ -1940,6 +1958,55 @@ void MainWindow::ShowOpenDialog() {
             window_, L"Не вдалося відкрити діалог вибору файла.",
             kApplicationTitle, MB_OK | MB_ICONERROR);
     }
+    RestoreUiAfterLifecycle();
+}
+
+void MainWindow::ShowExportVideoDialog() {
+    if (window_ == nullptr || shutdownComplete_ || !hasMedia_ ||
+        IsWindowEnabled(window_) == FALSE || HasActiveExportDialog(window_)) {
+        return;
+    }
+    CancelTransientUi();
+    playbackSnapshot_ = player_.Snapshot();
+    ExportSnapshot snapshot{};
+    snapshot.sourcePath = currentPath_;
+    snapshot.sourceIdentity = CaptureExportFileIdentity(snapshot.sourcePath);
+    snapshot.generation = player_.Generation();
+    if (!snapshot.sourceIdentity.valid) {
+        MessageBoxW(window_, L"Не вдалося зафіксувати identity файла-джерела.",
+            kApplicationTitle, MB_OK | MB_ICONERROR);
+        RestoreUiAfterLifecycle();
+        return;
+    }
+    snapshot.durationMs = playbackSnapshot_.durationMs;
+    snapshot.hasSegment = playbackLoop_.HasSegment(snapshot.durationMs);
+    snapshot.segmentStartMs = playbackLoop_.StartMs();
+    snapshot.segmentEndMs = playbackLoop_.EndMs();
+    snapshot.zoomApplied = zoomState_ == ZoomState::Applied;
+    if (!CurrentVideoViewport(snapshot.playerVideo, snapshot.viewportScreen)) {
+        MessageBoxW(window_, L"Не вдалося отримати геометрію відео для експорту.",
+            kApplicationTitle, MB_OK | MB_ICONERROR);
+        RestoreUiAfterLifecycle();
+        return;
+    }
+    snapshot.playerCrop = {0, 0, snapshot.playerVideo.width, snapshot.playerVideo.height};
+    snapshot.presentationScreen = ComputeVideoContentRect(
+        snapshot.playerVideo, snapshot.viewportScreen);
+    if (snapshot.zoomApplied) {
+        RECT render{};
+        if (!player_.GetVideoCrop(snapshot.playerCrop) ||
+            GetWindowRect(videoRenderWindow_, &render) == FALSE) {
+            MessageBoxW(window_, L"Не вдалося зафіксувати поточну область зуму.",
+                kApplicationTitle, MB_OK | MB_ICONERROR);
+            RestoreUiAfterLifecycle();
+            return;
+        }
+        const GeometryRect renderScreen{render.left, render.top, render.right, render.bottom};
+        snapshot.renderScreen = renderScreen;
+        snapshot.presentationScreen = ComputeVideoContentRect(
+            {snapshot.playerCrop.width, snapshot.playerCrop.height}, renderScreen);
+    }
+    ShowExportDialog(window_, instance_, std::move(snapshot));
     RestoreUiAfterLifecycle();
 }
 
@@ -3358,6 +3425,8 @@ void MainWindow::RenderPlaybackSnapshot() {
         state != PlaybackState::Opening && state != PlaybackState::Error &&
         (zoomState_ != ZoomState::None || player_.GetVideoSize(dimensions));
     EnableWindow(zoomButton_, canZoom);
+    EnableWindow(exportButton_, hasMedia_ && state != PlaybackState::Opening &&
+        state != PlaybackState::Error && duration > 0);
     UpdateControlBarVisibility();
 }
 

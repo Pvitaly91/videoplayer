@@ -14,6 +14,8 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $architectureFolder = if ($Platform -eq 'Win32') { 'win32' } else { 'win64' }
 $sourceRoot = Join-Path $repositoryRoot "third_party\libvlc\3.0.23\$architectureFolder"
+$ffmpegVersion = if ($Platform -eq 'Win32') { '6.0' } else { '6.1.1' }
+$ffmpegSourceRoot = Join-Path $repositoryRoot "third_party\ffmpeg\$ffmpegVersion\$architectureFolder"
 $pluginCache = Join-Path $sourceRoot 'plugins\plugins.dat'
 $copiedFiles = 0
 $unchangedFiles = 0
@@ -24,6 +26,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'libvlc.dll') -PathType 
     -not (Test-Path -LiteralPath $pluginCache -PathType Leaf) -or
     (Get-Item -LiteralPath $pluginCache -ErrorAction SilentlyContinue).Length -le 0) {
     throw "LibVLC runtime is missing for $Platform. Run scripts\fetch-libvlc.ps1 -Platform $Platform first."
+}
+foreach ($requiredTool in @('ffmpeg.exe', 'ffprobe.exe', 'LICENSE.GPLv3.txt', 'FFMPEG_BUILD.txt')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ffmpegSourceRoot $requiredTool) -PathType Leaf)) {
+        throw "FFmpeg runtime is missing for $Platform. Run scripts\fetch-ffmpeg.ps1 -Platform $Platform first."
+    }
 }
 
 $destinationRoot = [IO.Path]::GetFullPath($Destination)
@@ -101,4 +108,10 @@ foreach ($directory in Get-ChildItem -LiteralPath $sourceRoot -Directory) {
     Copy-DirectoryIncrementally -SourceDirectory $directory.FullName -DestinationDirectory (Join-Path $destinationRoot $directory.Name)
 }
 
-Write-Host "LibVLC runtime staged for $Platform at $destinationRoot ($copiedFiles copied, $unchangedFiles unchanged)."
+$exportTools = Join-Path $destinationRoot 'tools\export'
+foreach ($tool in @('ffmpeg.exe', 'ffprobe.exe', 'LICENSE.GPLv3.txt', 'FFMPEG_BUILD.txt')) {
+    Copy-FileIncrementally -SourceFile (Join-Path $ffmpegSourceRoot $tool) `
+        -DestinationFile (Join-Path $exportTools $tool)
+}
+
+Write-Host "LibVLC and FFmpeg runtimes staged for $Platform at $destinationRoot ($copiedFiles copied, $unchangedFiles unchanged)."

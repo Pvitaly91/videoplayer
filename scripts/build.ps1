@@ -46,6 +46,7 @@ if (-not (Test-Path -LiteralPath $solution -PathType Leaf)) {
 
 $msbuild = Find-MSBuild
 & (Join-Path $PSScriptRoot 'fetch-libvlc.ps1') -Platform $Platform
+& (Join-Path $PSScriptRoot 'fetch-ffmpeg.ps1') -Platform $Platform
 
 Write-Host "Building $Configuration|$Platform with $msbuild"
 & $msbuild $solution /nologo /m /t:Build "/p:Configuration=$Configuration" "/p:Platform=$Platform" /verbosity:minimal

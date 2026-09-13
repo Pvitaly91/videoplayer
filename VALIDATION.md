@@ -211,8 +211,69 @@
     кількість холодних запитів, але не гарантує готового кадру для першого
     наведення або довільного стрибка до ще не кешованої позиції.
 
+15. **Експорт відео, A–B і видимого зуму.** Реалізацію виконано від
+    заданої бази `9b2ed4cfae5729f2ff2ff952b752531199bdb3e5`.
+    Кнопка «Зберегти відео…» і `Ctrl+E` відкривають український
+    діалог. Probe стартує лише за цією дією і показує main-video,
+    audio, SAR, rational FPS, pixel format/bit depth, rotation, chapters і
+    виключені додаткові потоки. До відкриття діалогу фіксуються
+    file identity, generation, A/B, source crop, render/presentation і viewport.
+    Зміна файла після snapshot зупиняє job.
+
+    Підтримані чотири комбінації whole/A–B × full-frame/visible-zoom,
+    source canvas або native crop і оригінальне аудіо/без аудіо. Повний
+    кадр без trim/filter є stream copy/remux навіть у «точному» режимі.
+    Довільний A–B і будь-який crop перекодовуються; недоведений
+    fast A–B stream-copy відхиляється, а не називається точним. Точний
+    A–B перекодовує compressed audio в AAC/Opus для коректного timing.
+    «Параметри джерела» для crop означають масштабування видимої
+    області зі збереженням пропорцій і black padding до coded canvas
+    джерела; native crop лишає фактичний вирівняний розмір crop.
+
+    Pure geometry переносить intersection presentation/viewport на source
+    crop, тому overlay toolbar і letterbox не входять у результат; pan,
+    display scale/clipping, SAR і metadata rotation враховуються без
+    подвійного autorotate. Planner перевіряє фактичний encoder inventory і
+    вибирає software H.264/HEVC/MPEG-4/VP9/AV1 codec family. Невідомий
+    codec переходить у H.264/AAC MP4 лише після окремого підтвердження;
+    HDR/10-bit і interlaced downgrade/deinterlace не виконуються непомітно.
+
+    FFmpeg стартує у background thread через `CreateProcessW` без shell/
+    console, із приватними pipes й Job Object. Після підтвердження
+    плеєр знову інтерактивний; відтворення/preview працюють і можна
+    відкрити інший media, не змінюючи job. Закриття плеєра пропонує
+    скасувати export і чекає bounded cleanup. Результ пишеться в унікальний
+    same-directory `.part`, перевіряється ffprobe і повним decode, потім
+    атомарно фіналізується. Same path/hard link, зміна source/destination
+    під час job і непідтверджений overwrite блокуються; cancel/error
+    видаляє лише власний partial.
+
+    Portable x64 містить FFmpeg/ffprobe 6.1.1 essentials GPL static build
+    Gyan.dev, archive SHA-256 `742E32FC9F92681F9F254B925E1B613FDD8074BA40749D4879AEFDB009B94CC5`.
+    Win32 містить `n6.0-22-g549430e14d-20230529` GPL static build
+    sudo-nautilus/FFmpeg-Builds-Win32, SHA-256
+    `CABDE0DF130C32D097099F0F45773A695E2A8F44C6C88E0313757E9B8EB5320B`.
+    Обидва archive фіксовані URL/asset ID/size/hash, бінарні файли
+    не комітяться; package містить GPLv3 text і provenance.
+
 ## Автоматизовані та інтеграційні перевірки
 
+- Фінальний export/build/package цикл 13 вересня: 946/946 assertions
+  в кожній із Debug Win32, Release Win32, Debug x64 і Release x64.
+  Повторні package gates для обох Release також пройшли 946/946,
+  portable `--self-test`, PE architecture/dependency audit, exact FFmpeg bytes,
+  version/encoder inventory, source no-history для 59 production файлів,
+  folder і ZIP privacy/allowlist — зелені. Фінальні ZIP: Win32
+  142674109 bytes; x64 141923055 bytes.
+- Реальні H.264/AAC CFR/VFR fixture exports в кожній архітектурі:
+  whole-full 320×180, 4,000–4,004 с, audio; segment-full 320×180,
+  1,9019 с, no audio; whole-crop native 160×90, 3,97063–4,004 с,
+  no audio; segment-crop source canvas 320×180, 1,9019 с, audio;
+  rotated VFR crop 160×60, 2,96667 с, SAR 4:3, rotation 90°. Кожен
+  результат пройшов ffprobe plan validation і повний decode-check.
+  Окремо пройшли Unicode >MAX_PATH, доступний local UNC probe,
+  corrupt input rejection, cancellation/no-partial, same source/hard-link,
+  overwrite і destination/source race protection. Fixture не комітяться.
 - Після adjacent prefetch і збереження fallback: 892/892 assertions в усіх
   чотирьох конфігураціях Win32/x64 Debug/Release, без failed assertions.
   Додано 30 перевірок nearest cache (межі, LRU, tie-break, int64 extremes),
@@ -356,8 +417,9 @@
   seek/volume та drag через межі вікна;
 - три видимі незалежні процеси поруч;
 - кілька моніторів, від'ємні координати та різні DPI;
-- anamorphic/non-square pixel aspect ratio та metadata rotation у математиці
-  відповідності selection до source crop;
+- візуальна відповідність crop на видимому anamorphic/rotated відео
+  не перевірена вручну; pure geometry і реальний export metadata/decode gate
+  для SAR 4:3 + rotation 90° пройшли;
 - Windows 7 SP1, Windows 8.1 і Windows 10 (це лише compatibility targets).
 
 GitHub Actions на `windows-2022` перевіряється окремо після push поточного

@@ -139,13 +139,19 @@ struct MainWindowTestAccess final {
         }
     }
 
-    static std::array<HWND, 17> Controls(const MainWindow& window) {
-        return {window.openButton_, window.playButton_, window.stopButton_,
+    static std::array<HWND, 18> Controls(const MainWindow& window) {
+        return {window.openButton_, window.playButton_, window.stopButton_, window.exportButton_,
             window.seekSlider_, window.currentTimeLabel_, window.durationLabel_,
             window.muteButton_, window.volumeSlider_, window.zoomButton_,
             window.fullscreenButton_, window.hideToolbarButton_,
             window.loopVideoButton_, window.loopStartButton_, window.loopEndButton_,
             window.loopSegmentButton_, window.loopClearButton_, window.loopRangeLabel_};
+    }
+
+    static std::wstring ControlText(const HWND control) {
+        wchar_t text[128]{};
+        GetWindowTextW(control, text, static_cast<int>(std::size(text)));
+        return text;
     }
 
     static bool AllParents(const MainWindow& window, HWND parent) {
@@ -209,6 +215,10 @@ struct MainWindowTestAccess final {
             L"all controls reparent into fullscreen host");
         checks.Expect(GetAncestor(window.openButton_, GA_ROOTOWNER) == window.window_,
             L"Open control keyboard root remains its player owner");
+        checks.Expect(GetDlgCtrlID(window.exportButton_) == IDC_EXPORT_BUTTON &&
+            ControlText(window.exportButton_) == L"Зберегти відео…" &&
+            window.HandleHotKey('E', true, true),
+            L"export button and repeat-safe Ctrl+E are wired to this player owner");
         checks.Expect(!IsWindowVisible(window.fullscreenControlBar_) &&
             !IsWindowVisible(window.progressStrip_), L"hidden owner never reveals fullscreen popups");
         HIGHCONTRASTW highContrast{};

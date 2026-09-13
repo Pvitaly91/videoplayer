@@ -85,6 +85,7 @@ private:
     bool ProcessZoomMouseMessage(const MSG& message);
     bool HandleHotKey(UINT key, bool controlDown, bool repeated);
     void ShowOpenDialog();
+    void ShowExportVideoDialog();
     void HandleDroppedFiles(HDROP drop);
 
     void TogglePlayback();
@@ -177,6 +178,7 @@ private:
     HWND openButton_ = nullptr;
     HWND playButton_ = nullptr;
     HWND stopButton_ = nullptr;
+    HWND exportButton_ = nullptr;
     HWND seekSlider_ = nullptr;
     HWND currentTimeLabel_ = nullptr;
     HWND durationLabel_ = nullptr;

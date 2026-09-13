@@ -289,6 +289,56 @@ Crop зберігається в source coordinates при resize, minimize/rest
 Pause/Play і F/F11 в обидва боки. Новий файл, критична помилка, явний reset та
 закриття скидають crop. Кожен процес має незалежні crop, preview й overlay.
 
+## Експорт відео
+
+Кнопка **«Зберегти відео…»** або `Ctrl+E` відкриває український modal dialog.
+Exporter працює з даними вихідного файла через bundled `ffprobe.exe` і
+`ffmpeg.exe`; це не запис екрана і не залежність від установленого FFmpeg чи
+`PATH`. Аналіз запускається лише при відкритті exporter, тому звичайне
+відкриття/відтворення лишається на LibVLC.
+
+Можна зберегти повне відео або готовий фрагмент A–B незалежно від того, чи
+увімкнений його повтор, повний кадр або фактично видиму частину поточного
+зуму, вихідний canvas або нативний розмір crop, оригінальне аудіо або файл
+без аудіо. За замовчуванням пропонуються A–B (якщо межі валідні), застосований
+зум, вихідний canvas, аудіо та точний метод. Повний кадр без trim/filter
+копіюється без перекодування. Довільний A–B і crop є frame-accurate
+transcode; небезпечний stream-copy A–B не видається за точний і відхиляється
+без доведеної random-access межі.
+
+Перед запуском dialog показує container, main video codec/profile,
+роздільність, SAR, rational fps, pixel format/bit depth, rotation, audio,
+кількість потоків/розділів і фактичний план. Main video map задається явно;
+cover art, додаткове video, subtitles, attachments і chapters не копіюються,
+про що summary повідомляє до запуску. Crop обчислюється чистою функцією з
+source crop, presentation rect і його перетину з viewport: чорні поля й
+overlay toolbar не входять, а clipping/pan/scale, SAR і metadata rotation
+враховуються без подвійного autorotate.
+
+Перед відкриттям діалогу фіксуються path/file identity, generation, A–B,
+crop, render/presentation і viewport. Після підтвердження job плеєр знову
+доступний: відтворення й preview продовжуються, можна відкрити інший файл,
+а вже запущений export не змінює свій snapshot. Дозволений один активний
+export job на процес. Закриття плеєра під час job окремо пропонує скасувати
+експорт; cleanup завершується перед закриттям.
+
+Робота виконується у background thread. FFmpeg запускається абсолютним
+Unicode шляхом через `CreateProcessW` без console/shell, stdout і stderr
+дренуються окремо, `-progress pipe:1` оновлює progress, а Cancel спочатку
+надсилає `q` лише приватному stdin і потім завершує лише власний Job Object.
+Результат спочатку пишеться як `<ім’я>.<job-id>.part` у цільовому каталозі.
+Після ffprobe-перевірки container/duration/streams/dimensions/audio і повного
+decode-check файл атомарно перейменовується; source identity звіряється зі
+snapshot до запуску й перед фіналізацією, а destination identity, hard links,
+race та перезапис перевіряються окремо. Partial після помилки або
+скасування видаляється. Історія export paths не зберігається.
+
+Підтримані вихідні контейнери: MP4, Matroska і WebM. При transcode planner
+обирає software encoder тієї самої codec family (H.264/HEVC/MPEG-4/VP9/AV1),
+не додає штучний `-r 30` і явно переносить pixel/color parameters. Невідомий
+codec може перейти на H.264/AAC MP4 лише після окремого підтвердження;
+HDR/10-bit не знижується до SDR/8-bit непомітно.
+
 ## Збірка
 
 Потрібні Visual Studio 2022 (workload **Desktop development with C++**),
@@ -303,10 +353,13 @@ Platform Toolset v143 і Windows SDK. NuGet, vcpkg, Conan і CMake не потр
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/fetch-libvlc.ps1 -Platform Win32
 powershell -ExecutionPolicy Bypass -File scripts/fetch-libvlc.ps1 -Platform x64
+powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1 -Platform Win32
+powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1 -Platform x64
 ```
 
 Архіви та runtime зберігаються у
-`third_party/libvlc/3.0.23/{win32,win64}` та не комітяться. Після першого
+`third_party/libvlc/3.0.23/{win32,win64}` і `third_party/ffmpeg/` та не
+комітяться. Після першого
 завантаження post-build крок Visual Studio інкрементально додає runtime до
 папки результату, тому F5 не потребує ручного копіювання сотень мегабайт.
 
@@ -412,8 +465,8 @@ helper; фактично виконано **0 інтерактивних GUI-ц�
 - немає асоціації файлів;
 - preview є best-effort: точність кадру залежить від seek/index конкретного
   контейнера й кодека;
-- відповідність зуму перевірена для не оберненого відео з квадратними
-  пікселями; non-square SAR/DAR та metadata rotation окремо не перевірялися;
+- SAR/rotation export mapping перевірено deterministic geometry tests;
+  живий GUI з rotated/non-square-SAR джерелом у цьому середовищі не пройдено;
 - зум області доступний лише після того, як активна відеодоріжка віддала
   decoded video size.
 

@@ -6,6 +6,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Tests.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportDialog.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportGeometry.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportJob.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportPlanner.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportProcess.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\MediaProbe.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\MediaOpen.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PlaybackMath.cpp"><Filter>Shared</Filter></ClCompile>
@@ -20,6 +26,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\VideoPlayer\App.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportDialog.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportGeometry.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportJob.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportPlanner.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportProcess.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportTypes.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\MediaProbe.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\MediaOpen.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PathUtils.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PlaybackMath.h"><Filter>Shared</Filter></ClInclude>

@@ -39,14 +39,18 @@ Write-Host 'Fetching and verifying official LibVLC runtimes'
 & (Join-Path $PSScriptRoot 'fetch-libvlc.ps1') -Platform Win32
 & (Join-Path $PSScriptRoot 'fetch-libvlc.ps1') -Platform x64
 
-Write-Host 'Building Debug|Win32'
-& (Join-Path $PSScriptRoot 'build.ps1') -Platform Win32 -Configuration Debug -SkipTests
-Write-Host 'Building Release|Win32 and running Win32 native tests'
+Write-Host 'Fetching and verifying pinned FFmpeg/ffprobe runtimes'
+& (Join-Path $PSScriptRoot 'fetch-ffmpeg.ps1') -Platform Win32
+& (Join-Path $PSScriptRoot 'fetch-ffmpeg.ps1') -Platform x64
+
+Write-Host 'Building Debug|Win32 and running Win32 native/real-export tests'
+& (Join-Path $PSScriptRoot 'build.ps1') -Platform Win32 -Configuration Debug
+Write-Host 'Building Release|Win32 and running Win32 native/real-export tests'
 & (Join-Path $PSScriptRoot 'build.ps1') -Platform Win32 -Configuration Release
 
-Write-Host 'Building Debug|x64'
-& (Join-Path $PSScriptRoot 'build.ps1') -Platform x64 -Configuration Debug -SkipTests
-Write-Host 'Building Release|x64 and running x64 native tests'
+Write-Host 'Building Debug|x64 and running x64 native/real-export tests'
+& (Join-Path $PSScriptRoot 'build.ps1') -Platform x64 -Configuration Debug
+Write-Host 'Building Release|x64 and running x64 native/real-export tests'
 & (Join-Path $PSScriptRoot 'build.ps1') -Platform x64 -Configuration Release
 
 Write-Host 'Creating Win32 and x64 portable folders'

@@ -22,6 +22,7 @@ Win32/
 
 # Downloaded LibVLC SDK/runtime and archives
 third_party/libvlc/
+third_party/ffmpeg/
 *.zip
 *.zip.sha256
 

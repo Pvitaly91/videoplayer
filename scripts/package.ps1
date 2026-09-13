@@ -82,6 +82,16 @@ Recent Items. Основний і preview LibVLC запускаються з --i
 пам’ять і не додаються до їхнього командного рядка.
 
 МОЖЛИВОСТІ
+- «Зберегти відео…» або Ctrl+E відкриває exporter: усе відео чи A–B,
+  повний кадр чи поточна видима область зуму, source canvas чи native crop,
+  з аудіо або без нього. FFprobe показує параметри й план до запуску.
+- Exporter використовує лише tools\export\ffmpeg.exe і ffprobe.exe з цієї
+  папки, не PATH. Progress асинхронний; Cancel прибирає partial. Перезапис
+  підтверджується явно, source/hard-link ніколи не замінюється.
+- Після підтвердження фонового export плеєр знову інтерактивний: можна
+  продовжувати перегляд, preview або відкрити інший файл. Job використовує
+  незмінний snapshot source identity/A-B/crop. Закриття плеєра пропонує
+  скасувати job і чекає cleanup власного FFmpeg-процесу.
 - Hover або drag шкали показує timestamp і асинхронне preview до 320x180;
   окремий preview-player не перемотує основне відео, а 24-кадровий кеш
   залишається лише в RAM.
@@ -132,8 +142,8 @@ Recent Items. Основний і preview LibVLC запускаються з --i
   Новий файл скидає повтор, Pause/Stop не запускають його самостійно.
   Межі існують лише в RAM; перехід через seek/restart не є безшовним.
 
-Компоненти VLC/LibVLC 3.0.23 та їхні ліцензійні тексти постачаються
-в цій папці. Додаткові відомості: THIRD_PARTY_NOTICES.md.
+Компоненти VLC/LibVLC 3.0.23, FFmpeg/ffprobe та їхні ліцензійні тексти
+постачаються в цій папці. Додаткові відомості: THIRD_PARTY_NOTICES.md.
 "@
     Set-Content -LiteralPath (Join-Path $packageDirectory 'README-portable.txt') -Value $portableReadme -Encoding UTF8
 

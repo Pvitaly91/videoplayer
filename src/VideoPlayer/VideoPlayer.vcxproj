@@ -100,7 +100,7 @@
     </Link>
     <PostBuildEvent>
       <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)scripts\stage-runtime.ps1&quot; -Platform &quot;$(Platform)&quot; -Destination &quot;$(OutDir).&quot;</Command>
-      <Message>Incrementally staging the portable LibVLC runtime</Message>
+      <Message>Incrementally staging portable LibVLC and FFmpeg runtimes</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -129,7 +129,7 @@
     </Link>
     <PostBuildEvent>
       <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)scripts\stage-runtime.ps1&quot; -Platform &quot;$(Platform)&quot; -Destination &quot;$(OutDir).&quot;</Command>
-      <Message>Incrementally staging the portable LibVLC runtime</Message>
+      <Message>Incrementally staging portable LibVLC and FFmpeg runtimes</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -152,7 +152,7 @@
     </Link>
     <PostBuildEvent>
       <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)scripts\stage-runtime.ps1&quot; -Platform &quot;$(Platform)&quot; -Destination &quot;$(OutDir).&quot;</Command>
-      <Message>Incrementally staging the portable LibVLC runtime</Message>
+      <Message>Incrementally staging portable LibVLC and FFmpeg runtimes</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -181,13 +181,19 @@
     </Link>
     <PostBuildEvent>
       <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)scripts\stage-runtime.ps1&quot; -Platform &quot;$(Platform)&quot; -Destination &quot;$(OutDir).&quot;</Command>
-      <Message>Incrementally staging the portable LibVLC runtime</Message>
+      <Message>Incrementally staging portable LibVLC and FFmpeg runtimes</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="App.cpp" />
+    <ClCompile Include="ExportDialog.cpp" />
+    <ClCompile Include="ExportGeometry.cpp" />
+    <ClCompile Include="ExportJob.cpp" />
+    <ClCompile Include="ExportPlanner.cpp" />
+    <ClCompile Include="ExportProcess.cpp" />
     <ClCompile Include="LibVlcRuntime.cpp" />
     <ClCompile Include="MainWindow.cpp" />
+    <ClCompile Include="MediaProbe.cpp" />
     <ClCompile Include="MediaOpen.cpp" />
     <ClCompile Include="PathUtils.cpp" />
     <ClCompile Include="PlaybackMath.cpp" />
@@ -206,8 +212,15 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="App.h" />
+    <ClInclude Include="ExportDialog.h" />
+    <ClInclude Include="ExportGeometry.h" />
+    <ClInclude Include="ExportJob.h" />
+    <ClInclude Include="ExportPlanner.h" />
+    <ClInclude Include="ExportProcess.h" />
+    <ClInclude Include="ExportTypes.h" />
     <ClInclude Include="LibVlcRuntime.h" />
     <ClInclude Include="MainWindow.h" />
+    <ClInclude Include="MediaProbe.h" />
     <ClInclude Include="MediaOpen.h" />
     <ClInclude Include="PathUtils.h" />
     <ClInclude Include="PlaybackMath.h" />

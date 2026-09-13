@@ -1,4 +1,9 @@
 #include "../../src/VideoPlayer/App.h"
+#include "../../src/VideoPlayer/ExportGeometry.h"
+#include "../../src/VideoPlayer/ExportJob.h"
+#include "../../src/VideoPlayer/ExportPlanner.h"
+#include "../../src/VideoPlayer/ExportProcess.h"
+#include "../../src/VideoPlayer/MediaProbe.h"
 #include "../../src/VideoPlayer/MediaOpen.h"
 #include "../../src/VideoPlayer/PathUtils.h"
 #include "../../src/VideoPlayer/PlaybackLoop.h"
@@ -136,6 +141,507 @@ private:
     int passed_ = 0;
     int failed_ = 0;
 };
+
+bool HasArgument(const std::vector<std::wstring>& arguments, const std::wstring_view value) {
+    for (const auto& argument : arguments) {
+        if (argument == value) return true;
+    }
+    return false;
+}
+
+void TestVideoExport(TestRunner& runner) {
+    using namespace videoplayer;
+    const ExportSourceRegion full = ComputeExportSourceRegion(
+        {1920, 1080}, {0, 0, 1920, 1080}, {100, 50, 1700, 950}, {0, 0, 1920, 1080});
+    runner.True(full.valid && full.aligned == VideoCrop{0, 0, 1920, 1080},
+        L"export geometry maps complete fitted presentation");
+
+    const ExportSourceRegion clipped = ComputeExportSourceRegion(
+        {1920, 1080}, {200, 100, 800, 400}, {-100, 0, 1500, 800}, {0, 0, 1000, 800});
+    runner.True(clipped.valid, L"export geometry accepts clipped zoom presentation");
+    runner.Equal(clipped.aligned, VideoCrop{250, 100, 500, 400},
+        L"export geometry maps pan and viewport clipping into source");
+    runner.Near(clipped.x, 250.0, 0.001, L"export geometry keeps rational source x");
+    runner.True(!ComputeExportSourceRegion(
+        {1920, 1080}, {0, 0, 1920, 1080}, {0, 0, 0, 100}, {0, 0, 100, 100}).valid,
+        L"export geometry rejects empty presentation");
+    const ExportSourceRegion oddSource = ComputeExportSourceRegion(
+        {1919, 1079}, {0, 0, 1919, 1079}, {0, 0, 1919, 1079}, {0, 0, 1919, 1079});
+    runner.True(oddSource.valid && oddSource.aligned.width == 1918 &&
+        oddSource.aligned.height == 1078,
+        L"export geometry keeps subsampled crop extents encoder-aligned at odd bounds");
+    runner.Equal(ComputeExportPresentationRect(
+            {0, 0, 720, 576}, {0, 0, 1000, 1000}, {16, 15}, 0),
+        GeometryRect{0, 125, 1000, 875},
+        L"export presentation honors non-square SAR without black bars");
+    const GeometryRect rotatedPresentation = ComputeExportPresentationRect(
+        {0, 0, 1920, 1080}, {0, 0, 1000, 1000}, {1, 1}, 90);
+    runner.True(rotatedPresentation.Height() == 1000 &&
+        rotatedPresentation.Width() >= 562 && rotatedPresentation.Width() <= 563,
+        L"export presentation swaps aspect for metadata rotation");
+    const ExportSourceRegion rotated = ComputeExportSourceRegionTransformed(
+        {1920, 1080}, {0, 0, 1920, 1080}, {0, 0, 1080, 1920},
+        {0, 0, 540, 1920}, 90);
+    runner.True(rotated.valid && rotated.aligned == VideoCrop{0, 540, 1920, 540},
+        L"export geometry maps rotated display clipping back to coded pixels");
+
+    const std::string flat =
+        "streams.stream.0.index=0\n"
+        "streams.stream.0.codec_type=\"video\"\n"
+        "streams.stream.0.codec_name=\"mjpeg\"\n"
+        "streams.stream.0.disposition.attached_pic=1\n"
+        "streams.stream.1.index=2\n"
+        "streams.stream.1.codec_type=\"video\"\n"
+        "streams.stream.1.codec_name=\"h264\"\n"
+        "streams.stream.1.profile=\"High\"\n"
+        "streams.stream.1.width=1920\n"
+        "streams.stream.1.height=1080\n"
+        "streams.stream.1.sample_aspect_ratio=\"1:1\"\n"
+        "streams.stream.1.avg_frame_rate=\"30000/1001\"\n"
+        "streams.stream.1.time_base=\"1/90000\"\n"
+        "streams.stream.1.pix_fmt=\"yuv420p10le\"\n"
+        "streams.stream.1.side_data_list.side_data.0.rotation=90\n"
+        "streams.stream.2.index=3\n"
+        "streams.stream.2.codec_type=\"audio\"\n"
+        "streams.stream.2.codec_name=\"aac\"\n"
+        "format.format_name=\"mov,mp4,m4a,3gp,3g2,mj2\"\n"
+        "format.duration=12.500000\n"
+        "chapters.chapter.0.id=0\n";
+    MediaProbeResult probe = ParseFfprobeFlat(flat);
+    probe.availableEncoders = {L"libx264", L"libx265", L"mpeg4",
+        L"libvpx-vp9", L"libaom-av1", L"aac", L"libopus"};
+    runner.True(probe.valid && probe.MainVideo() != nullptr,
+        L"ffprobe flat parser selects a main video");
+    runner.Equal(probe.MainVideo()->index, 2, L"ffprobe parser ignores attached cover art");
+    runner.Equal(probe.MainVideo()->averageFrameRate.numerator,
+        static_cast<std::int64_t>(30000), L"ffprobe parser preserves rational fps");
+    runner.Equal(probe.MainVideo()->averageFrameRate.denominator,
+        static_cast<std::int64_t>(1001), L"ffprobe parser preserves fps denominator");
+    runner.Equal(probe.MainVideo()->bitDepth, 10U, L"ffprobe parser derives pixel bit depth");
+    runner.Equal(probe.MainVideo()->rotationDegrees, 90, L"ffprobe parser reads display matrix rotation");
+    runner.True(probe.HasAudio() && probe.chapterCount == 1,
+        L"ffprobe parser inventories audio and chapters");
+
+    ExportSnapshot snapshot{};
+    snapshot.sourcePath = L"C:\\media\\source.mp4";
+    snapshot.durationMs = 12500;
+    snapshot.hasSegment = true;
+    snapshot.segmentStartMs = 1000;
+    snapshot.segmentEndMs = 4000;
+    snapshot.playerVideo = {1920, 1080};
+    snapshot.playerCrop = {100, 100, 800, 400};
+    ExportOptions options{};
+    options.destinationPath = L"C:\\out\\result.mp4";
+    ExportPlan plan = BuildExportPlan(snapshot, probe, options, clipped);
+    runner.True(plan.valid && plan.streamCopy && HasArgument(plan.ffmpegArguments, L"copy"),
+        L"whole full-frame export uses stream copy");
+    runner.True(HasArgument(plan.ffmpegArguments, L"0:2") && HasArgument(plan.ffmpegArguments, L"0:a?"),
+        L"export planner explicitly maps viewed video and optional audio");
+    runner.True(!HasArgument(plan.ffmpegArguments, L"-r"),
+        L"export planner never invents a 30 fps rate");
+
+    options.fragment = ExportFragment::Segment;
+    plan = BuildExportPlan(snapshot, probe, options, clipped);
+    runner.True(plan.valid && !plan.streamCopy && plan.videoEncoder == L"libx264",
+        L"exact arbitrary A-B export transcodes in source codec family");
+    runner.True(HasArgument(plan.ffmpegArguments, L"1.000") &&
+        HasArgument(plan.ffmpegArguments, L"3.000"),
+        L"exact A-B plan carries half-open start and duration");
+
+    options.image = ExportImage::VisibleZoom;
+    plan = BuildExportPlan(snapshot, probe, options, clipped);
+    runner.True(plan.valid && HasArgument(plan.ffmpegArguments, L"-vf"),
+        L"visible zoom export emits a crop filter");
+    runner.True(HasArgument(plan.ffmpegArguments, L"-noautorotate"),
+        L"cropped export disables FFmpeg autorotation before coded crop");
+    runner.True(HasArgument(plan.ffmpegArguments, L"crop=500:400:250:100,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black"),
+        L"source-canvas export pads an aspect-safe crop");
+
+    options.image = ExportImage::FullFrame;
+    options.method = ExportMethod::FastStreamCopy;
+    plan = BuildExportPlan(snapshot, probe, options, clipped);
+    runner.True(!plan.valid && !plan.error.empty(),
+        L"unsafe arbitrary fast A-B copy is rejected without keyframe proof");
+
+    options.fragment = ExportFragment::WholeVideo;
+    runner.Equal(ExportMuxerForPath(L"C:\\x\\out.MKV"), std::wstring(L"matroska"),
+        L"export muxer is explicit and extension case-insensitive");
+    runner.True(ExportMuxerForPath(L"out.avi").empty(),
+        L"unsupported output container is rejected");
+
+    auto SetMainCodec = [](MediaProbeResult& value, const std::wstring& codec) {
+        for (auto& stream : value.streams) {
+            if (stream.codecType == L"video" && !stream.attachedPicture) {
+                stream.codecName = codec;
+                stream.bitDepth = 8;
+                stream.pixelFormat = L"yuv420p";
+                return;
+            }
+        }
+    };
+    for (const auto& encoderCase : std::array<std::pair<const wchar_t*, const wchar_t*>, 3>{{
+             {L"hevc", L"libx265"}, {L"mpeg4", L"mpeg4"}, {L"vp9", L"libvpx-vp9"}}}) {
+        MediaProbeResult codecProbe = probe;
+        SetMainCodec(codecProbe, encoderCase.first);
+        options = {};
+        options.fragment = ExportFragment::Segment;
+        options.audio = ExportAudio::None;
+        options.destinationPath = encoderCase.first == std::wstring(L"vp9")
+            ? L"C:\\out\\result.webm" : L"C:\\out\\result.mp4";
+        plan = BuildExportPlan(snapshot, codecProbe, options, clipped);
+        runner.True(plan.valid && plan.videoEncoder == encoderCase.second,
+            std::wstring(L"planner selects available source-family encoder for ") + encoderCase.first);
+    }
+
+    MediaProbeResult unsupportedCodec = probe;
+    SetMainCodec(unsupportedCodec, L"prores");
+    options = {};
+    options.fragment = ExportFragment::Segment;
+    options.audio = ExportAudio::None;
+    options.destinationPath = L"C:\\out\\fallback.mp4";
+    plan = BuildExportPlan(snapshot, unsupportedCodec, options, clipped);
+    runner.True(!plan.valid && plan.requiresCodecFallbackConfirmation,
+        L"unknown source codec requires explicit H.264 fallback confirmation");
+    options.confirmedCodecFallback = true;
+    plan = BuildExportPlan(snapshot, unsupportedCodec, options, clipped);
+    runner.True(plan.valid && plan.videoEncoder == L"libx264" &&
+        plan.expectedVideoCodec == L"h264",
+        L"confirmed unknown-codec fallback is explicit H.264 in MP4");
+
+    MediaProbeResult hdrFallback = unsupportedCodec;
+    for (auto& stream : hdrFallback.streams) {
+        if (stream.codecType == L"video" && !stream.attachedPicture) {
+            stream.bitDepth = 10;
+            stream.pixelFormat = L"yuv420p10le";
+            stream.colorTransfer = L"smpte2084";
+        }
+    }
+    plan = BuildExportPlan(snapshot, hdrFallback, options, clipped);
+    runner.True(!plan.valid && !plan.error.empty(),
+        L"HDR/10-bit fallback refuses an implicit SDR/8-bit downgrade");
+
+    options.confirmedCodecFallback = false;
+    options.destinationPath = L"C:\\out\\incompatible.webm";
+    plan = BuildExportPlan(snapshot, probe, options, clipped);
+    runner.True(!plan.valid && !plan.error.empty(),
+        L"planner rejects an incompatible H.264 WebM container");
+}
+
+void TestRealVideoExportIntegration(TestRunner& runner) {
+    using namespace videoplayer;
+    const std::wstring tools = ExportToolsDirectory();
+    const std::wstring ffmpeg = tools + L"\\ffmpeg.exe";
+    const std::wstring ffprobe = tools + L"\\ffprobe.exe";
+    if (GetFileAttributesW(ffmpeg.c_str()) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(ffprobe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        runner.True(false, L"real export integration has bundled ffmpeg and ffprobe");
+        return;
+    }
+    wchar_t temporaryRoot[MAX_PATH]{};
+    if (GetTempPathW(static_cast<DWORD>(std::size(temporaryRoot)), temporaryRoot) == 0) {
+        runner.True(false, L"real export integration obtains temp directory");
+        return;
+    }
+    const std::wstring directory = std::wstring(temporaryRoot) +
+        L"VideoPlayer-експорт-" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(directory.c_str(), nullptr);
+    const std::wstring source = directory + L"\\джерело з пробілами.mp4";
+    std::vector<std::wstring> fixtureArgs{
+        L"-hide_banner", L"-loglevel", L"error", L"-y",
+        L"-f", L"lavfi", L"-i", L"testsrc2=size=320x180:rate=30000/1001",
+        L"-f", L"lavfi", L"-i", L"sine=frequency=880:sample_rate=48000",
+        L"-t", L"4", L"-c:v", L"libx264", L"-g", L"30",
+        L"-pix_fmt", L"yuv420p", L"-c:a", L"aac", L"-shortest",
+        L"-f", L"mp4", source};
+    ExportProcessResult fixture = RunHiddenExportProcess(ffmpeg, fixtureArgs);
+    runner.True(fixture.started && fixture.exitCode == 0,
+        L"real export integration generates H.264/AAC fixture");
+    MediaProbeResult probe = ProbeMediaFile(ffprobe, source);
+    runner.True(probe.valid && probe.HasAudio(),
+        L"real export integration probes source streams");
+    if (!probe.valid) {
+        DeleteFileW(source.c_str());
+        RemoveDirectoryW(directory.c_str());
+        return;
+    }
+    ExportSnapshot snapshot{};
+    snapshot.sourcePath = source;
+    snapshot.sourceIdentity = CaptureExportFileIdentity(source);
+    snapshot.durationMs = static_cast<std::int64_t>(probe.durationSeconds * 1000.0 + 0.5);
+    snapshot.hasSegment = true;
+    snapshot.segmentStartMs = 700;
+    snapshot.segmentEndMs = 2600;
+    snapshot.playerVideo = {320, 180};
+    snapshot.playerCrop = {40, 20, 200, 120};
+    snapshot.presentationScreen = {-40, 0, 360, 240};
+    snapshot.viewportScreen = {0, 0, 320, 180};
+    const ExportSourceRegion region = ComputeExportSourceRegion(
+        snapshot.playerVideo, snapshot.playerCrop,
+        snapshot.presentationScreen, snapshot.viewportScreen);
+
+    const std::wstring changedSource = directory + L"\\changed-after-snapshot.mp4";
+    CopyFileW(source.c_str(), changedSource.c_str(), FALSE);
+    ExportSnapshot changedSnapshot = snapshot;
+    changedSnapshot.sourcePath = changedSource;
+    changedSnapshot.sourceIdentity = CaptureExportFileIdentity(changedSource);
+    HANDLE changedFile = CreateFileW(changedSource.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (changedFile != INVALID_HANDLE_VALUE) {
+        FILETIME changedTime{};
+        GetSystemTimeAsFileTime(&changedTime);
+        ULARGE_INTEGER later{};
+        later.LowPart = changedTime.dwLowDateTime;
+        later.HighPart = changedTime.dwHighDateTime;
+        later.QuadPart += 10ULL * 10000000ULL;
+        changedTime.dwLowDateTime = later.LowPart;
+        changedTime.dwHighDateTime = later.HighPart;
+        SetFileTime(changedFile, nullptr, nullptr, &changedTime);
+        CloseHandle(changedFile);
+    }
+    ExportOptions changedOptions{};
+    changedOptions.destinationPath = directory + L"\\changed-output.mp4";
+    const ExportPlan changedPlan = BuildExportPlan(
+        changedSnapshot, probe, changedOptions, region);
+    std::atomic_bool changedCancellation{false};
+    const ExportJobResult changedResult = RunExportJob(ffmpeg, ffprobe,
+        changedSnapshot, changedOptions, changedPlan, false, changedCancellation);
+    runner.True(!changedResult.success && !changedResult.diagnostics.empty(),
+        L"export refuses a source changed after the immutable dialog snapshot");
+    DeleteFileW(changedOptions.destinationPath.c_str());
+    DeleteFileW(changedSource.c_str());
+
+    struct Combination final {
+        ExportFragment fragment;
+        ExportImage image;
+        ExportResolution resolution;
+        ExportAudio audio;
+        const wchar_t* name;
+    };
+    const std::array<Combination, 4> combinations{{
+        {ExportFragment::WholeVideo, ExportImage::FullFrame,
+            ExportResolution::SourceCanvas, ExportAudio::Original, L"whole-full"},
+        {ExportFragment::Segment, ExportImage::FullFrame,
+            ExportResolution::SourceCanvas, ExportAudio::None, L"segment-full"},
+        {ExportFragment::WholeVideo, ExportImage::VisibleZoom,
+            ExportResolution::NativeCrop, ExportAudio::None, L"whole-crop"},
+        {ExportFragment::Segment, ExportImage::VisibleZoom,
+            ExportResolution::SourceCanvas, ExportAudio::Original, L"segment-crop"},
+    }};
+    for (const auto& combination : combinations) {
+        ExportOptions options{};
+        options.fragment = combination.fragment;
+        options.image = combination.image;
+        options.resolution = combination.resolution;
+        options.audio = combination.audio;
+        options.destinationPath = directory + L"\\" + combination.name + L".mp4";
+        const ExportPlan plan = BuildExportPlan(snapshot, probe, options, region);
+        std::atomic_bool cancellation{false};
+        const ExportJobResult exported = RunExportJob(ffmpeg, ffprobe, snapshot,
+            options, plan, false, cancellation);
+        const MediaProbeResult output = ProbeMediaFile(ffprobe, options.destinationPath);
+        const MediaStreamInfo* outputVideo = output.MainVideo();
+        const bool audioExpected = combination.audio == ExportAudio::Original;
+        runner.True(exported.success && output.valid && output.HasAudio() == audioExpected,
+            std::wstring(L"real export pipeline validates ") + combination.name);
+        if (exported.success && outputVideo != nullptr) {
+            std::wcout << L"REAL EXPORT " << combination.name << L": "
+                << outputVideo->codecName << L" " << outputVideo->width << L"x"
+                << outputVideo->height << L", " << output.durationSeconds
+                << L" s, audio=" << (output.HasAudio() ? L"yes" : L"no") << L'\n';
+        }
+        DeleteFileW(options.destinationPath.c_str());
+    }
+
+    ExportOptions protectionOptions{};
+    protectionOptions.destinationPath = source;
+    ExportPlan protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
+    std::atomic_bool protectionCancellation{false};
+    ExportJobResult protectedSource = RunExportJob(ffmpeg, ffprobe, snapshot,
+        protectionOptions, protectionPlan, true, protectionCancellation);
+    runner.True(!protectedSource.success && !protectedSource.diagnostics.empty(),
+        L"export refuses to overwrite its source path");
+
+    const std::wstring hardLink = directory + L"\\source-hard-link.mp4";
+    if (CreateHardLinkW(hardLink.c_str(), source.c_str(), nullptr) != FALSE) {
+        protectionOptions.destinationPath = hardLink;
+        protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
+        protectionCancellation.store(false);
+        ExportJobResult protectedHardLink = RunExportJob(ffmpeg, ffprobe, snapshot,
+            protectionOptions, protectionPlan, true, protectionCancellation);
+        runner.True(!protectedHardLink.success,
+            L"export refuses to overwrite a hard link to source");
+        DeleteFileW(hardLink.c_str());
+    } else {
+        runner.True(false, L"export source protection creates hard-link fixture");
+    }
+
+    const std::wstring existing = directory + L"\\existing.mp4";
+    CopyFileW(source.c_str(), existing.c_str(), FALSE);
+    protectionOptions.destinationPath = existing;
+    protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
+    protectionCancellation.store(false);
+    ExportJobResult unconfirmedOverwrite = RunExportJob(ffmpeg, ffprobe, snapshot,
+        protectionOptions, protectionPlan, false, protectionCancellation);
+    runner.True(!unconfirmedOverwrite.success,
+        L"export refuses an existing destination without overwrite confirmation");
+
+    bool raced = false;
+    protectionCancellation.store(false);
+    ExportJobResult racedDestination = RunExportJob(ffmpeg, ffprobe, snapshot,
+        protectionOptions, protectionPlan, true, protectionCancellation,
+        [&](int, const std::wstring&) {
+            if (!raced) {
+                raced = true;
+                DeleteFileW(existing.c_str());
+                CopyFileW(source.c_str(), existing.c_str(), FALSE);
+            }
+        });
+    runner.True(!racedDestination.success && raced &&
+        GetFileAttributesW(existing.c_str()) != INVALID_FILE_ATTRIBUTES,
+        L"export detects destination replacement race before finalization");
+    DeleteFileW(existing.c_str());
+
+    protectionOptions.destinationPath = directory + L"\\cancelled.mp4";
+    protectionOptions.fragment = ExportFragment::Segment;
+    protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
+    protectionCancellation.store(false);
+    ExportJobResult cancelledJob = RunExportJob(ffmpeg, ffprobe, snapshot,
+        protectionOptions, protectionPlan, false, protectionCancellation,
+        [&](int, const std::wstring&) { protectionCancellation.store(true); });
+    WIN32_FIND_DATAW partialData{};
+    HANDLE partialSearch = FindFirstFileW((protectionOptions.destinationPath + L".*.part").c_str(), &partialData);
+    const bool partialAbsent = partialSearch == INVALID_HANDLE_VALUE;
+    if (partialSearch != INVALID_HANDLE_VALUE) FindClose(partialSearch);
+    runner.True(cancelledJob.cancelled && partialAbsent,
+        L"cancelled export removes its unique partial file");
+
+    std::atomic_bool cancelImmediately{true};
+    ExportProcessResult cancelled = RunHiddenExportProcess(ffmpeg,
+        {L"-hide_banner", L"-loglevel", L"error", L"-f", L"lavfi", L"-i",
+         L"testsrc2=size=1920x1080:rate=60", L"-t", L"60", L"-f", L"null", L"NUL"},
+        &cancelImmediately);
+    runner.True(cancelled.started && cancelled.cancelled,
+        L"real export process cancellation targets its own job");
+
+    const std::wstring vfrBase = directory + L"\\vfr-sar-base.mp4";
+    const std::wstring vfrRotated = directory + L"\\vfr-sar-rotated.mp4";
+    ExportProcessResult vfrCreated = RunHiddenExportProcess(ffmpeg,
+        {L"-hide_banner", L"-loglevel", L"error", L"-y",
+         L"-f", L"lavfi", L"-i", L"testsrc2=size=160x120:rate=30", L"-t", L"3",
+         L"-vf", L"select='not(mod(n,2))+not(mod(n,5))',setsar=4/3",
+         L"-fps_mode", L"vfr", L"-c:v", L"libx264", L"-pix_fmt", L"yuv420p",
+         L"-an", L"-f", L"mp4", vfrBase});
+    ExportProcessResult rotationAdded = RunHiddenExportProcess(ffmpeg,
+        {L"-hide_banner", L"-loglevel", L"error", L"-y", L"-display_rotation",
+         L"90", L"-i", vfrBase, L"-c", L"copy", L"-f", L"mp4", vfrRotated});
+    MediaProbeResult transformedProbe = ProbeMediaFile(ffprobe, vfrRotated);
+    const MediaStreamInfo* transformedVideo = transformedProbe.MainVideo();
+    runner.True(vfrCreated.exitCode == 0 && rotationAdded.exitCode == 0 &&
+        transformedVideo != nullptr && !transformedProbe.HasAudio() &&
+        transformedVideo->sampleAspectRatio.numerator == 4 &&
+        transformedVideo->sampleAspectRatio.denominator == 3 &&
+        transformedVideo->averageFrameRate.numerator * transformedVideo->realFrameRate.denominator !=
+            transformedVideo->realFrameRate.numerator * transformedVideo->averageFrameRate.denominator &&
+        transformedVideo->rotationDegrees == 90,
+        L"real ffprobe preserves VFR, no-audio, non-square SAR and rotation metadata");
+
+    if (transformedVideo != nullptr) {
+        ExportSnapshot transformedSnapshot{};
+        transformedSnapshot.sourcePath = vfrRotated;
+        transformedSnapshot.sourceIdentity = CaptureExportFileIdentity(vfrRotated);
+        transformedSnapshot.durationMs = static_cast<std::int64_t>(
+            transformedProbe.durationSeconds * 1000.0 + 0.5);
+        transformedSnapshot.playerVideo = {160, 120};
+        transformedSnapshot.playerCrop = {0, 0, 160, 120};
+        transformedSnapshot.zoomApplied = true;
+        const ExportSourceRegion transformedRegion = ComputeExportSourceRegionTransformed(
+            {160, 120}, {0, 0, 160, 120}, {0, 0, 120, 160}, {0, 0, 60, 160}, 90);
+        ExportOptions transformedOptions{};
+        transformedOptions.image = ExportImage::VisibleZoom;
+        transformedOptions.resolution = ExportResolution::NativeCrop;
+        transformedOptions.audio = ExportAudio::None;
+        transformedOptions.destinationPath = directory + L"\\vfr-sar-rotated-crop.mp4";
+        const ExportPlan transformedPlan = BuildExportPlan(transformedSnapshot,
+            transformedProbe, transformedOptions, transformedRegion);
+        std::atomic_bool transformedCancellation{false};
+        const ExportJobResult transformedOutput = RunExportJob(ffmpeg, ffprobe,
+            transformedSnapshot, transformedOptions, transformedPlan, false,
+            transformedCancellation);
+        const MediaProbeResult transformedOutputProbe = ProbeMediaFile(
+            ffprobe, transformedOptions.destinationPath);
+        const MediaStreamInfo* transformedOutputVideo = transformedOutputProbe.MainVideo();
+        runner.True(transformedOutput.success && transformedOutputVideo != nullptr &&
+            transformedOutputVideo->rotationDegrees == 90 &&
+            transformedOutputVideo->sampleAspectRatio.numerator == 4 &&
+            transformedOutputVideo->sampleAspectRatio.denominator == 3,
+            L"real cropped export keeps SAR and rotation without double-rotating pixels");
+        if (transformedOutput.success && transformedOutputVideo != nullptr) {
+            std::wcout << L"REAL EXPORT vfr-sar-rotated-crop: "
+                << transformedOutputVideo->codecName << L" "
+                << transformedOutputVideo->width << L"x" << transformedOutputVideo->height
+                << L", SAR " << transformedOutputVideo->sampleAspectRatio.numerator << L":"
+                << transformedOutputVideo->sampleAspectRatio.denominator << L", rotation="
+                << transformedOutputVideo->rotationDegrees << L", "
+                << transformedOutputProbe.durationSeconds << L" s\n";
+        }
+        DeleteFileW(transformedOptions.destinationPath.c_str());
+    }
+
+    const std::wstring corrupt = directory + L"\\corrupt.mp4";
+    CopyFileW(source.c_str(), corrupt.c_str(), FALSE);
+    HANDLE corruptFile = CreateFileW(corrupt.c_str(), GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (corruptFile != INVALID_HANDLE_VALUE) {
+        SetFilePointer(corruptFile, 64, nullptr, FILE_BEGIN);
+        SetEndOfFile(corruptFile);
+        CloseHandle(corruptFile);
+    }
+    runner.True(!ProbeMediaFile(ffprobe, corrupt).valid,
+        L"real ffprobe rejects a corrupted/truncated source");
+    DeleteFileW(corrupt.c_str());
+
+    std::vector<std::wstring> longDirectories;
+    std::wstring longDirectory = directory;
+    for (int index = 0; index < 7; ++index) {
+        longDirectory += L"\\довгий-сегмент-експорту-0123456789-" + std::to_wstring(index);
+        CreateDirectoryW(PathForWin32Io(longDirectory).c_str(), nullptr);
+        longDirectories.push_back(longDirectory);
+    }
+    const std::wstring longSource = longDirectory + L"\\довге джерело.mp4";
+    const std::wstring longOutput = longDirectory + L"\\довгий результат.mp4";
+    const bool longCopied = CopyFileW(PathForWin32Io(source).c_str(),
+        PathForWin32Io(longSource).c_str(), FALSE) != FALSE;
+    const MediaProbeResult longProbe = ProbeMediaFile(ffprobe, longSource);
+    ExportSnapshot longSnapshot = snapshot;
+    longSnapshot.sourcePath = longSource;
+    longSnapshot.sourceIdentity = CaptureExportFileIdentity(longSource);
+    ExportOptions longOptions{};
+    longOptions.destinationPath = longOutput;
+    const ExportPlan longPlan = BuildExportPlan(longSnapshot, longProbe, longOptions, region);
+    std::atomic_bool longCancellation{false};
+    const ExportJobResult longExport = RunExportJob(ffmpeg, ffprobe, longSnapshot,
+        longOptions, longPlan, false, longCancellation);
+    runner.True(longSource.size() > MAX_PATH && longCopied && longProbe.valid && longExport.success,
+        L"real export supports extended Unicode paths longer than MAX_PATH");
+    DeleteFileW(PathForWin32Io(longOutput).c_str());
+    DeleteFileW(PathForWin32Io(longSource).c_str());
+    for (auto item = longDirectories.rbegin(); item != longDirectories.rend(); ++item) {
+        RemoveDirectoryW(PathForWin32Io(*item).c_str());
+    }
+
+    if (source.size() > 2 && source[1] == L':') {
+        const std::wstring uncSource = L"\\\\localhost\\" + source.substr(0, 1) +
+            L"$" + source.substr(2);
+        if (GetFileAttributesW(uncSource.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            runner.True(ProbeMediaFile(ffprobe, uncSource).valid,
+                L"real ffprobe supports an available UNC source");
+        }
+    }
+    DeleteFileW(vfrBase.c_str());
+    DeleteFileW(vfrRotated.c_str());
+    DeleteFileW(source.c_str());
+    RemoveDirectoryW(directory.c_str());
+}
 
 void TestTimeFormatting(TestRunner& runner)
 {
@@ -2302,6 +2808,10 @@ void TestPrivacyPolicy(TestRunner& runner)
     runner.True(
         (kPrivateOpenDialogFlags & OFN_ALLOWMULTISELECT) != 0,
         L"file dialog accepts several videos in one selection");
+    runner.Equal(kPrivateSaveDialogFlags,
+        static_cast<DWORD>(OFN_EXPLORER | OFN_PATHMUSTEXIST |
+            OFN_NOCHANGEDIR | OFN_DONTADDTORECENT),
+        L"export save dialog avoids Recent Items and CWD persistence");
 }
 
 } // namespace
@@ -2324,6 +2834,8 @@ int wmain(const int argc, wchar_t* const* const argv)
     TestTimeFormatting(runner);
     TestPlaybackMath(runner);
     TestPlaybackLoop(runner);
+    TestVideoExport(runner);
+    TestRealVideoExportIntegration(runner);
     TestProgressStrip(runner);
     TestUtf8(runner);
     TestMediaOpen(runner);

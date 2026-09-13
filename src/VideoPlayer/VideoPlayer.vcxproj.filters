@@ -16,8 +16,14 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="App.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ExportDialog.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ExportGeometry.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ExportJob.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ExportPlanner.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ExportProcess.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="LibVlcRuntime.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="MainWindow.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="MediaProbe.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="MediaOpen.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PathUtils.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PlaybackMath.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -36,8 +42,15 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="App.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ExportDialog.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ExportGeometry.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ExportJob.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ExportPlanner.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ExportProcess.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ExportTypes.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LibVlcRuntime.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="MainWindow.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="MediaProbe.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="MediaOpen.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PathUtils.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PlaybackMath.h"><Filter>Header Files</Filter></ClInclude>

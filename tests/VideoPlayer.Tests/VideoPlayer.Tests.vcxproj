@@ -69,6 +69,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Tests.cpp" />
+    <ClCompile Include="..\..\src\VideoPlayer\ExportDialog.cpp"><Link>Shared\ExportDialog.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportGeometry.cpp"><Link>Shared\ExportGeometry.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportJob.cpp"><Link>Shared\ExportJob.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportPlanner.cpp"><Link>Shared\ExportPlanner.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\ExportProcess.cpp"><Link>Shared\ExportProcess.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\MediaProbe.cpp"><Link>Shared\MediaProbe.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\MediaOpen.cpp"><Link>Shared\MediaOpen.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Link>Shared\PathUtils.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PlaybackMath.cpp"><Link>Shared\PlaybackMath.cpp</Link></ClCompile>
@@ -83,6 +89,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\VideoPlayer\App.h"><Link>Shared\App.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportGeometry.h"><Link>Shared\ExportGeometry.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportDialog.h"><Link>Shared\ExportDialog.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportJob.h"><Link>Shared\ExportJob.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportPlanner.h"><Link>Shared\ExportPlanner.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportProcess.h"><Link>Shared\ExportProcess.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\ExportTypes.h"><Link>Shared\ExportTypes.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\MediaProbe.h"><Link>Shared\MediaProbe.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\MediaOpen.h"><Link>Shared\MediaOpen.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PathUtils.h"><Link>Shared\PathUtils.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PlaybackMath.h"><Link>Shared\PlaybackMath.h</Link></ClInclude>

@@ -25,8 +25,16 @@ $portableReadme = Join-Path $packageDirectory 'README-portable.txt'
 $thirdPartyNotices = Join-Path $packageDirectory 'THIRD_PARTY_NOTICES.md'
 $plugins = Join-Path $packageDirectory 'plugins'
 $pluginCache = Join-Path $plugins 'plugins.dat'
+$exportTools = Join-Path $packageDirectory 'tools\export'
+$ffmpeg = Join-Path $exportTools 'ffmpeg.exe'
+$ffprobe = Join-Path $exportTools 'ffprobe.exe'
+$ffmpegLicense = Join-Path $exportTools 'LICENSE.GPLv3.txt'
+$ffmpegBuild = Join-Path $exportTools 'FFMPEG_BUILD.txt'
 $expectedMachine = if ($Platform -eq 'Win32') { 0x014c } else { 0x8664 }
 $expectedMachineName = if ($Platform -eq 'Win32') { 'x86' } else { 'x64' }
+$ffmpegVersion = if ($Platform -eq 'Win32') { '6.0' } else { '6.1.1' }
+$ffmpegArchitecture = if ($Platform -eq 'Win32') { 'win32' } else { 'win64' }
+$ffmpegSource = Join-Path $repositoryRoot "third_party\ffmpeg\$ffmpegVersion\$ffmpegArchitecture"
 
 function Assert-Path {
     param(
@@ -170,6 +178,12 @@ function Assert-PrivateProductionSource {
         $relativeName = $sourceFile.FullName.Substring($sourceRoot.Length).TrimStart('\')
         $sourceText = Remove-CppComments -Text ([IO.File]::ReadAllText($sourceFile.FullName))
         foreach ($entry in $forbiddenSourcePatterns.GetEnumerator()) {
+            if ($relativeName -ieq 'ExportProcess.cpp' -and
+                $entry.Key -eq 'Win32 file-write API') {
+                # ExportProcess writes only "q\n" to the private stdin pipe of
+                # its own FFmpeg child. This is cancellation IPC, not persistence.
+                continue
+            }
             $match = [regex]::Match($sourceText, [string]$entry.Value)
             if ($match.Success) {
                 $sampleStart = [Math]::Max(0, $match.Index - 40)
@@ -184,8 +198,9 @@ function Assert-PrivateProductionSource {
     $mainWindowPath = Join-Path $sourceRoot 'MainWindow.cpp'
     $mediaOpenPath = Join-Path $sourceRoot 'MediaOpen.cpp'
     $playerEnginePath = Join-Path $sourceRoot 'PlayerEngine.cpp'
+    $exportDialogPath = Join-Path $sourceRoot 'ExportDialog.cpp'
     $previewEnginePath = Join-Path $sourceRoot 'PreviewEngine.cpp'
-    foreach ($requiredSource in @($privacyPolicyPath, $mainWindowPath, $mediaOpenPath, $playerEnginePath, $previewEnginePath)) {
+    foreach ($requiredSource in @($privacyPolicyPath, $mainWindowPath, $mediaOpenPath, $playerEnginePath, $previewEnginePath, $exportDialogPath)) {
         if (-not (Test-Path -LiteralPath $requiredSource -PathType Leaf)) {
             throw "Privacy-critical production source is missing: $requiredSource"
         }
@@ -205,6 +220,10 @@ function Assert-PrivateProductionSource {
     $mainWindowSource = Remove-CppComments -Text ([IO.File]::ReadAllText($mainWindowPath))
     if ($mainWindowSource -notmatch '\bkPrivateOpenDialogFlags\b') {
         throw 'GetOpenFileNameW does not consume kPrivateOpenDialogFlags/OFN_DONTADDTORECENT.'
+    }
+    $exportDialogSource = Remove-CppComments -Text ([IO.File]::ReadAllText($exportDialogPath))
+    if ($exportDialogSource -notmatch '\bkPrivateSaveDialogFlags\b') {
+        throw 'GetSaveFileNameW does not consume kPrivateSaveDialogFlags/OFN_DONTADDTORECENT.'
     }
 
     $mediaOpenSource = Remove-CppComments -Text ([IO.File]::ReadAllText($mediaOpenPath))
@@ -283,10 +302,14 @@ Assert-Path -Path $portableReadme -Kind Leaf
 Assert-Path -Path $thirdPartyNotices -Kind Leaf
 Assert-Path -Path $plugins -Kind Container
 Assert-Path -Path $pluginCache -Kind Leaf
+Assert-Path -Path $ffmpeg -Kind Leaf
+Assert-Path -Path $ffprobe -Kind Leaf
+Assert-Path -Path $ffmpegLicense -Kind Leaf
+Assert-Path -Path $ffmpegBuild -Kind Leaf
 if ((Get-Item -LiteralPath $pluginCache).Length -le 0) {
     throw "The LibVLC plugin cache is empty: $pluginCache"
 }
-foreach ($document in @($libVlcLicense, $portableReadme, $thirdPartyNotices)) {
+foreach ($document in @($libVlcLicense, $portableReadme, $thirdPartyNotices, $ffmpegLicense, $ffmpegBuild)) {
     if ((Get-Item -LiteralPath $document).Length -le 0) {
         throw "Required package document is empty: $document"
     }
@@ -299,6 +322,20 @@ Assert-FileContentsEqual `
     -Expected $releaseApplication `
     -Actual $application `
     -Description 'Portable VideoPlayer.exe and the current Release build'
+Assert-FileContentsEqual -Expected (Join-Path $ffmpegSource 'ffmpeg.exe') `
+    -Actual $ffmpeg -Description 'Portable ffmpeg.exe and pinned verified runtime'
+Assert-FileContentsEqual -Expected (Join-Path $ffmpegSource 'ffprobe.exe') `
+    -Actual $ffprobe -Description 'Portable ffprobe.exe and pinned verified runtime'
+
+$trackedBinaries = @(git -C $repositoryRoot ls-files | Where-Object {
+    $_ -match '(?i)\.(?:exe|dll|zip|7z|mp4|mkv|webm|mov|avi)$'
+})
+if ($LASTEXITCODE -ne 0) {
+    throw 'git ls-files failed while checking tracked binary artifacts.'
+}
+if ($trackedBinaries.Count -ne 0) {
+    throw "Repository tracks forbidden binary/package/media artifacts: $($trackedBinaries -join ', ')"
+}
 
 $buildInputs = @(
     Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'src') -File -Recurse
@@ -328,7 +365,7 @@ if ($null -eq $pluginFile) {
     throw "The plugins directory has no plugin DLLs: $plugins"
 }
 
-foreach ($requiredBinary in @($application, $libvlc, $libvlccore)) {
+foreach ($requiredBinary in @($application, $libvlc, $libvlccore, $ffmpeg, $ffprobe)) {
     $machine = Get-PeMachine -Path $requiredBinary
     if ($machine -ne $expectedMachine) {
         throw ('Architecture mismatch in {0}: expected {1} (0x{2:x4}), found 0x{3:x4}.' -f
@@ -382,7 +419,11 @@ if (-not $FolderOnly) {
             'COPYING.LIB',
             'README-portable.txt',
             'THIRD_PARTY_NOTICES.md',
-            'plugins\plugins.dat')) {
+            'plugins\plugins.dat',
+            'tools\export\ffmpeg.exe',
+            'tools\export\ffprobe.exe',
+            'tools\export\LICENSE.GPLv3.txt',
+            'tools\export\FFMPEG_BUILD.txt')) {
             $requiredArchiveEntry = $archive.Entries | Where-Object {
                 $_.FullName.Replace('/', '\').TrimStart('\') -eq $requiredEntry
             } | Select-Object -First 1
@@ -473,5 +514,24 @@ if ($dependents -match '(?i)\b(?:MSVCP|VCRUNTIME)140(?:_[0-9]+)?\.DLL\b') {
 }
 
 Write-Host $dependents.Trim()
+$ffmpegVersion = @(& $ffmpeg -version 2>&1)
+if ($LASTEXITCODE -ne 0 -or $ffmpegVersion.Count -eq 0) {
+    throw "Bundled ffmpeg did not execute: $ffmpeg"
+}
+$ffprobeVersion = @(& $ffprobe -version 2>&1)
+if ($LASTEXITCODE -ne 0 -or $ffprobeVersion.Count -eq 0) {
+    throw "Bundled ffprobe did not execute: $ffprobe"
+}
+$encoders = @(& $ffmpeg -hide_banner -encoders 2>&1) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw 'Bundled FFmpeg encoder inventory failed.'
+}
+foreach ($encoder in @('libx264', 'libx265', 'mpeg4', 'libvpx-vp9', 'libaom-av1', 'aac', 'libopus')) {
+    if ($encoders -notmatch "(?m)\s$([regex]::Escape($encoder))\s") {
+        throw "Bundled FFmpeg lacks required software encoder: $encoder"
+    }
+}
+Write-Host $ffmpegVersion[0]
+Write-Host $ffprobeVersion[0]
 $scope = if ($FolderOnly) { 'portable folder' } else { 'portable folder and ZIP' }
 Write-Host "Package verification passed for $Platform ($expectedMachineName): source is no-history clean; $scope contains no persistence artifacts; self-test returned 0 and no dynamic MSVC runtime import was found."
