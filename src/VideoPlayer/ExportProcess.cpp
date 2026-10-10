@@ -111,7 +111,8 @@ ExportProcessResult RunHiddenExportProcess(
     const std::vector<std::wstring>& arguments,
     std::atomic_bool* cancellation,
     ExportProgressLine progress,
-    const std::size_t outputLimit) {
+    const std::size_t outputLimit,
+    const std::string& standardInput) {
     ExportProcessResult result{};
     const bool absolute = executable.size() >= 3 &&
         ((executable[1] == L':' && (executable[2] == L'\\' || executable[2] == L'/')) ||
@@ -201,6 +202,21 @@ ExportProcessResult RunHiddenExportProcess(
         outputLimit, std::cref(progress));
     std::thread stderrThread(DrainPipe, stderrRead.Get(), std::ref(result.standardError),
         outputLimit, ExportProgressLine{});
+    std::thread inputThread;
+    if (!standardInput.empty()) {
+        inputThread = std::thread([&stdinWrite, &standardInput] {
+            std::size_t offset = 0;
+            while (offset < standardInput.size()) {
+                DWORD written = 0;
+                const DWORD count = static_cast<DWORD>((std::min<std::size_t>)(
+                    standardInput.size() - offset, 4096U));
+                if (WriteFile(stdinWrite.Get(), standardInput.data() + offset,
+                        count, &written, nullptr) == FALSE || written == 0) break;
+                offset += written;
+            }
+            stdinWrite.Reset();
+        });
+    }
     bool quitSent = false;
     ULONGLONG quitAt = 0;
     for (;;) {
@@ -213,9 +229,11 @@ ExportProcessResult RunHiddenExportProcess(
         if (cancellation != nullptr && cancellation->load()) {
             result.cancelled = true;
             if (!quitSent) {
-                static constexpr char quit[] = "q\n";
-                DWORD written = 0;
-                WriteFile(stdinWrite.Get(), quit, 2, &written, nullptr);
+                if (standardInput.empty()) {
+                    static constexpr char quit[] = "q\n";
+                    DWORD written = 0;
+                    WriteFile(stdinWrite.Get(), quit, 2, &written, nullptr);
+                }
                 quitSent = true;
                 quitAt = GetTickCount64();
             } else if (GetTickCount64() - quitAt >= 2000) {
@@ -223,6 +241,7 @@ ExportProcessResult RunHiddenExportProcess(
             }
         }
     }
+    if (inputThread.joinable()) inputThread.join();
     stdinWrite.Reset();
     stdoutThread.join();
     stderrThread.join();

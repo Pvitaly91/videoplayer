@@ -26,6 +26,13 @@ third_party/ffmpeg/
 *.zip
 *.zip.sha256
 
+# Generated executables and downloaded packages belong outside source control.
+*.exe
+*.dll
+*.7z
+*.partial-*
+*.download
+
 # Portable output
 artifacts/
 

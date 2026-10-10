@@ -7,4 +7,5 @@
 #define RT_MANIFEST 24
 #endif
 
+IDI_VIDEOPLAYER ICON "assets/VideoPlayer.ico"
 IDR_MAIN_MANIFEST RT_MANIFEST "VideoPlayer.manifest"

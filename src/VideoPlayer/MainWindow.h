@@ -12,6 +12,7 @@
 #include <shellapi.h>
 
 #include "PlayerEngine.h"
+#include "ExportTypes.h"
 #include "PlaybackLoop.h"
 #include "PreviewEngine.h"
 #include "PreviewPopup.h"
@@ -51,6 +52,8 @@ private:
     static LRESULT CALLBACK StaticControlBarProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK StaticToolbarRestoreProc(
         HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK StaticProgressStripProc(
+        HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK StaticSeekSubclass(
         HWND window,
         UINT message,
@@ -64,7 +67,12 @@ private:
     LRESULT HandleControlBarMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleToolbarRestoreMessage(
         HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleProgressStripMessage(
+        HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleSeekSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    void DrawSavedIntervals(HDC dc, const RECT& timeline) const noexcept;
+    void DrawCompactProgress(HDC dc, const RECT& bounds) const noexcept;
+    void InvalidateIntervalTimeline() noexcept;
 
     bool RegisterWindowClasses(std::wstring& error) const;
     bool CreateChildWindows();
@@ -86,6 +94,10 @@ private:
     bool HandleHotKey(UINT key, bool controlDown, bool repeated);
     void ShowOpenDialog();
     void ShowExportVideoDialog();
+    void ShowRemoveSegmentVideoDialog();
+    void AddRemovalInterval();
+    bool CommitSourceRemoval(const ExportSnapshot& snapshot,
+        const std::wstring& partialPath, std::wstring& error);
     void HandleDroppedFiles(HDROP drop);
 
     void TogglePlayback();
@@ -179,6 +191,9 @@ private:
     HWND playButton_ = nullptr;
     HWND stopButton_ = nullptr;
     HWND exportButton_ = nullptr;
+    HWND removeSegmentButton_ = nullptr;
+    HWND addRemovalButton_ = nullptr;
+    HWND removalCountLabel_ = nullptr;
     HWND seekSlider_ = nullptr;
     HWND currentTimeLabel_ = nullptr;
     HWND durationLabel_ = nullptr;
@@ -200,6 +215,9 @@ private:
     PlayerEngine player_;
     PlaybackSnapshot playbackSnapshot_{};
     PlaybackLoop playbackLoop_;
+    std::vector<VideoInterval> removalIntervals_;
+    std::int64_t timelineDurationMs_ = 0;
+    int progressCompletedWidth_ = 0;
     bool applyingPlaybackLoop_ = false;
     bool loopPlaybackRequested_ = false;
     PreviewEngine previewEngine_;

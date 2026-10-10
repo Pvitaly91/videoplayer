@@ -6,15 +6,20 @@
 #include <Windows.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace videoplayer {
 
 inline constexpr std::int64_t kPreviewTimestampQuantumMs = 5'000;
+inline constexpr std::int64_t kPreviewMaximumIntervals = 120;
 inline constexpr unsigned int kPreviewMaximumWidth = 320;
 inline constexpr unsigned int kPreviewMaximumHeight = 180;
 
-// About 120 preview intervals, bounded to 5..30 seconds. Seeking stays exact.
+// At most 120 preview intervals, with a five-second minimum. Seeking stays exact.
 std::int64_t PreviewTimestampQuantum(std::int64_t durationMs) noexcept;
+// Every preview bucket, including both endpoints, ordered coarse-to-fine so
+// background warming covers the whole timeline before filling smaller gaps.
+std::vector<std::int64_t> BuildPreviewWarmupTimestamps(std::int64_t durationMs);
 std::int64_t QuantizePreviewTimestamp(
     std::int64_t timestampMs,
     std::int64_t durationMs) noexcept;

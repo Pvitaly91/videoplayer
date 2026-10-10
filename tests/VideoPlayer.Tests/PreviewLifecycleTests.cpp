@@ -58,6 +58,11 @@ struct FakeState final {
         return decoded.size();
     }
 
+    bool RemainsAtDecodeCount(const std::size_t count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return !changed.wait_for(lock, 650ms, [&] { return decoded.size() != count; });
+    }
+
     bool WaitIdleAfter(const std::size_t count) {
         std::unique_lock<std::mutex> lock(mutex);
         return changed.wait_for(lock, 3s, [&] {
@@ -233,6 +238,183 @@ public:
 void RunPreviewLifecycleTests(const std::function<void(bool, const wchar_t*)>& check) {
     check(VerifyPreviewCaptureIsolationForTesting(),
         L"preview callbacks enforce preroll, token and retired-context isolation");
+    {
+        Fixture f;
+        f.engine.WarmMedia(10000);
+        f.engine.SetPrefetchEnabled(true);
+        f.engine.WarmMedia(0);
+        f.engine.WarmMedia(-1);
+        check(!f.engine.HasWorker() && f.state->DecodeCount() == 0,
+            L"preview eager warming requires enabled prefetch and a known positive duration");
+        f.engine.WarmMedia(10000);
+        check(f.WaitCached(0) && f.WaitCached(5000) && f.WaitCached(10000) &&
+            f.state->DecodeCount() == 3 && !f.engine.TakeLatestResult(),
+            L"preview media opening warms every coarse bucket before the first hover without publishing a hover result");
+        {
+            std::lock_guard<std::mutex> lock(f.state->mutex);
+            check(!f.state->decoded.empty() && f.state->maximumDecodes == 1 && f.state->workerThreads.size() == 1 &&
+                f.state->decoded.front().timestampMs == 0,
+                L"preview eager warming uses one sequential worker beginning at the video start");
+        }
+        for (const auto timestamp : {std::int64_t{0}, std::int64_t{5000}, std::int64_t{10000}}) {
+            const auto request = f.engine.RequestFrame(timestamp, 10000);
+            check(!f.engine.IsRequestPending(request) && f.Ready(request, 1, timestamp) &&
+                f.state->DecodeCount() == 3,
+                L"preview a warmed timeline bucket is ready synchronously with no decoder work");
+        }
+        f.engine.WarmMedia(10000);
+        f.engine.WarmMedia(10000);
+        check(f.state->RemainsAtDecodeCount(3),
+            L"preview repeated known-duration events do not restart completed warming");
+    }
+    {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({Behavior::WaitForReady});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1), L"preview idempotent warming fixture enters its first decode");
+        f.engine.WarmMedia(10000);
+        f.engine.WarmMedia(10000);
+        check(f.state->RemainsAtDecodeCount(1),
+            L"preview repeated warm requests preserve an in-flight capture instead of cancelling it");
+        {
+            std::lock_guard<std::mutex> lock(f.state->mutex);
+            f.state->allowReady = true;
+        }
+        f.state->changed.notify_all();
+        check(f.WaitCached(0) && f.WaitCached(5000) && f.WaitCached(10000) &&
+            f.state->DecodeCount() == 3,
+            L"preview idempotent warming completes each bucket only once");
+    }
+    {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({Behavior::LateFrameAfterCancel, Behavior::Ready, Behavior::WaitForReady});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1), L"preview eager foreground preemption fixture starts background work");
+        const auto foreground = f.engine.RequestFrame(5000, 10000);
+        check(f.WaitFinished(foreground) && f.state->WaitDecoded(3) &&
+            !f.engine.FindNearestCachedFrame(0, 0),
+            L"preview a hover preempts eager decoding and rejects pixels arriving after cancellation");
+        {
+            std::lock_guard<std::mutex> lock(f.state->mutex);
+            check(f.state->decoded.size() >= 2 && f.state->decoded[1].timestampMs == 5000,
+                L"preview the foreground bucket runs ahead of all remaining eager buckets");
+            f.state->allowReady = true;
+        }
+        f.state->changed.notify_all();
+        check(f.WaitCached(0) && f.WaitCached(10000) && f.Ready(foreground, 1, 5000) &&
+            f.engine.GetRequestState(foreground) == PreviewRequestState::Ready &&
+            f.state->DecodeCount() == 4,
+            L"preview warming resumes the cancelled bucket and preserves the foreground result and request state");
+    }
+    {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({Behavior::LateFrameAfterCancel, Behavior::WaitForReady});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1), L"preview hidden-hover warming fixture starts background work");
+        f.engine.CancelRequests();
+        check(f.state->WaitDecoded(2) && !f.engine.FindNearestCachedFrame(0, 0) &&
+            !f.engine.TakeLatestResult(),
+            L"preview hiding a hover cancels stale pixels without abandoning the media warming plan");
+        {
+            std::lock_guard<std::mutex> lock(f.state->mutex);
+            check(f.state->decoded.size() >= 2 && f.state->decoded[1].timestampMs == 0,
+                L"preview hover cancellation retries the interrupted eager bucket");
+            f.state->allowReady = true;
+        }
+        f.state->changed.notify_all();
+        check(f.WaitCached(0) && f.WaitCached(5000) && f.WaitCached(10000) &&
+            f.state->DecodeCount() == 4 && !f.engine.TakeLatestResult(),
+            L"preview background completion never recreates a hidden hover result");
+    }
+    {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({Behavior::LateFrameAfterCancel, Behavior::WaitForReady});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1), L"preview warm media replacement fixture starts old generation");
+        f.engine.SetMedia(L"B", 2);
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(2) && !f.engine.FindNearestCachedFrame(0, 10000),
+            L"preview changing media clears eager cache and rejects the old generation's late frame");
+        {
+            std::lock_guard<std::mutex> lock(f.state->mutex);
+            check(f.state->decoded.size() >= 2 && f.state->decoded[1].path == L"B" &&
+                f.state->decoded[1].mediaGeneration == 2,
+                L"preview the replacement eager plan reads only the new media");
+            f.state->allowReady = true;
+        }
+        f.state->changed.notify_all();
+        check(f.WaitCached(0) && f.WaitCached(5000) && f.WaitCached(10000) &&
+            f.state->DecodeCount() == 4,
+            L"preview replacement media warms a fresh complete timeline");
+        const auto frame = f.engine.FindNearestCachedFrame(0, 0);
+        check(frame && frame->mediaGeneration == 2 && frame->pixels.front() == 2,
+            L"preview replacement timeline contains only current-generation pixels");
+    }
+    {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({Behavior::LateFrameAfterCancel});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1), L"preview warm pause fixture enters background decoding");
+        f.engine.SetPrefetchEnabled(false);
+        check(f.state->WaitIdleAfter(1) && f.state->WaitSpeculationReleased() &&
+            f.state->RemainsAtDecodeCount(1) && !f.engine.FindNearestCachedFrame(0, 0),
+            L"preview disabling warming pauses its plan and rejects the interrupted frame");
+        f.engine.SetPrefetchEnabled(true);
+        check(f.WaitCached(0) && f.WaitCached(5000) && f.WaitCached(10000) &&
+            f.state->DecodeCount() == 4,
+            L"preview reenabling warming resumes the paused plan without requiring another duration event");
+    }
+    for (const auto failure : {Behavior::Timeout, Behavior::Cancelled}) {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({failure});
+        f.engine.WarmMedia(10000);
+        check(f.WaitCached(5000) && f.WaitCached(10000) && f.state->DecodeCount() == 3 &&
+            !f.engine.FindNearestCachedFrame(0, 0) && !f.engine.TakeLatestResult() &&
+            f.state->RemainsAtDecodeCount(3),
+            L"preview eager timeout or unsolicited cancellation skips its bucket without busy retrying");
+        f.engine.SetPrefetchEnabled(false);
+        check(f.Ready(f.engine.RequestFrame(0, 10000), 1, 0) && f.state->DecodeCount() == 4,
+            L"preview a failed eager bucket stays available for a successful explicit hover retry");
+    }
+    for (const auto failure : {Behavior::Unsupported, Behavior::RuntimeFailure, Behavior::Throw}) {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({failure});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1) && f.state->WaitSpeculationReleased() &&
+            f.state->RemainsAtDecodeCount(1) && !f.engine.TakeLatestResult() &&
+            !f.engine.FindNearestCachedFrame(0, 10000),
+            L"preview unsupported or broken eager decoder stops the background plan without a retry storm");
+        f.engine.SetPrefetchEnabled(false);
+        check(f.Ready(f.engine.RequestFrame(0, 10000), 1, 0) && f.state->DecodeCount() == 2,
+            L"preview eager media or runtime failures never poison a later explicit foreground request");
+    }
+    {
+        Fixture f;
+        f.engine.SetPrefetchEnabled(true);
+        f.state->SetSteps({Behavior::LateFrameAfterCancel, Behavior::WaitForReady});
+        f.engine.WarmMedia(10000);
+        check(f.state->WaitDecoded(1), L"preview changed-duration fixture begins the old plan");
+        f.engine.WarmMedia(2000);
+        check(f.state->WaitDecoded(2) && !f.engine.FindNearestCachedFrame(0, 0),
+            L"preview a corrected duration cancels old background capture before replacing its plan");
+        {
+            std::lock_guard<std::mutex> lock(f.state->mutex);
+            check(f.state->decoded.size() >= 2 && f.state->decoded[1].durationMs == 2000,
+                L"preview the replacement warm plan uses the corrected duration");
+            f.state->allowReady = true;
+        }
+        f.state->changed.notify_all();
+        check(f.WaitCached(0) && f.WaitCached(2000) && f.state->DecodeCount() == 3 &&
+            !f.engine.FindNearestCachedFrame(5000, 0) && f.state->RemainsAtDecodeCount(3),
+            L"preview corrected-duration warming includes its end and never continues obsolete buckets");
+    }
     {
         Fixture f;
         f.engine.SetPrefetchEnabled(true);

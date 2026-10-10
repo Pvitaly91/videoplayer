@@ -38,6 +38,11 @@ struct ExportFileIdentity final {
     std::uint64_t modifiedTime = 0;
 };
 
+struct VideoInterval final {
+    std::int64_t startMs = 0;
+    std::int64_t endMs = 0;
+};
+
 struct ExportSnapshot final {
     std::wstring sourcePath;
     ExportFileIdentity sourceIdentity{};
@@ -46,6 +51,7 @@ struct ExportSnapshot final {
     bool hasSegment = false;
     std::int64_t segmentStartMs = 0;
     std::int64_t segmentEndMs = 0;
+    std::vector<VideoInterval> removalIntervals;
     VideoDimensions playerVideo{};
     VideoCrop playerCrop{};
     GeometryRect presentationScreen{};
@@ -121,7 +127,7 @@ struct MediaProbeResult final {
 struct ExportOptions final {
     ExportFragment fragment = ExportFragment::WholeVideo;
     ExportImage image = ExportImage::FullFrame;
-    ExportResolution resolution = ExportResolution::SourceCanvas;
+    ExportResolution resolution = ExportResolution::NativeCrop;
     ExportMethod method = ExportMethod::Exact;
     ExportAudio audio = ExportAudio::Original;
     std::wstring destinationPath;
@@ -141,6 +147,7 @@ struct ExportPlan final {
     VideoCrop effectiveCrop{};
     unsigned outputWidth = 0;
     unsigned outputHeight = 0;
+    std::int64_t targetVideoBitRate = 0;
     bool outputHasAudio = false;
     std::wstring expectedVideoCodec;
     std::wstring expectedPixelFormat;

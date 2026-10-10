@@ -1,8 +1,10 @@
 #include "targetver.h"
 #include "MainWindow.h"
+#include "AppIcon.h"
 
 #include "ExportDialog.h"
 #include "ExportJob.h"
+#include "IntervalTimeline.h"
 
 #include "MediaOpen.h"
 #include "PlaybackMath.h"
@@ -62,7 +64,7 @@ constexpr int kInitialWidth = 1000;
 constexpr int kInitialHeight = 650;
 constexpr int kMinimumWidth = 760;
 constexpr int kMinimumHeight = 400;
-constexpr int kControlBarHeight = 120;
+constexpr int kControlBarHeight = 154;
 constexpr int kProgressStripHeight = 3;
 constexpr int kToolbarRestoreWidth = 48;
 constexpr int kToolbarRestoreHeight = 34;
@@ -72,48 +74,12 @@ constexpr std::size_t kMaximumFilesPerOpen = 8;
 constexpr BYTE kFullscreenControlBarAlpha = 160;
 constexpr BYTE kToolbarRestoreAlpha = 176;
 constexpr COLORREF kProgressStripColor = RGB(255, 0, 0);
+constexpr COLORREF kSavedIntervalColor = RGB(255, 153, 0);
+constexpr COLORREF kProgressTransparentColor = RGB(1, 0, 1);
 
 constexpr wchar_t kOpenFilter[] =
     L"Відеофайли\0*.mp4;*.avi;*.mkv;*.mov;*.m4v;*.webm;*.wmv;*.mpg;*.mpeg;*.ts;*.m2ts;*.mts;*.flv;*.3gp;*.ogv;*.vob\0"
     L"Усі файли\0*.*\0\0";
-
-LRESULT CALLBACK ProgressStripWindowProc(
-    const HWND window,
-    const UINT message,
-    const WPARAM wParam,
-    const LPARAM lParam) {
-    UNREFERENCED_PARAMETER(lParam);
-    switch (message) {
-    case WM_NCHITTEST:
-        return HTTRANSPARENT;
-
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-
-    case WM_ERASEBKGND: {
-        RECT bounds{};
-        GetClientRect(window, &bounds);
-        const HDC dc = reinterpret_cast<HDC>(wParam);
-        SetDCBrushColor(dc, kProgressStripColor);
-        FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-        return 1;
-    }
-
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        const HDC dc = BeginPaint(window, &paint);
-        RECT bounds{};
-        GetClientRect(window, &bounds);
-        SetDCBrushColor(dc, kProgressStripColor);
-        FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-        EndPaint(window, &paint);
-        return 0;
-    }
-
-    default:
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
-}
 
 bool IsHighContrastEnabled() noexcept {
     HIGHCONTRASTW highContrast{};
@@ -450,6 +416,20 @@ LRESULT CALLBACK MainWindow::StaticSeekSubclass(
         : self->HandleSeekSubclass(window, message, wParam, lParam);
 }
 
+LRESULT CALLBACK MainWindow::StaticProgressStripProc(
+    const HWND window, const UINT message, const WPARAM wParam, const LPARAM lParam) {
+    MainWindow* self = reinterpret_cast<MainWindow*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        self = static_cast<MainWindow*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    return self == nullptr
+        ? DefWindowProcW(window, message, wParam, lParam)
+        : self->HandleProgressStripMessage(window, message, wParam, lParam);
+}
+
 LRESULT MainWindow::HandleMessage(
     const UINT message,
     const WPARAM wParam,
@@ -562,6 +542,14 @@ LRESULT MainWindow::HandleMessage(
                 return 0;
             case IDC_EXPORT_BUTTON:
                 ShowExportVideoDialog();
+                FinishMouseControlInteraction();
+                return 0;
+            case IDC_REMOVE_SEGMENT_BUTTON:
+                ShowRemoveSegmentVideoDialog();
+                FinishMouseControlInteraction();
+                return 0;
+            case IDC_ADD_REMOVAL_BUTTON:
+                AddRemovalInterval();
                 FinishMouseControlInteraction();
                 return 0;
             case IDC_MUTE_BUTTON:
@@ -879,6 +867,30 @@ LRESULT MainWindow::HandleControlBarMessage(
     const WPARAM wParam,
     const LPARAM lParam) {
     switch (message) {
+    case WM_NOTIFY: {
+        const auto* draw = reinterpret_cast<const NMCUSTOMDRAW*>(lParam);
+        if (draw == nullptr || draw->hdr.hwndFrom != seekSlider_ ||
+            draw->hdr.code != NM_CUSTOMDRAW) break;
+        if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (draw->dwItemSpec == TBCD_CHANNEL) {
+            if (draw->dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYPOSTPAINT;
+            if (draw->dwDrawStage == CDDS_ITEMPOSTPAINT) {
+                RECT channel{}, thumb{};
+                SendMessageW(seekSlider_, TBM_GETCHANNELRECT, 0,
+                    reinterpret_cast<LPARAM>(&channel));
+                SendMessageW(seekSlider_, TBM_GETTHUMBRECT, 0,
+                    reinterpret_cast<LPARAM>(&thumb));
+                RECT timeline = TrackbarPointerRange(channel, thumb);
+                if (timeline.bottom - timeline.top > 2) {
+                    ++timeline.top;
+                    --timeline.bottom;
+                }
+                DrawSavedIntervals(draw->hdc, timeline);
+            }
+        }
+        return CDRF_DODEFAULT;
+    }
+
     case WM_COMMAND:
     case WM_HSCROLL:
         RegisterInteraction();
@@ -894,8 +906,9 @@ LRESULT MainWindow::HandleControlBarMessage(
             const HWND hitWindow = GetCursorPos(&cursor) != FALSE
                 ? WindowFromPoint(cursor)
                 : nullptr;
-            const std::array<HWND, 15> interactiveControls{
-                openButton_, playButton_, stopButton_, exportButton_, seekSlider_,
+            const std::array<HWND, 17> interactiveControls{
+                openButton_, playButton_, stopButton_, exportButton_,
+                removeSegmentButton_, addRemovalButton_, seekSlider_,
                 muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
                 hideToolbarButton_, loopVideoButton_, loopStartButton_,
                 loopEndButton_, loopSegmentButton_, loopClearButton_};
@@ -1043,6 +1056,79 @@ LRESULT MainWindow::HandleToolbarRestoreMessage(
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+void MainWindow::DrawSavedIntervals(const HDC dc, const RECT& timeline) const noexcept {
+    if (dc == nullptr || !hasMedia_ || removalIntervals_.empty() ||
+        playbackSnapshot_.durationMs <= 0) return;
+    const int savedDc = SaveDC(dc);
+    if (savedDc == 0) return;
+    SetDCBrushColor(dc, IsHighContrastEnabled()
+        ? GetSysColor(COLOR_HIGHLIGHT) : kSavedIntervalColor);
+    for (const auto& interval : removalIntervals_) {
+        const RECT rectangle = IntervalTimelineRect(
+            interval, playbackSnapshot_.durationMs, timeline);
+        if (rectangle.right > rectangle.left && rectangle.bottom > rectangle.top) {
+            FillRect(dc, &rectangle, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        }
+    }
+    RestoreDC(dc, savedDc);
+}
+
+void MainWindow::DrawCompactProgress(const HDC dc, const RECT& bounds) const noexcept {
+    if (dc == nullptr) return;
+    const int savedDc = SaveDC(dc);
+    if (savedDc == 0) return;
+    SetDCBrushColor(dc, kProgressTransparentColor);
+    FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    RECT completed = bounds;
+    completed.right = (std::min)(bounds.right,
+        bounds.left + static_cast<LONG>(progressCompletedWidth_));
+    if (completed.right > completed.left) {
+        SetDCBrushColor(dc, kProgressStripColor);
+        FillRect(dc, &completed, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    }
+    DrawSavedIntervals(dc, bounds);
+    RestoreDC(dc, savedDc);
+}
+
+LRESULT MainWindow::HandleProgressStripMessage(
+    const HWND window, const UINT message, const WPARAM wParam, const LPARAM lParam) {
+    switch (message) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        const HDC dc = BeginPaint(window, &paint);
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        DrawCompactProgress(dc, bounds);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_PRINTCLIENT: {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        DrawCompactProgress(reinterpret_cast<HDC>(wParam), bounds);
+        return 0;
+    }
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void MainWindow::InvalidateIntervalTimeline() noexcept {
+    if (seekSlider_ != nullptr) InvalidateRect(seekSlider_, nullptr, FALSE);
+    if (progressStrip_ != nullptr) InvalidateRect(progressStrip_, nullptr, FALSE);
+    UpdateProgressStrip();
+}
+
 LRESULT MainWindow::HandleSeekSubclass(
     const HWND window,
     const UINT message,
@@ -1146,11 +1232,13 @@ bool MainWindow::RegisterWindowClasses(std::wstring& error) const {
     mainClass.style = CS_HREDRAW | CS_VREDRAW;
     mainClass.lpfnWndProc = StaticWindowProc;
     mainClass.hInstance = instance_;
-    mainClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    mainClass.hIcon = LoadPlayerIcon(instance_,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     mainClass.lpszClassName = kWindowClassName;
-    mainClass.hIconSm = mainClass.hIcon;
+    mainClass.hIconSm = LoadPlayerIcon(instance_,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     if (RegisterClassExW(&mainClass) == 0 && !IsClassAlreadyRegistered()) {
         error = L"Не вдалося зареєструвати головне вікно VideoPlayer.";
         return false;
@@ -1185,7 +1273,7 @@ bool MainWindow::RegisterWindowClasses(std::wstring& error) const {
     WNDCLASSEXW progressStripClass{};
     progressStripClass.cbSize = sizeof(progressStripClass);
     progressStripClass.style = CS_HREDRAW;
-    progressStripClass.lpfnWndProc = ProgressStripWindowProc;
+    progressStripClass.lpfnWndProc = StaticProgressStripProc;
     progressStripClass.hInstance = instance_;
     progressStripClass.lpszClassName = kProgressStripClassName;
     if (RegisterClassExW(&progressStripClass) == 0 && !IsClassAlreadyRegistered()) {
@@ -1254,7 +1342,7 @@ bool MainWindow::CreateChildWindows() {
         window_,
         nullptr,
         instance_,
-        nullptr);
+        this);
     toolbarRestorePopup_ = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         kToolbarRestoreClassName,
@@ -1278,6 +1366,17 @@ bool MainWindow::CreateChildWindows() {
     exportButton_ = CreateWindowExW(
         0, L"BUTTON", L"Зберегти відео…", child | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, controlBar_, ControlId(IDC_EXPORT_BUTTON), instance_, nullptr);
+    removeSegmentButton_ = CreateWindowExW(
+        0, L"BUTTON", L"Видалити відрізки…", child | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 0, 0, controlBar_,
+        ControlId(IDC_REMOVE_SEGMENT_BUTTON), instance_, nullptr);
+    addRemovalButton_ = CreateWindowExW(
+        0, L"BUTTON", L"Додати A–B до списку", child | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 0, 0, controlBar_, ControlId(IDC_ADD_REMOVAL_BUTTON), instance_, nullptr);
+    removalCountLabel_ = CreateWindowExW(
+        0, L"STATIC", L"У списку на видалення: 0",
+        child | SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+        0, 0, 0, 0, controlBar_, ControlId(IDC_REMOVAL_COUNT_LABEL), instance_, nullptr);
     seekSlider_ = CreateWindowExW(
         0, TRACKBAR_CLASSW, nullptr,
         child | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_ENABLESELRANGE,
@@ -1326,10 +1425,12 @@ bool MainWindow::CreateChildWindows() {
         0, 0, 0, 0, toolbarRestorePopup_,
         ControlId(IDC_RESTORE_TOOLBAR_BUTTON), instance_, nullptr);
 
-    const std::array<HWND, 25> controls{
+    const std::array<HWND, 28> controls{
         videoWindow_, videoRenderWindow_, controlBar_, fullscreenControlBar_, progressStrip_,
         toolbarRestorePopup_, toolbarRestoreButton_,
-        openButton_, playButton_, stopButton_, exportButton_, seekSlider_, currentTimeLabel_,
+        openButton_, playButton_, stopButton_, exportButton_, removeSegmentButton_,
+        addRemovalButton_, removalCountLabel_,
+        seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, loopVideoButton_, loopStartButton_, loopEndButton_,
         loopSegmentButton_, loopClearButton_, loopRangeLabel_};
@@ -1344,7 +1445,8 @@ bool MainWindow::CreateChildWindows() {
     // A layered owned popup composites above LibVLC's native video output.
     // WS_EX_TRANSPARENT makes this noninteractive strip pass input through
     // even when the video output belongs to LibVLC's rendering thread.
-    if (SetLayeredWindowAttributes(progressStrip_, 0, 255, LWA_ALPHA) == FALSE) {
+    if (SetLayeredWindowAttributes(progressStrip_, kProgressTransparentColor,
+            255, LWA_ALPHA | LWA_COLORKEY) == FALSE) {
         return false;
     }
 
@@ -1391,8 +1493,10 @@ void MainWindow::ApplySystemFont() {
         uiFont_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     }
 
-    const std::array<HWND, 19> controls{
-        openButton_, playButton_, stopButton_, exportButton_, seekSlider_, currentTimeLabel_,
+    const std::array<HWND, 22> controls{
+        openButton_, playButton_, stopButton_, exportButton_, removeSegmentButton_,
+        addRemovalButton_, removalCountLabel_,
+        seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, toolbarRestoreButton_, loopVideoButton_, loopStartButton_,
         loopEndButton_, loopSegmentButton_, loopClearButton_, loopRangeLabel_};
@@ -1482,6 +1586,15 @@ void MainWindow::LayoutChildren(const int width, const int height) {
     }
     MoveWindow(loopRangeLabel_, left, loopRowY,
         (std::max)(0, width - margin - left), rowHeight, TRUE);
+    const int removalRowY = Scale(118);
+    const int addRemovalWidth = Scale(160);
+    const int removeWidth = Scale(156);
+    MoveWindow(addRemovalButton_, margin, removalRowY, addRemovalWidth, rowHeight, TRUE);
+    left = margin + addRemovalWidth + gap;
+    MoveWindow(removeSegmentButton_, left, removalRowY, removeWidth, rowHeight, TRUE);
+    left += removeWidth + gap;
+    MoveWindow(removalCountLabel_, left, removalRowY,
+        (std::max)(0, width - margin - left), rowHeight, TRUE);
 
     if (fullscreen_ && controlBarVisible_ && CanShowOwnedPopups() &&
         zoomState_ != ZoomState::Selecting && !ZoomGestureActive()) {
@@ -1514,12 +1627,14 @@ bool MainWindow::ReparentControlBarControls(const HWND parent) noexcept {
         return false;
     }
 
-    const std::array<HWND, 18> controls{
-        openButton_, playButton_, stopButton_, exportButton_, seekSlider_, currentTimeLabel_,
+    const std::array<HWND, 21> controls{
+        openButton_, playButton_, stopButton_, exportButton_, removeSegmentButton_,
+        addRemovalButton_, removalCountLabel_,
+        seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, loopVideoButton_, loopStartButton_, loopEndButton_,
         loopSegmentButton_, loopClearButton_, loopRangeLabel_};
-    std::array<HWND, 18> previousParents{};
+    std::array<HWND, 21> previousParents{};
     for (std::size_t index = 0; index < controls.size(); ++index) {
         if (controls[index] == nullptr || IsWindow(controls[index]) == FALSE) {
             return false;
@@ -1630,7 +1745,12 @@ void MainWindow::UpdateProgressStrip() noexcept {
     input.positionMs = playbackSnapshot_.positionMs;
     input.durationMs = playbackSnapshot_.durationMs;
     const ProgressStripDecision decision = EvaluateProgressStrip(input);
-    if (!decision.visible || decision.completedWidth <= 0) {
+    const bool hasSavedIntervals = !removalIntervals_.empty() && input.hasMedia &&
+        input.durationMs > 0 && input.availableWidth > 0 &&
+        input.compactMode && !input.toolbarVisible;
+    const int previousCompletedWidth = progressCompletedWidth_;
+    progressCompletedWidth_ = decision.completedWidth;
+    if (!decision.visible && !hasSavedIntervals) {
         ShowWindow(progressStrip_, SW_HIDE);
         return;
     }
@@ -1648,9 +1768,12 @@ void MainWindow::UpdateProgressStrip() noexcept {
         HWND_TOP,
         origin.x,
         origin.y,
-        decision.completedWidth,
+        hasSavedIntervals ? input.availableWidth : decision.completedWidth,
         stripHeight,
         SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    if (previousCompletedWidth != progressCompletedWidth_) {
+        InvalidateRect(progressStrip_, nullptr, FALSE);
+    }
 }
 
 void MainWindow::SetToolbarRestoreVisible(const bool visible) noexcept {
@@ -2010,6 +2133,175 @@ void MainWindow::ShowExportVideoDialog() {
     RestoreUiAfterLifecycle();
 }
 
+void MainWindow::AddRemovalInterval() {
+    if (!hasMedia_ || !playerInitialized_ || shutdownComplete_ ||
+        HasActiveExportDialog(window_)) return;
+    playbackSnapshot_ = player_.Snapshot();
+    if (!playbackLoop_.HasSegment(playbackSnapshot_.durationMs) ||
+        playbackSnapshot_.state == PlaybackState::Opening ||
+        playbackSnapshot_.state == PlaybackState::Error) return;
+    const VideoInterval interval{playbackLoop_.StartMs(), playbackLoop_.EndMs()};
+    if (OverlapsSavedInterval(interval, removalIntervals_)) return;
+    const auto duplicate = std::find_if(removalIntervals_.begin(), removalIntervals_.end(),
+        [&](const VideoInterval& existing) {
+            return existing.startMs == interval.startMs && existing.endMs == interval.endMs;
+        });
+    if (duplicate == removalIntervals_.end()) {
+        removalIntervals_.push_back(interval);
+        std::sort(removalIntervals_.begin(), removalIntervals_.end(),
+            [](const VideoInterval& a, const VideoInterval& b) {
+                return a.startMs < b.startMs ||
+                    (a.startMs == b.startMs && a.endMs < b.endMs);
+            });
+    }
+    playbackLoop_.ClearSegment();
+    InvalidateIntervalTimeline();
+    RegisterInteraction();
+    RefreshControls();
+}
+
+void MainWindow::ShowRemoveSegmentVideoDialog() {
+    if (window_ == nullptr || shutdownComplete_ || !hasMedia_ ||
+        IsWindowEnabled(window_) == FALSE || HasActiveExportDialog(window_)) return;
+    playbackSnapshot_ = player_.Snapshot();
+    ExportSnapshot snapshot{};
+    snapshot.sourcePath = currentPath_;
+    snapshot.sourceIdentity = CaptureExportFileIdentity(currentPath_);
+    snapshot.generation = player_.Generation();
+    snapshot.durationMs = playbackSnapshot_.durationMs;
+    snapshot.hasSegment = playbackLoop_.HasSegment(snapshot.durationMs);
+    snapshot.segmentStartMs = playbackLoop_.StartMs();
+    snapshot.segmentEndMs = playbackLoop_.EndMs();
+    if (snapshot.hasSegment && OverlapsSavedInterval(
+            {snapshot.segmentStartMs, snapshot.segmentEndMs}, removalIntervals_)) return;
+    snapshot.removalIntervals = removalIntervals_;
+    if (snapshot.hasSegment) {
+        const VideoInterval current{snapshot.segmentStartMs, snapshot.segmentEndMs};
+        const auto duplicate = std::find_if(snapshot.removalIntervals.begin(),
+            snapshot.removalIntervals.end(), [&](const VideoInterval& interval) {
+                return interval.startMs == current.startMs && interval.endMs == current.endMs;
+            });
+        if (duplicate == snapshot.removalIntervals.end()) {
+            snapshot.removalIntervals.push_back(current);
+        }
+    }
+    if (snapshot.removalIntervals.empty() || !snapshot.sourceIdentity.valid) {
+        MessageBoxW(window_,
+            L"Спочатку позначте A і B або додайте відрізки до списку.",
+            kApplicationTitle, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    // Include a current single A-B selection in the same editable queue.
+    removalIntervals_ = snapshot.removalIntervals;
+    std::sort(removalIntervals_.begin(), removalIntervals_.end(),
+        [](const VideoInterval& a, const VideoInterval& b) {
+            return a.startMs < b.startMs ||
+                (a.startMs == b.startMs && a.endMs < b.endMs);
+        });
+    snapshot.removalIntervals = removalIntervals_;
+    playbackLoop_.ClearSegment();
+    InvalidateIntervalTimeline();
+    RefreshControls();
+    CancelTransientUi();
+    ShowRemoveSegmentDialog(window_, instance_, snapshot,
+        [this](const ExportSnapshot& source, const std::wstring& partial,
+            std::wstring& error) {
+            return CommitSourceRemoval(source, partial, error);
+        },
+        [this, snapshot](const std::vector<VideoInterval>& intervals) {
+            const ExportFileIdentity identity =
+                CaptureExportFileIdentity(snapshot.sourcePath);
+            if (_wcsicmp(currentPath_.c_str(), snapshot.sourcePath.c_str()) == 0 &&
+                identity.valid && identity.volume == snapshot.sourceIdentity.volume &&
+                identity.fileIndex == snapshot.sourceIdentity.fileIndex &&
+                identity.size == snapshot.sourceIdentity.size &&
+                identity.modifiedTime == snapshot.sourceIdentity.modifiedTime) {
+                removalIntervals_ = intervals;
+                InvalidateIntervalTimeline();
+                RefreshControls();
+            }
+        });
+    RestoreUiAfterLifecycle();
+}
+
+bool MainWindow::CommitSourceRemoval(const ExportSnapshot& snapshot,
+    const std::wstring& partialPath, std::wstring& error) {
+    const ExportFileIdentity currentIdentity =
+        CaptureExportFileIdentity(snapshot.sourcePath);
+    if (!currentIdentity.valid ||
+        currentIdentity.volume != snapshot.sourceIdentity.volume ||
+        currentIdentity.fileIndex != snapshot.sourceIdentity.fileIndex ||
+        currentIdentity.size != snapshot.sourceIdentity.size ||
+        currentIdentity.modifiedTime != snapshot.sourceIdentity.modifiedTime ||
+        _wcsicmp(currentPath_.c_str(), snapshot.sourcePath.c_str()) != 0) {
+        error = L"Відкритий файл змінився; оригінал не перезаписано.";
+        return false;
+    }
+    const std::vector<VideoInterval> queuedIntervals = removalIntervals_;
+    if (previewInitialized_) {
+        previewEngine_.Shutdown();
+        previewInitialized_ = false;
+    }
+    if (playerInitialized_) {
+        player_.Shutdown();
+        playerInitialized_ = false;
+    }
+    const ExportFileIdentity readyIdentity =
+        CaptureExportFileIdentity(snapshot.sourcePath);
+    const bool sourceStillSame = readyIdentity.valid &&
+        readyIdentity.volume == snapshot.sourceIdentity.volume &&
+        readyIdentity.fileIndex == snapshot.sourceIdentity.fileIndex &&
+        readyIdentity.size == snapshot.sourceIdentity.size &&
+        readyIdentity.modifiedTime == snapshot.sourceIdentity.modifiedTime;
+    const bool replaced = sourceStillSame &&
+        MoveFileExW(PathForWin32Io(partialPath).c_str(),
+            PathForWin32Io(snapshot.sourcePath).c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    const DWORD replaceError = replaced ? ERROR_SUCCESS : GetLastError();
+    std::wstring initializationError;
+    if (player_.Initialize(videoRenderWindow_, window_, initializationError)) {
+        playerInitialized_ = true;
+        player_.SetVolume(displayedVolume_);
+        player_.SetMuted(muted_);
+        if (previewEngine_.Initialize(window_)) {
+            previewInitialized_ = true;
+            previewEngine_.SetPrefetchEnabled(true);
+        } else {
+            initializationError = L"Не вдалося повторно запустити preview кадрів.";
+        }
+        if (!OpenFile(snapshot.sourcePath) && initializationError.empty()) {
+            initializationError = L"Не вдалося повторно відкрити відео.";
+        }
+    } else {
+        hasMedia_ = false;
+        currentPath_.clear();
+        RestoreExecutionState();
+        SetPromptVisible(true);
+        UpdateWindowTitle();
+    }
+    if (!replaced) {
+        if (sourceStillSame &&
+            _wcsicmp(currentPath_.c_str(), snapshot.sourcePath.c_str()) == 0) {
+            removalIntervals_ = queuedIntervals;
+            InvalidateIntervalTimeline();
+            RefreshControls();
+        }
+        error = sourceStillSame
+            ? L"Не вдалося атомарно перезаписати оригінал (Win32 " +
+                std::to_wstring(replaceError) + L")."
+            : L"Оригінал змінився перед перезаписом; його збережено.";
+        if (!initializationError.empty()) error += L" " + initializationError;
+        return false;
+    }
+    if (!initializationError.empty()) {
+        MessageBoxW(window_,
+            (L"Файл перезаписано, але плеєр не вдалося повторно відкрити: " +
+                initializationError).c_str(), kApplicationTitle,
+            MB_OK | MB_ICONWARNING);
+    }
+    return true;
+}
+
 void MainWindow::HandleDroppedFiles(const HDROP drop) {
     const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
     std::vector<std::wstring> paths;
@@ -2072,6 +2364,9 @@ void MainWindow::SetLoopPoint(const bool start) {
     if (start && position >= snapshot.durationMs) {
         return;
     }
+    if (IsInsideSavedInterval(position, removalIntervals_) ||
+        (!start && OverlapsSavedInterval(
+            {playbackLoop_.StartMs(), position}, removalIntervals_))) return;
     const bool changed = start
         ? playbackLoop_.SetStart(position, snapshot.durationMs)
         : playbackLoop_.SetEnd(position, snapshot.durationMs);
@@ -2145,10 +2440,12 @@ void MainWindow::UpdateLoopControls() {
     const bool canMark = usable && snapshot.seekable && snapshot.durationMs > 0 &&
         snapshot.state != PlaybackState::Opening;
     const auto position = ClampTime(snapshot.positionMs, snapshot.durationMs);
+    const bool pointBlocked = IsInsideSavedInterval(position, removalIntervals_);
+    const bool endBlocked = OverlapsSavedInterval({start, position}, removalIntervals_);
     EnableWindow(loopVideoButton_, usable);
-    EnableWindow(loopStartButton_, canMark && position < snapshot.durationMs);
+    EnableWindow(loopStartButton_, canMark && position < snapshot.durationMs && !pointBlocked);
     EnableWindow(loopEndButton_, canMark && start >= 0 &&
-        position >= start && position - start >= 500);
+        position >= start && position - start >= 500 && !pointBlocked && !endBlocked);
     EnableWindow(loopSegmentButton_, playbackLoop_.Mode() == LoopMode::Segment ||
         (canMark && playbackLoop_.HasSegment(snapshot.durationMs)));
     EnableWindow(loopClearButton_, start >= 0 || end >= 0);
@@ -2160,9 +2457,16 @@ void MainWindow::UpdateLoopControls() {
             SendMessageW(button.first, BM_SETCHECK, check, 0);
         }
     }
-    const std::wstring label =
+    std::wstring label =
         L"A: " + FormatLoopPoint(start) + L"   B: " + FormatLoopPoint(end);
+    if (canMark && (pointBlocked || endBlocked)) {
+        label += L"   Перетин зі збереженим відрізком";
+    }
     SetWindowTextW(loopRangeLabel_, label.c_str());
+    if (timelineDurationMs_ != snapshot.durationMs) {
+        timelineDurationMs_ = snapshot.durationMs;
+        InvalidateIntervalTimeline();
+    }
     if (playbackLoop_.HasSegment(snapshot.durationMs)) {
         const auto selectionStart = TimeToSlider(start, snapshot.durationMs);
         const auto selectionEnd = TimeToSlider(end, snapshot.durationMs);
@@ -2326,7 +2630,7 @@ void MainWindow::ShowPendingSeekPreview(const std::int64_t durationMs) {
         previewDisplayedFrame_.reset();
     }
     const auto nearby = previewEngine_.FindNearestCachedFrame(
-        previewHoverTimeMs_, 2 * PreviewTimestampQuantum(durationMs));
+        previewHoverTimeMs_, (std::max)(std::int64_t{0}, durationMs));
     if (nearby && nearby->mediaGeneration == generation) {
         previewDisplayedFrame_ = nearby;
     }
@@ -3387,6 +3691,10 @@ void MainWindow::RenderPlaybackSnapshot() {
     const PlaybackState state = playbackSnapshot_.state;
     if (state == PlaybackState::Error) {
         playbackLoop_.Reset();
+        if (!removalIntervals_.empty()) {
+            removalIntervals_.clear();
+            InvalidateIntervalTimeline();
+        }
         loopPlaybackRequested_ = false;
     }
     // Polling can observe an error even if its posted event was lost during a
@@ -3409,6 +3717,10 @@ void MainWindow::RenderPlaybackSnapshot() {
         (std::max<std::int64_t>)(0, playbackSnapshot_.durationMs);
     const std::int64_t position = ClampTime(playbackSnapshot_.positionMs, duration);
     const bool canSeek = hasMedia_ && duration > 0 && playbackSnapshot_.seekable;
+    if (canSeek && previewInitialized_ && state != PlaybackState::Error &&
+        state != PlaybackState::Opening) {
+        previewEngine_.WarmMedia(duration);
+    }
     EnableWindow(seekSlider_, canSeek);
     UpdateLoopControls();
 
@@ -3427,6 +3739,18 @@ void MainWindow::RenderPlaybackSnapshot() {
     EnableWindow(zoomButton_, canZoom);
     EnableWindow(exportButton_, hasMedia_ && state != PlaybackState::Opening &&
         state != PlaybackState::Error && duration > 0);
+    const bool canRemove = hasMedia_ &&
+        state != PlaybackState::Opening && state != PlaybackState::Error &&
+        duration > 0 && !HasActiveExportDialog(window_);
+    const bool hasCurrentSegment = playbackLoop_.HasSegment(duration);
+    const bool currentConflict = hasCurrentSegment && OverlapsSavedInterval(
+        {playbackLoop_.StartMs(), playbackLoop_.EndMs()}, removalIntervals_);
+    EnableWindow(addRemovalButton_, canRemove && hasCurrentSegment && !currentConflict);
+    EnableWindow(removeSegmentButton_, canRemove && !currentConflict &&
+        (!removalIntervals_.empty() || playbackLoop_.HasSegment(duration)));
+    const std::wstring removalCount =
+        L"У списку на видалення: " + std::to_wstring(removalIntervals_.size());
+    SetWindowTextW(removalCountLabel_, removalCount.c_str());
     UpdateControlBarVisibility();
 }
 
@@ -3478,6 +3802,9 @@ void MainWindow::ResetMediaUiState() noexcept {
     CancelTransientUi();
     playbackSnapshot_ = {};
     playbackLoop_.Reset();
+    removalIntervals_.clear();
+    InvalidateIntervalTimeline();
+    SetWindowTextW(removalCountLabel_, L"У списку на видалення: 0");
     loopPlaybackRequested_ = false;
     UpdateLoopControls();
     if (playerInitialized_) {

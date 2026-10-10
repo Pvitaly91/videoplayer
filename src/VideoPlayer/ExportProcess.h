@@ -24,6 +24,7 @@ ExportProcessResult RunHiddenExportProcess(
     const std::vector<std::wstring>& arguments,
     std::atomic_bool* cancellation = nullptr,
     ExportProgressLine progress = {},
-    std::size_t outputLimit = 1024U * 1024U);
+    std::size_t outputLimit = 1024U * 1024U,
+    const std::string& standardInput = {});
 
 }  // namespace videoplayer

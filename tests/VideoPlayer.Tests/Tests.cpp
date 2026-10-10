@@ -3,6 +3,7 @@
 #include "../../src/VideoPlayer/ExportJob.h"
 #include "../../src/VideoPlayer/ExportPlanner.h"
 #include "../../src/VideoPlayer/ExportProcess.h"
+#include "../../src/VideoPlayer/RemoveSegment.h"
 #include "../../src/VideoPlayer/MediaProbe.h"
 #include "../../src/VideoPlayer/MediaOpen.h"
 #include "../../src/VideoPlayer/PathUtils.h"
@@ -11,7 +12,9 @@
 #include "../../src/VideoPlayer/PreviewCache.h"
 #include "../../src/VideoPlayer/PreviewMath.h"
 #include "../../src/VideoPlayer/ProgressStrip.h"
+#include "../../src/VideoPlayer/IntervalTimeline.h"
 #include "../../src/VideoPlayer/PrivacyPolicy.h"
+#include "../../src/VideoPlayer/Resource.h"
 #include "../../src/VideoPlayer/TimeFormatter.h"
 #include "../../src/VideoPlayer/ToolbarVisibility.h"
 #include "../../src/VideoPlayer/Utf8.h"
@@ -23,8 +26,11 @@
 
 #include <Windows.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -142,6 +148,128 @@ private:
     int failed_ = 0;
 };
 
+bool IconHasBrandColors(const HICON icon) {
+    ICONINFO info{};
+    if (!GetIconInfo(icon, &info)) return false;
+    BITMAP color{};
+    bool foundOrange = false;
+    bool foundWhite = false;
+    if (info.hbmColor && GetObjectW(info.hbmColor, sizeof(color), &color) == static_cast<int>(sizeof(color)) &&
+        color.bmWidth > 0 && color.bmHeight > 0) {
+        BITMAPINFO bitmap{};
+        bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmap.bmiHeader.biWidth = color.bmWidth;
+        bitmap.bmiHeader.biHeight = -color.bmHeight;
+        bitmap.bmiHeader.biPlanes = 1;
+        bitmap.bmiHeader.biBitCount = 32;
+        bitmap.bmiHeader.biCompression = BI_RGB;
+        std::vector<std::uint8_t> pixels(
+            static_cast<std::size_t>(color.bmWidth) * color.bmHeight * 4);
+        const HDC dc = GetDC(nullptr);
+        if (dc && GetDIBits(dc, info.hbmColor, 0, static_cast<UINT>(color.bmHeight),
+            pixels.data(), &bitmap, DIB_RGB_COLORS) == color.bmHeight) {
+            for (std::size_t offset = 0; offset < pixels.size(); offset += 4) {
+                const auto blue = pixels[offset];
+                const auto green = pixels[offset + 1];
+                const auto red = pixels[offset + 2];
+                foundOrange = foundOrange || (red > 180 && green > 65 &&
+                    green < 210 && blue < 110);
+                foundWhite = foundWhite || (red > 225 && green > 225 && blue > 225);
+            }
+        }
+        if (dc) ReleaseDC(nullptr, dc);
+    }
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    return foundOrange && foundWhite;
+}
+
+void CheckApplicationIconResources(TestRunner& runner, const HMODULE module,
+    const std::wstring_view context) {
+    const auto name = [&](const std::wstring_view detail) {
+        return std::wstring(context) + L": " + std::wstring(detail);
+    };
+    const HRSRC group = FindResourceW(module, MAKEINTRESOURCEW(IDI_VIDEOPLAYER),
+        RT_GROUP_ICON);
+    runner.True(group != nullptr, name(L"application icon group is embedded"));
+    if (!group) return;
+    const DWORD bytes = SizeofResource(module, group);
+    const HGLOBAL loaded = LoadResource(module, group);
+    const auto* data = static_cast<const std::uint8_t*>(LockResource(loaded));
+    runner.True(data != nullptr && bytes >= 6, name(L"icon group is readable"));
+    if (!data || bytes < 6) return;
+    const auto word = [&](const std::size_t offset) {
+        return static_cast<unsigned>(data[offset]) |
+            (static_cast<unsigned>(data[offset + 1]) << 8);
+    };
+    const auto dword = [&](const std::size_t offset) {
+        return static_cast<DWORD>(word(offset)) |
+            (static_cast<DWORD>(word(offset + 2)) << 16);
+    };
+    constexpr std::array<int, 9> expectedSizes{16, 20, 24, 32, 40, 48, 64, 128, 256};
+    const unsigned count = word(4);
+    runner.True(word(0) == 0 && word(2) == 1 && count == expectedSizes.size() &&
+        bytes >= 6 + 14 * count, name(L"icon group has exactly nine valid entries"));
+    if (bytes < 6 + 14 * count) return;
+    for (const int expectedSize : expectedSizes) {
+        bool embedded = false;
+        for (unsigned index = 0; index < count; ++index) {
+            const std::size_t entry = 6 + 14 * index;
+            const int width = data[entry] == 0 ? 256 : data[entry];
+            const int height = data[entry + 1] == 0 ? 256 : data[entry + 1];
+            if (width != expectedSize || height != expectedSize) continue;
+            const HRSRC image = FindResourceW(module,
+                MAKEINTRESOURCEW(word(entry + 12)), RT_ICON);
+            embedded = image != nullptr && dword(entry + 8) > 0 &&
+                SizeofResource(module, image) == dword(entry + 8);
+        }
+        const std::wstring sizeName = std::to_wstring(expectedSize) + L"px";
+        runner.True(embedded, name(sizeName + L" image resource is embedded"));
+        const HICON icon = static_cast<HICON>(LoadImageW(module,
+            MAKEINTRESOURCEW(IDI_VIDEOPLAYER), IMAGE_ICON, expectedSize, expectedSize,
+            LR_DEFAULTCOLOR));
+        runner.True(icon != nullptr, name(sizeName + L" icon can be loaded"));
+        ICONINFO info{};
+        BITMAP color{};
+        BITMAP mask{};
+        const bool information = icon && GetIconInfo(icon, &info);
+        runner.True(information && info.fIcon && info.hbmColor && info.hbmMask &&
+            GetObjectW(info.hbmColor, sizeof(color), &color) == static_cast<int>(sizeof(color)) &&
+            GetObjectW(info.hbmMask, sizeof(mask), &mask) == static_cast<int>(sizeof(mask)) &&
+            color.bmWidth == expectedSize && color.bmHeight == expectedSize &&
+            color.bmBitsPixel == 32 && mask.bmWidth == expectedSize &&
+            mask.bmHeight == expectedSize && mask.bmBitsPixel == 1,
+            name(sizeName + L" icon color and transparency mask have correct dimensions"));
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+        if (expectedSize == 32 || expectedSize == 256) {
+            runner.True(icon && IconHasBrandColors(icon),
+                name(sizeName + L" icon contains the orange frame and white play symbol"));
+        }
+        if (icon) DestroyIcon(icon);
+    }
+}
+
+void TestApplicationIconResources(TestRunner& runner) {
+    CheckApplicationIconResources(runner, GetModuleHandleW(nullptr), L"test EXE");
+    std::vector<wchar_t> path(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    runner.True(length > 0 && length < path.size(), L"application icon test resolves build directory");
+    if (length == 0 || length >= path.size()) return;
+    const std::wstring executablePath(path.data(), length);
+    const auto separator = executablePath.find_last_of(L"\\/");
+    runner.True(separator != std::wstring::npos, L"application icon test finds sibling player EXE");
+    if (separator == std::wstring::npos) return;
+    const std::wstring playerPath = executablePath.substr(0, separator + 1) + L"VideoPlayer.exe";
+    // Data-file loading does not execute application code or resolve its DLLs.
+    const HMODULE player = LoadLibraryExW(playerPath.c_str(), nullptr,
+        LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    runner.True(player != nullptr, L"built player EXE can be inspected as a resource data file");
+    if (!player) return;
+    CheckApplicationIconResources(runner, player, L"player EXE");
+    FreeLibrary(player);
+}
+
 bool HasArgument(const std::vector<std::wstring>& arguments, const std::wstring_view value) {
     for (const auto& argument : arguments) {
         if (argument == value) return true;
@@ -196,6 +324,7 @@ void TestVideoExport(TestRunner& runner) {
         "streams.stream.1.profile=\"High\"\n"
         "streams.stream.1.width=1920\n"
         "streams.stream.1.height=1080\n"
+        "streams.stream.1.bit_rate=2000000\n"
         "streams.stream.1.sample_aspect_ratio=\"1:1\"\n"
         "streams.stream.1.avg_frame_rate=\"30000/1001\"\n"
         "streams.stream.1.time_base=\"1/90000\"\n"
@@ -231,6 +360,8 @@ void TestVideoExport(TestRunner& runner) {
     snapshot.playerVideo = {1920, 1080};
     snapshot.playerCrop = {100, 100, 800, 400};
     ExportOptions options{};
+    runner.True(options.resolution == ExportResolution::NativeCrop,
+        L"visible-zoom export defaults to a physically cropped frame");
     options.destinationPath = L"C:\\out\\result.mp4";
     ExportPlan plan = BuildExportPlan(snapshot, probe, options, clipped);
     runner.True(plan.valid && plan.streamCopy && HasArgument(plan.ffmpegArguments, L"copy"),
@@ -249,6 +380,7 @@ void TestVideoExport(TestRunner& runner) {
         L"exact A-B plan carries half-open start and duration");
 
     options.image = ExportImage::VisibleZoom;
+    options.resolution = ExportResolution::SourceCanvas;
     plan = BuildExportPlan(snapshot, probe, options, clipped);
     runner.True(plan.valid && HasArgument(plan.ffmpegArguments, L"-vf"),
         L"visible zoom export emits a crop filter");
@@ -256,6 +388,17 @@ void TestVideoExport(TestRunner& runner) {
         L"cropped export disables FFmpeg autorotation before coded crop");
     runner.True(HasArgument(plan.ffmpegArguments, L"crop=500:400:250:100,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black"),
         L"source-canvas export pads an aspect-safe crop");
+    runner.True(plan.outputWidth == 1920 && plan.outputHeight == 1080 &&
+        plan.summary.find(L"black padding") != std::wstring::npos,
+        L"source-canvas plan explicitly reports retained canvas and padding");
+
+    options.resolution = ExportResolution::NativeCrop;
+    plan = BuildExportPlan(snapshot, probe, options, clipped);
+    runner.True(plan.valid && plan.outputWidth == 500 && plan.outputHeight == 400 &&
+        plan.summary.find(L"фізичний crop") != std::wstring::npos,
+        L"native zoom export physically changes encoded frame dimensions");
+    runner.True(plan.targetVideoBitRate > 0 && plan.targetVideoBitRate < probe.MainVideo()->bitRate,
+        L"native crop scales target bitrate with encoded pixel area");
 
     options.image = ExportImage::FullFrame;
     options.method = ExportMethod::FastStreamCopy;
@@ -639,6 +782,339 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
     }
     DeleteFileW(vfrBase.c_str());
     DeleteFileW(vfrRotated.c_str());
+    DeleteFileW(source.c_str());
+    RemoveDirectoryW(directory.c_str());
+}
+
+void TestRemovalPlans(TestRunner& runner) {
+    using namespace videoplayer;
+    MediaProbeResult probe{};
+    probe.valid = true;
+    probe.durationSeconds = 10.0;
+    MediaStreamInfo video{};
+    video.index = 0;
+    video.codecType = L"video";
+    video.codecName = L"h264";
+    probe.streams.push_back(video);
+    const std::vector<std::int64_t> keyframes{
+        0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000};
+    ExportSnapshot snapshot{};
+    snapshot.removalIntervals = {{6200, 6800}, {1200, 1800},
+        {2100, 2400}, {1100, 1700}};
+    auto plan = BuildRemovalPlan(snapshot, probe, keyframes, L"result.mp4");
+    runner.True(plan.valid && plan.requestedIntervals.size() == 4 &&
+        plan.actualIntervals.size() == 2 && plan.retainedIntervals.size() == 3 &&
+        plan.actualIntervals[0].startMs == 1000 && plan.actualIntervals[0].endMs == 3000 &&
+        plan.actualIntervals[1].startMs == 6000 && plan.actualIntervals[1].endMs == 7000 &&
+        plan.retainedIntervals[0].startMs == 0 && plan.retainedIntervals[0].endMs == 1000 &&
+        plan.retainedIntervals[1].startMs == 3000 && plan.retainedIntervals[1].endMs == 6000 &&
+        plan.retainedIntervals[2].startMs == 7000 && plan.retainedIntervals[2].endMs == 10000 &&
+        plan.expectedDurationMs == 7000,
+        L"multi removal sorts and merges aligned duplicate/overlapping/touching cuts");
+    snapshot.removalIntervals = {{1200, 1600}, {1750, 1900}};
+    plan = BuildRemovalPlan(snapshot, probe, keyframes, L"result.mkv");
+    runner.True(plan.valid && plan.actualIntervals.size() == 1 &&
+        plan.actualIntervals[0].startMs == 1000 && plan.actualIntervals[0].endMs == 2000 &&
+        plan.expectedDurationMs == 9000,
+        L"separated requested cuts merging only after keyframe alignment are counted once");
+    snapshot.removalIntervals = {{0, 1000}, {9000, 10000}};
+    plan = BuildRemovalPlan(snapshot, probe, keyframes, L"result.mp4");
+    runner.True(plan.valid && plan.retainedIntervals.size() == 1 &&
+        plan.retainedIntervals[0].startMs == 1000 &&
+        plan.retainedIntervals[0].endMs == 9000 && plan.expectedDurationMs == 8000,
+        L"multi removal excludes empty retained prefix and suffix");
+    snapshot.removalIntervals = {{0, 4900}, {5100, 10000}};
+    runner.True(!BuildRemovalPlan(snapshot, probe, keyframes, L"result.mp4").valid,
+        L"aligned multi-cut union covering entire source is rejected");
+    for (const VideoInterval invalid : std::vector<VideoInterval>{
+            {-1, 1000}, {1000, 1000}, {2000, 1000}, {10000, 10100}, {1000, 10501}}) {
+        snapshot.removalIntervals = {{1000, 2000}, invalid};
+        runner.True(!BuildRemovalPlan(snapshot, probe, keyframes, L"result.mp4").valid,
+            L"one invalid queued cut rejects the entire operation");
+    }
+    snapshot.removalIntervals.clear();
+    runner.True(!BuildRemovalPlan(snapshot, probe, keyframes, L"result.mp4").valid,
+        L"empty removal selection is rejected");
+    snapshot.hasSegment = true;
+    snapshot.segmentStartMs = 1000;
+    snapshot.segmentEndMs = 2000;
+    plan = BuildRemovalPlan(snapshot, probe, {9000, 2000, 0, 1000, 1000}, L"result.mp4");
+    runner.True(plan.valid && plan.actualIntervals.size() == 1 &&
+        plan.actualIntervals[0].startMs == 1000 && plan.actualIntervals[0].endMs == 2000 &&
+        plan.expectedDurationMs == 9000,
+        L"legacy A-B fallback preserves exact keyframe bounds with unsorted duplicate keyframes");
+}
+
+void TestRemovalWithoutReencode(TestRunner& runner) {
+    using namespace videoplayer;
+    const std::wstring tools = ExportToolsDirectory();
+    const std::wstring ffmpeg = tools + L"\\ffmpeg.exe";
+    const std::wstring ffprobe = tools + L"\\ffprobe.exe";
+    wchar_t temporaryRoot[MAX_PATH]{};
+    if (GetTempPathW(static_cast<DWORD>(std::size(temporaryRoot)), temporaryRoot) == 0) {
+        runner.True(false, L"removal test obtains temporary directory");
+        return;
+    }
+    const std::wstring directory = std::wstring(temporaryRoot) +
+        L"VideoPlayer-removal-" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(directory.c_str(), nullptr);
+    const std::wstring source = directory + L"\\джерело.mp4";
+    const std::wstring destination = directory + L"\\результат з 'quote'.mp4";
+    const auto fixture = RunHiddenExportProcess(ffmpeg,
+        {L"-v", L"error", L"-y", L"-f", L"lavfi",
+         L"-i", L"testsrc2=size=320x180:rate=30",
+         L"-f", L"lavfi", L"-i", L"sine=frequency=440:sample_rate=48000",
+         L"-t", L"18", L"-c:v", L"libx264", L"-g", L"30",
+         L"-keyint_min", L"30", L"-sc_threshold", L"0",
+         L"-pix_fmt", L"yuv420p", L"-c:a", L"aac", L"-shortest",
+         L"-f", L"mp4", source});
+    runner.True(fixture.started && fixture.exitCode == 0,
+        L"removal fixture generated");
+    const MediaProbeResult probe = ProbeMediaFile(ffprobe, source);
+    runner.True(probe.valid && probe.HasAudio(), L"removal fixture probed");
+    if (!probe.valid) {
+        DeleteFileW(source.c_str());
+        RemoveDirectoryW(directory.c_str());
+        return;
+    }
+    ExportSnapshot snapshot{};
+    snapshot.sourcePath = source;
+    snapshot.sourceIdentity = CaptureExportFileIdentity(source);
+    snapshot.durationMs = 18000;
+    snapshot.hasSegment = true;
+    snapshot.segmentStartMs = 1400;
+    snapshot.segmentEndMs = 2400;
+    std::atomic_bool cancellation{false};
+    std::wstring keyframeError;
+    const auto keyframes = ProbeVideoKeyframes(ffprobe, source, probe,
+        &cancellation, keyframeError);
+    runner.True(keyframeError.empty() && keyframes.size() >= 5,
+        L"removal scans keyframe packet timestamps");
+    const RemovalPlan plan = BuildRemovalPlan(snapshot, probe, keyframes, destination);
+    runner.True(plan.valid && plan.actualIntervals.size() == 1 &&
+        plan.actualIntervals[0].startMs >= 990 &&
+        plan.actualIntervals[0].startMs <= 1010 &&
+        plan.actualIntervals[0].endMs >= 2990 &&
+        plan.actualIntervals[0].endMs <= 3010,
+        L"removal rounds A down and B up to keyframes");
+    if (plan.valid) {
+        const ExportJobResult result = RunRemovalJob(ffmpeg, ffprobe,
+            snapshot, probe, plan, destination, false, false, cancellation);
+        const MediaProbeResult output = ProbeMediaFile(ffprobe, destination);
+        const ExportFileIdentity sourceAfter = CaptureExportFileIdentity(source);
+        runner.True(result.success && output.valid &&
+            output.MainVideo() != nullptr &&
+            output.MainVideo()->codecName == probe.MainVideo()->codecName &&
+            output.HasAudio() &&
+            std::abs(output.durationSeconds - 16.0) < 0.75 &&
+            sourceAfter.fileIndex == snapshot.sourceIdentity.fileIndex &&
+            sourceAfter.size == snapshot.sourceIdentity.size,
+            L"removal produces stream-copy result and preserves source");
+        if (!result.success) {
+            std::wcerr << L"REMOVAL FAILURE: " << result.diagnostics << L"\n";
+        }
+        const ExportJobResult denied = RunRemovalJob(ffmpeg, ffprobe,
+            snapshot, probe, plan, source, false, false, cancellation);
+        runner.True(!denied.success && !denied.diagnostics.empty(),
+            L"removal rejects source-as-new-file");
+        ExportSnapshot fromBeginning = snapshot;
+        fromBeginning.segmentStartMs = 0;
+        fromBeginning.segmentEndMs = 1100;
+        const std::wstring onePiecePath = directory + L"\\одна частина.mp4";
+        const RemovalPlan onePiecePlan =
+            BuildRemovalPlan(fromBeginning, probe, keyframes, onePiecePath);
+        const ExportJobResult onePiece = RunRemovalJob(ffmpeg, ffprobe,
+            fromBeginning, probe, onePiecePlan, onePiecePath,
+            false, false, cancellation);
+        runner.True(onePiece.success &&
+            ProbeMediaFile(ffprobe, onePiecePath).valid,
+            L"removal handles a single retained suffix");
+        DeleteFileW(onePiecePath.c_str());
+
+        ExportSnapshot multiple = snapshot;
+        // Reverse order ensures the real job consumes the planner's sorted
+        // complement rather than the order in which the user added cuts.
+        for (int index = 7; index >= 0; --index) {
+            multiple.removalIntervals.push_back(
+                {index * 2000 + 1200, index * 2000 + 1700});
+        }
+        const std::wstring multiPath = directory + L"\\кілька відрізків з 'quote'.mp4";
+        const RemovalPlan multiPlan = BuildRemovalPlan(multiple, probe, keyframes, multiPath);
+        runner.True(multiPlan.valid && multiPlan.actualIntervals.size() == 8 &&
+            multiPlan.retainedIntervals.size() == 9 && multiPlan.expectedDurationMs == 10000,
+            L"eight requested cuts produce nine ordered retained pieces");
+        const ExportJobResult multiResult = RunRemovalJob(ffmpeg, ffprobe,
+            multiple, probe, multiPlan, multiPath, false, false, cancellation);
+        const MediaProbeResult multiOutput = ProbeMediaFile(ffprobe, multiPath);
+        runner.True(multiResult.success && multiOutput.valid &&
+            multiOutput.MainVideo() != nullptr &&
+            multiOutput.MainVideo()->codecName == probe.MainVideo()->codecName &&
+            multiOutput.HasAudio() && std::abs(multiOutput.durationSeconds - 10.0) < 0.05 &&
+            std::abs(multiOutput.MainVideo()->durationSeconds - 10.0) < 0.01 &&
+            CaptureExportFileIdentity(source).fileIndex == snapshot.sourceIdentity.fileIndex &&
+            CaptureExportFileIdentity(source).size == snapshot.sourceIdentity.size,
+            L"many-cut stream copy preserves audio/codecs/source without cumulative duration drift");
+        if (!multiResult.success) {
+            std::wcerr << L"MULTI REMOVAL FAILURE: " << multiResult.diagnostics << L"\n";
+        }
+        struct HashedPacket final { double pts = 0.0; std::string hash; };
+        const auto packets = [&](const std::wstring& path, const wchar_t* selector) {
+            std::vector<HashedPacket> parsed;
+            const auto process = RunHiddenExportProcess(ffprobe,
+                {L"-v", L"error", L"-select_streams", selector, L"-show_packets",
+                 L"-show_entries", L"packet=pts_time,data_hash", L"-show_data_hash", L"sha256",
+                 L"-of", L"compact=p=0:nk=0", path});
+            if (!process.started || process.exitCode != 0) return parsed;
+            std::size_t cursor = 0;
+            while (cursor < process.standardOutput.size()) {
+                const auto end = process.standardOutput.find('\n', cursor);
+                const std::string line = process.standardOutput.substr(cursor,
+                    end == std::string::npos ? std::string::npos : end - cursor);
+                const auto pts = line.find("pts_time=");
+                const auto hash = line.find("data_hash=");
+                if (pts != std::string::npos && hash != std::string::npos) {
+                    std::string value = line.substr(hash + 10);
+                    const auto terminator = value.find_first_of("|\r");
+                    if (terminator != std::string::npos) value.resize(terminator);
+                    parsed.push_back({std::strtod(line.c_str() + pts + 9, nullptr), value});
+                }
+                if (end == std::string::npos) break;
+                cursor = end + 1;
+            }
+            return parsed;
+        };
+        const auto sourceVideoPackets = packets(source, L"v:0");
+        const auto outputVideoPackets = packets(multiPath, L"v:0");
+        std::vector<std::string> expectedVideoHashes, outputVideoHashes;
+        for (const auto& packet : sourceVideoPackets) {
+            for (const auto& interval : multiPlan.retainedIntervals) {
+                const double milliseconds = packet.pts * 1000.0;
+                if (milliseconds >= interval.startMs - 0.001 &&
+                    milliseconds < interval.endMs - 0.001) {
+                    expectedVideoHashes.push_back(packet.hash);
+                    break;
+                }
+            }
+        }
+        for (const auto& packet : outputVideoPackets) outputVideoHashes.push_back(packet.hash);
+        runner.True(expectedVideoHashes.size() == 300 &&
+            outputVideoHashes == expectedVideoHashes,
+            L"multi-cut output keeps exactly the requested retained encoded video packets in order");
+        const auto sourceAudioPackets = packets(source, L"a:0");
+        const auto outputAudioPackets = packets(multiPath, L"a:0");
+        const bool unchangedAudio = !sourceAudioPackets.empty() && !outputAudioPackets.empty() &&
+            std::all_of(outputAudioPackets.begin(), outputAudioPackets.end(),
+                [&](const HashedPacket& packet) {
+                    return std::any_of(sourceAudioPackets.begin(), sourceAudioPackets.end(),
+                        [&](const HashedPacket& original) { return packet.hash == original.hash; });
+                });
+        runner.True(unchangedAudio,
+            L"all retained encoded audio payloads are byte-identical to source packets");
+        const auto multiDecoded = RunHiddenExportProcess(ffmpeg,
+            {L"-v", L"error", L"-xerror", L"-i", multiPath,
+             L"-map", L"0:v:0", L"-map", L"0:a?", L"-f", L"null", L"NUL"});
+        runner.True(multiDecoded.started && multiDecoded.exitCode == 0 &&
+            multiDecoded.standardError.empty(),
+            L"many-cut result decodes cleanly without overlapping timestamp errors");
+
+        for (const auto& muxer : std::vector<std::wstring>{L"matroska", L"webm", L"mp4"}) {
+            const bool webm = muxer == L"webm";
+            const bool mkv = muxer == L"matroska";
+            const std::wstring extension = mkv ? L".mkv" : webm ? L".webm" : L".mp4";
+            const std::wstring fixturePath = directory + L"\\джерело перевірки" + extension;
+            const std::wstring copiedPath = directory + L"\\результат перевірки" + extension;
+            std::vector<std::wstring> fixtureArgs;
+            if (webm) {
+                fixtureArgs = {L"-v", L"error", L"-y", L"-f", L"lavfi",
+                    L"-i", L"testsrc2=size=320x180:rate=30", L"-f", L"lavfi",
+                    L"-i", L"sine=frequency=440:sample_rate=48000", L"-t", L"8",
+                    L"-c:v", L"libvpx-vp9", L"-deadline", L"realtime", L"-cpu-used", L"8",
+                    L"-g", L"30", L"-pix_fmt", L"yuv420p", L"-c:a", L"libopus",
+                    L"-shortest", L"-f", muxer, fixturePath};
+            } else {
+                fixtureArgs = {L"-v", L"error", L"-y", L"-i", source,
+                    L"-map", mkv ? L"0" : L"0:v:0", L"-c", L"copy", L"-f", muxer, fixturePath};
+            }
+            const auto generated = RunHiddenExportProcess(ffmpeg, fixtureArgs);
+            const auto containerProbe = ProbeMediaFile(ffprobe, fixturePath);
+            runner.True(generated.started && generated.exitCode == 0 && containerProbe.valid &&
+                (!mkv || (containerProbe.MainVideo() != nullptr &&
+                    containerProbe.MainVideo()->startSeconds - containerProbe.startSeconds > 0.01)),
+                L"MKV offset/WebM Opus/video-only regression fixture generated");
+            ExportSnapshot containerSnapshot{};
+            containerSnapshot.sourcePath = fixturePath;
+            containerSnapshot.sourceIdentity = CaptureExportFileIdentity(fixturePath);
+            containerSnapshot.removalIntervals = {{1400, 1600}, {3400, 3600}};
+            std::wstring scanError;
+            const auto boundaries = ProbeVideoKeyframes(ffprobe, fixturePath,
+                containerProbe, &cancellation, scanError);
+            const auto containerPlan = BuildRemovalPlan(containerSnapshot,
+                containerProbe, boundaries, copiedPath);
+            const auto copied = RunRemovalJob(ffmpeg, ffprobe, containerSnapshot,
+                containerProbe, containerPlan, copiedPath, false, false, cancellation);
+            const auto copiedProbe = ProbeMediaFile(ffprobe, copiedPath);
+            runner.True(scanError.empty() && containerPlan.valid && copied.success &&
+                copiedProbe.valid && copiedProbe.MainVideo() != nullptr &&
+                containerProbe.MainVideo() != nullptr &&
+                copiedProbe.MainVideo()->codecName == containerProbe.MainVideo()->codecName &&
+                copiedProbe.HasAudio() == (mkv || webm) &&
+                std::abs(copiedProbe.durationSeconds - containerPlan.expectedDurationMs / 1000.0) < 0.05 &&
+                CaptureExportFileIdentity(fixturePath).fileIndex == containerSnapshot.sourceIdentity.fileIndex &&
+                CaptureExportFileIdentity(fixturePath).size == containerSnapshot.sourceIdentity.size,
+                L"MKV/WebM/video-only multi-cut copying preserves source and duration");
+            if (!copied.success) std::wcerr << L"CONTAINER REMOVAL FAILURE: " << copied.diagnostics << L"\n";
+            std::vector<std::string> expectedHashes, actualHashes;
+            if (containerProbe.MainVideo() != nullptr) {
+                for (const auto& packet : packets(fixturePath, L"v:0")) {
+                    const double ms = (packet.pts - containerProbe.MainVideo()->startSeconds) * 1000.0;
+                    for (const auto& interval : containerPlan.retainedIntervals) {
+                        if (ms >= interval.startMs - 0.001 && ms < interval.endMs - 0.001) {
+                            expectedHashes.push_back(packet.hash);
+                            break;
+                        }
+                    }
+                }
+            }
+            for (const auto& packet : packets(copiedPath, L"v:0")) actualHashes.push_back(packet.hash);
+            runner.True(expectedHashes.size() == (webm ? 180U : 480U) && actualHashes == expectedHashes,
+                L"MKV/WebM/video-only cuts retain exact ordered encoded video packets");
+            const auto decodedContainer = RunHiddenExportProcess(ffmpeg,
+                {L"-v", L"error", L"-xerror", L"-i", copiedPath,
+                 L"-map", L"0:v:0", L"-map", L"0:a?", L"-f", L"null", L"NUL"});
+            runner.True(decodedContainer.started && decodedContainer.exitCode == 0 &&
+                decodedContainer.standardError.empty(),
+                L"MKV/WebM/video-only multi-cut result decodes without timestamp errors");
+            DeleteFileW(copiedPath.c_str());
+            DeleteFileW(fixturePath.c_str());
+        }
+        std::atomic_bool alreadyCancelled{true};
+        const std::wstring cancelledPath = directory + L"\\скасовано.mp4";
+        const auto cancelled = RunRemovalJob(ffmpeg, ffprobe, multiple,
+            probe, multiPlan, cancelledPath, false, false, alreadyCancelled);
+        runner.True(cancelled.cancelled && !cancelled.success &&
+            GetFileAttributesW(cancelledPath.c_str()) == INVALID_FILE_ATTRIBUTES,
+            L"cancelled multi-cut operation creates no final file");
+        const RemovalPlan overwritePlan =
+            BuildRemovalPlan(multiple, probe, keyframes, source);
+        const ExportJobResult prepared = RunRemovalJob(ffmpeg, ffprobe,
+            multiple, probe, overwritePlan, source, true, true, cancellation);
+        runner.True(prepared.success && !prepared.partialPath.empty() &&
+            GetFileAttributesW(prepared.partialPath.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            CaptureExportFileIdentity(source).fileIndex == snapshot.sourceIdentity.fileIndex,
+            L"source overwrite remains staged until UI commits verified result");
+        if (prepared.success) {
+            const bool committed = MoveFileExW(prepared.partialPath.c_str(),
+                source.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+            const MediaProbeResult replaced = ProbeMediaFile(ffprobe, source);
+            runner.True(committed && replaced.valid &&
+                std::abs(replaced.durationSeconds - 10.0) < 0.05,
+                L"verified removal can atomically replace source");
+        } else {
+            std::wcerr << L"REMOVAL PREPARE FAILURE: " << prepared.diagnostics << L"\n";
+        }
+        DeleteFileW(multiPath.c_str());
+    }
+    DeleteFileW(destination.c_str());
     DeleteFileW(source.c_str());
     RemoveDirectoryW(directory.c_str());
 }
@@ -1036,6 +1512,117 @@ void TestProgressStrip(TestRunner& runner)
         decision.completedWidth,
         (std::numeric_limits<int>::max)() - 1,
         L"extreme duration scaling is exact and overflow-safe");
+}
+
+void TestIntervalTimeline(TestRunner& runner)
+{
+    using videoplayer::IntervalTimelineRect;
+    using videoplayer::IsInsideSavedInterval;
+    using videoplayer::OverlapsSavedInterval;
+    using videoplayer::VideoInterval;
+
+    const std::vector<VideoInterval> saved{{1000, 2000}, {4000, 5000}};
+    runner.True(IsInsideSavedInterval(1500, saved), L"saved range contains interior position");
+    runner.True(IsInsideSavedInterval(4500, saved), L"second saved range contains interior position");
+    runner.True(!IsInsideSavedInterval(1000, saved), L"saved start endpoint remains selectable");
+    runner.True(!IsInsideSavedInterval(2000, saved), L"saved end endpoint remains selectable");
+    runner.True(!IsInsideSavedInterval(3000, saved), L"gap between saved ranges remains selectable");
+    runner.True(!IsInsideSavedInterval(-1, saved), L"negative position is not inside a saved range");
+    runner.True(!IsInsideSavedInterval(1500, {}), L"empty saved range list permits any position");
+    const std::vector<VideoInterval> invalid{{-10, 20}, {10, 10}, {30, 20}};
+    runner.True(!IsInsideSavedInterval(15, invalid), L"malformed saved ranges do not occupy positions");
+    runner.True(!OverlapsSavedInterval({0, 40}, invalid), L"malformed saved ranges do not overlap");
+    runner.True(OverlapsSavedInterval({1100, 1900}, saved), L"candidate within saved range overlaps");
+    runner.True(OverlapsSavedInterval({0, 6000}, saved), L"candidate enclosing saved ranges overlaps");
+    runner.True(OverlapsSavedInterval({1000, 2000}, saved), L"exact duplicate saved range overlaps");
+    runner.True(OverlapsSavedInterval({500, 1500}, saved), L"candidate crossing saved start overlaps");
+    runner.True(OverlapsSavedInterval({1500, 2500}, saved), L"candidate crossing saved end overlaps");
+    runner.True(OverlapsSavedInterval({2000, 4500}, saved), L"candidate crossing a later saved range overlaps");
+    runner.True(!OverlapsSavedInterval({0, 1000}, saved), L"candidate touching saved start is allowed");
+    runner.True(!OverlapsSavedInterval({2000, 4000}, saved), L"candidate touching two saved endpoints is allowed");
+    runner.True(!OverlapsSavedInterval({5000, 6000}, saved), L"candidate touching saved end is allowed");
+    runner.True(!OverlapsSavedInterval({2500, 3500}, saved), L"candidate in saved range gap is allowed");
+    runner.True(!OverlapsSavedInterval({1000, 2000}, {}), L"empty saved list cannot overlap");
+    runner.True(!OverlapsSavedInterval({-1, 1500}, saved), L"negative candidate is malformed");
+    runner.True(!OverlapsSavedInterval({1500, 1500}, saved), L"zero-length candidate cannot overlap");
+    runner.True(!OverlapsSavedInterval({1800, 1200}, saved), L"reversed candidate cannot overlap");
+
+    const auto expectRect = [&runner](const RECT& actual, const RECT& expected,
+        const wchar_t* name) {
+        runner.True(actual.left == expected.left && actual.top == expected.top &&
+            actual.right == expected.right && actual.bottom == expected.bottom, name);
+    };
+    const RECT timeline{100, 7, 1100, 13};
+    expectRect(IntervalTimelineRect({1000, 2000}, 10000, timeline),
+        {200, 7, 300, 13}, L"saved interval maps to exact timeline pixel bounds");
+    expectRect(IntervalTimelineRect({0, 10000}, 10000, timeline), timeline,
+        L"whole-video interval fills timeline exactly");
+    expectRect(IntervalTimelineRect({-1000, 2000}, 10000, timeline),
+        {100, 7, 300, 13}, L"interval clips before video start");
+    expectRect(IntervalTimelineRect({8000, 12000}, 10000, timeline),
+        {900, 7, 1100, 13}, L"interval clips beyond video end");
+    expectRect(IntervalTimelineRect({-1000, 12000}, 10000, timeline), timeline,
+        L"interval clips at both video endpoints");
+    expectRect(IntervalTimelineRect({-2000, -1}, 10000, timeline), {},
+        L"interval wholly before video is empty");
+    expectRect(IntervalTimelineRect({10000, 12000}, 10000, timeline), {},
+        L"interval starting at video end is empty");
+    expectRect(IntervalTimelineRect({12000, 14000}, 10000, timeline), {},
+        L"interval wholly after video is empty");
+    expectRect(IntervalTimelineRect({1, 1}, 10000, timeline), {},
+        L"zero-length interval cannot be rendered");
+    expectRect(IntervalTimelineRect({2, 1}, 10000, timeline), {},
+        L"reversed interval cannot be rendered");
+    expectRect(IntervalTimelineRect({0, 1}, 0, timeline), {},
+        L"unknown duration cannot be rendered");
+    expectRect(IntervalTimelineRect({0, 1}, -1, timeline), {},
+        L"negative duration cannot be rendered");
+    expectRect(IntervalTimelineRect({0, 1}, 1, {5, 0, 5, 1}), {},
+        L"zero-width timeline cannot be rendered");
+    expectRect(IntervalTimelineRect({0, 1}, 1, {6, 0, 5, 1}), {},
+        L"reversed-width timeline cannot be rendered");
+    expectRect(IntervalTimelineRect({0, 1}, 1, {0, 5, 10, 5}), {},
+        L"zero-height timeline cannot be rendered");
+    expectRect(IntervalTimelineRect({0, 1}, 1, {0, 6, 10, 5}), {},
+        L"reversed-height timeline cannot be rendered");
+    expectRect(IntervalTimelineRect({1, 2}, 3, {0, 0, 1001, 2}),
+        {333, 0, 668, 2}, L"odd-width fractional mapping uses floor start and ceil end");
+    expectRect(IntervalTimelineRect({1, 2}, 10000, timeline),
+        {100, 7, 101, 13}, L"subpixel interval retains one visible pixel");
+    expectRect(IntervalTimelineRect({9998, 9999}, 10000, timeline),
+        {1099, 7, 1100, 13}, L"subpixel interval at video end stays within timeline");
+    expectRect(IntervalTimelineRect({1000, 2000}, 10000, {4, 8, 5, 9}),
+        {4, 8, 5, 9}, L"one-pixel timeline displays any positive interval");
+    constexpr std::int64_t day = 24LL * 60 * 60 * 1000;
+    expectRect(IntervalTimelineRect({3 * day, 4 * day}, 10 * day, timeline),
+        {400, 7, 500, 13}, L"multiday timeline uses exact millisecond ratios");
+    const std::int64_t maxTime = (std::numeric_limits<std::int64_t>::max)();
+    const LONG maxCoord = (std::numeric_limits<LONG>::max)();
+    const LONG minCoord = (std::numeric_limits<LONG>::min)();
+    const RECT hugeTimeline{0, 0, maxCoord, 1};
+    expectRect(IntervalTimelineRect({maxTime - 1, maxTime}, maxTime, hugeTimeline),
+        {maxCoord - 1, 0, maxCoord, 1},
+        L"INT64 maximum duration maps end subpixel without overflow or rounding");
+    expectRect(IntervalTimelineRect({1, 2}, maxTime, hugeTimeline),
+        {0, 0, 1, 1}, L"INT64 maximum duration maps start subpixel exactly");
+    expectRect(IntervalTimelineRect({0, maxTime}, maxTime, hugeTimeline), hugeTimeline,
+        L"INT64 maximum duration whole interval fills maximum valid width");
+    const RECT negativeTimeline{minCoord, minCoord, -1, maxCoord};
+    expectRect(IntervalTimelineRect({0, maxTime}, maxTime, negativeTimeline), negativeTimeline,
+        L"extreme negative timeline coordinates and height do not overflow");
+    expectRect(IntervalTimelineRect({0, 1}, 1, {minCoord, 0, maxCoord, 1}), {},
+        L"timeline wider than INT_MAX is rejected without subtraction overflow");
+    expectRect(IntervalTimelineRect({(std::numeric_limits<std::int64_t>::min)(), maxTime},
+        maxTime, timeline), timeline, L"extreme signed interval clips without duration subtraction");
+    const std::vector<VideoInterval> extremeSaved{{maxTime - 10, maxTime}};
+    runner.True(IsInsideSavedInterval(maxTime - 1, extremeSaved),
+        L"saved membership handles INT64 maximum end");
+    runner.True(OverlapsSavedInterval({maxTime - 20, maxTime - 1}, extremeSaved),
+        L"saved overlap handles INT64 maximum without subtraction");
+    runner.True(saved.size() == 2 && saved[0].startMs == 1000 &&
+        saved[0].endMs == 2000 && saved[1].startMs == 4000 && saved[1].endMs == 5000,
+        L"interval helpers preserve original saved ranges");
+    expectRect(timeline, {100, 7, 1100, 13}, L"interval mapping preserves supplied timeline");
 }
 
 void TestUtf8(TestRunner& runner)
@@ -2162,13 +2749,67 @@ void TestPreviewMath(TestRunner& runner)
     runner.Equal(PreviewTimestampQuantum(600'000), std::int64_t{5'000}, L"ten-minute video keeps five-second previews");
     runner.Equal(PreviewTimestampQuantum(600'001), std::int64_t{6'000}, L"adaptive quantum rounds up to whole seconds");
     runner.Equal(PreviewTimestampQuantum(2'400'000), std::int64_t{20'000}, L"forty-minute video uses twenty-second previews");
-    runner.Equal(PreviewTimestampQuantum(7'200'000), std::int64_t{30'000}, L"long video quantum is capped at thirty seconds");
+    runner.Equal(PreviewTimestampQuantum(7'200'000), std::int64_t{60'000}, L"two-hour video stays within 120 preview intervals");
     runner.Equal(PreviewTimestampQuantum((std::numeric_limits<std::int64_t>::max)()),
-        std::int64_t{30'000}, L"huge duration quantum does not overflow");
+        std::int64_t{76'861'433'640'457'000}, L"huge duration quantum rounds safely without a short-video cap");
     runner.Equal(QuantizePreviewTimestamp(2'499, 60'000), std::int64_t{0}, L"coarse preview below midpoint");
     runner.Equal(QuantizePreviewTimestamp(2'500, 60'000), std::int64_t{5'000}, L"coarse preview midpoint");
     runner.Equal(QuantizePreviewTimestamp(19'900, 2'400'000), std::int64_t{20'000}, L"long-video bucket used by default");
     runner.Equal(QuantizePreviewTimestamp(61'234, 61'234), std::int64_t{61'234}, L"non-grid media end stays exact");
+    runner.Equal(QuantizePreviewTimestamp(
+        (std::numeric_limits<std::int64_t>::max)() - 1,
+        (std::numeric_limits<std::int64_t>::max)()),
+        (std::numeric_limits<std::int64_t>::max)(),
+        L"rounding the last huge-duration bucket clamps to the endpoint without overflow");
+    runner.True(BuildPreviewWarmupTimestamps(0).empty(), L"zero-duration preview warmup is empty");
+    runner.True(BuildPreviewWarmupTimestamps(-1).empty(), L"negative-duration preview warmup is empty");
+    runner.Equal(BuildPreviewWarmupTimestamps(1),
+        std::vector<std::int64_t>{0, 1}, L"sub-quantum video warms both distinct endpoints");
+    runner.Equal(BuildPreviewWarmupTimestamps(40'000),
+        std::vector<std::int64_t>{0, 40'000, 20'000, 10'000, 30'000, 5'000, 15'000, 25'000, 35'000},
+        L"preview warmup visits endpoints midpoint quarters then smaller gaps");
+    runner.Equal(BuildPreviewWarmupTimestamps(26'000),
+        std::vector<std::int64_t>{0, 26'000, 15'000, 5'000, 20'000, 10'000, 25'000},
+        L"non-grid endpoint and uneven bucket gaps preserve breadth-first warmup order");
+
+    const std::int64_t warmupDurations[]{
+        1, 4'999, 5'000, 5'001, 9'999, 10'000, 61'234,
+        599'999, 600'000, 600'001, 2'400'000, 7'200'000,
+        86'400'000, 604'800'001,
+        (std::numeric_limits<std::int64_t>::max)() - 1,
+        (std::numeric_limits<std::int64_t>::max)()};
+    for (const auto duration : warmupDurations) {
+        const auto quantum = PreviewTimestampQuantum(duration);
+        auto timestamps = BuildPreviewWarmupTimestamps(duration);
+        const std::wstring label = L"preview warmup duration " + std::to_wstring(duration);
+        runner.True(quantum >= kPreviewTimestampQuantumMs && quantum % 1000 == 0,
+            label + L" has a whole-second quantum of at least five seconds");
+        runner.True(timestamps.size() <= static_cast<std::size_t>(kPreviewMaximumIntervals + 1),
+            label + L" fits entirely in the bounded preview cache");
+        runner.True(timestamps.size() >= 2 && timestamps[0] == 0 && timestamps[1] == duration,
+            label + L" warms both endpoints first");
+        std::sort(timestamps.begin(), timestamps.end());
+        runner.True(std::adjacent_find(timestamps.begin(), timestamps.end()) == timestamps.end(),
+            label + L" never requests the same bucket twice");
+        const std::int64_t expectedIntervals = duration / quantum + (duration % quantum != 0 ? 1 : 0);
+        runner.Equal(timestamps.size(), static_cast<std::size_t>(expectedIntervals + 1),
+            label + L" contains every bucket and the exact endpoint");
+        bool complete = !timestamps.empty() && timestamps.back() == duration;
+        for (std::size_t index = 0; index + 1 < timestamps.size(); ++index) {
+            const auto timestamp = timestamps[index];
+            complete = complete && timestamp == static_cast<std::int64_t>(index) * quantum &&
+                timestamp >= 0 && timestamp < duration &&
+                QuantizePreviewTimestamp(timestamp, duration) == timestamp;
+        }
+        runner.True(complete, label + L" covers all regular quantization keys without overflow");
+        bool coversRequests = true;
+        for (std::int64_t sample = 0; sample <= 1000; ++sample) {
+            const auto request = (duration / 1000) * sample + ((duration % 1000) * sample) / 1000;
+            const auto key = QuantizePreviewTimestamp(request, duration);
+            coversRequests = coversRequests && std::binary_search(timestamps.begin(), timestamps.end(), key);
+        }
+        runner.True(coversRequests, label + L" includes every sampled hover request");
+    }
     int coarseBuckets = 0;
     int fineBuckets = 0;
     std::int64_t lastCoarse = -1;
@@ -2831,12 +3472,16 @@ int wmain(const int argc, wchar_t* const* const argv)
     }
 
     TestRunner runner;
+    TestApplicationIconResources(runner);
     TestTimeFormatting(runner);
     TestPlaybackMath(runner);
     TestPlaybackLoop(runner);
     TestVideoExport(runner);
     TestRealVideoExportIntegration(runner);
+    TestRemovalPlans(runner);
+    TestRemovalWithoutReencode(runner);
     TestProgressStrip(runner);
+    TestIntervalTimeline(runner);
     TestUtf8(runner);
     TestMediaOpen(runner);
     TestMediaOpenLaunchIntegration(runner);

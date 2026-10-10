@@ -191,6 +191,7 @@
     <ClCompile Include="ExportJob.cpp" />
     <ClCompile Include="ExportPlanner.cpp" />
     <ClCompile Include="ExportProcess.cpp" />
+    <ClCompile Include="RemoveSegment.cpp" />
     <ClCompile Include="LibVlcRuntime.cpp" />
     <ClCompile Include="MainWindow.cpp" />
     <ClCompile Include="MediaProbe.cpp" />
@@ -217,6 +218,7 @@
     <ClInclude Include="ExportJob.h" />
     <ClInclude Include="ExportPlanner.h" />
     <ClInclude Include="ExportProcess.h" />
+    <ClInclude Include="RemoveSegment.h" />
     <ClInclude Include="ExportTypes.h" />
     <ClInclude Include="LibVlcRuntime.h" />
     <ClInclude Include="MainWindow.h" />
@@ -234,8 +236,10 @@
     <ClInclude Include="PreviewMath.h" />
     <ClInclude Include="PreviewPopup.h" />
     <ClInclude Include="ProgressStrip.h" />
+    <ClInclude Include="IntervalTimeline.h" />
     <ClInclude Include="PrivacyPolicy.h" />
     <ClInclude Include="Resource.h" />
+    <ClInclude Include="AppIcon.h" />
     <ClInclude Include="SelectionOverlay.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="TimeFormatter.h" />
@@ -250,6 +254,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="VideoPlayer.manifest" />
+    <None Include="assets\VideoPlayer.png" />
+    <None Include="assets\VideoPlayer.ico" />
+    <None Include="assets\README.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

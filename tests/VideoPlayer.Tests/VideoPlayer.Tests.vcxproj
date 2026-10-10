@@ -46,7 +46,16 @@
     <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>VideoPlayer.Tests</TargetName>
+    <GenerateManifest>false</GenerateManifest>
   </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir)src\VideoPlayer;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ResourceCompile Include="..\..\src\VideoPlayer\VideoPlayer.rc"><Link>Shared\VideoPlayer.rc</Link></ResourceCompile>
+  </ItemGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32' Or '$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp17</LanguageStandard><ExceptionHandling>Sync</ExceptionHandling>
@@ -74,6 +83,7 @@
     <ClCompile Include="..\..\src\VideoPlayer\ExportJob.cpp"><Link>Shared\ExportJob.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportPlanner.cpp"><Link>Shared\ExportPlanner.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportProcess.cpp"><Link>Shared\ExportProcess.cpp</Link></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\RemoveSegment.cpp"><Link>Shared\RemoveSegment.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\MediaProbe.cpp"><Link>Shared\MediaProbe.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\MediaOpen.cpp"><Link>Shared\MediaOpen.cpp</Link></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Link>Shared\PathUtils.cpp</Link></ClCompile>
@@ -94,6 +104,7 @@
     <ClInclude Include="..\..\src\VideoPlayer\ExportJob.h"><Link>Shared\ExportJob.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ExportPlanner.h"><Link>Shared\ExportPlanner.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ExportProcess.h"><Link>Shared\ExportProcess.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\RemoveSegment.h"><Link>Shared\RemoveSegment.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ExportTypes.h"><Link>Shared\ExportTypes.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\MediaProbe.h"><Link>Shared\MediaProbe.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\MediaOpen.h"><Link>Shared\MediaOpen.h</Link></ClInclude>
@@ -103,6 +114,7 @@
     <ClInclude Include="..\..\src\VideoPlayer\PreviewFrame.h"><Link>Shared\PreviewFrame.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PreviewMath.h"><Link>Shared\PreviewMath.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ProgressStrip.h"><Link>Shared\ProgressStrip.h</Link></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\IntervalTimeline.h"><Link>Shared\IntervalTimeline.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PrivacyPolicy.h"><Link>Shared\PrivacyPolicy.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\TimeFormatter.h"><Link>Shared\TimeFormatter.h</Link></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ToolbarVisibility.h"><Link>Shared\ToolbarVisibility.h</Link></ClInclude>

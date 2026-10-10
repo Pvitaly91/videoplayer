@@ -5,12 +5,16 @@
     <Filter Include="Shared"><UniqueIdentifier>{83FE8B65-63AC-44DB-A785-88466C7B6756}</UniqueIdentifier></Filter>
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="..\..\src\VideoPlayer\VideoPlayer.rc"><Filter>Shared</Filter></ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
     <ClCompile Include="Tests.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportDialog.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportGeometry.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportJob.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportPlanner.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\ExportProcess.cpp"><Filter>Shared</Filter></ClCompile>
+    <ClCompile Include="..\..\src\VideoPlayer\RemoveSegment.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\MediaProbe.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\MediaOpen.cpp"><Filter>Shared</Filter></ClCompile>
     <ClCompile Include="..\..\src\VideoPlayer\PathUtils.cpp"><Filter>Shared</Filter></ClCompile>
@@ -31,6 +35,7 @@
     <ClInclude Include="..\..\src\VideoPlayer\ExportJob.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ExportPlanner.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ExportProcess.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\RemoveSegment.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ExportTypes.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\MediaProbe.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\MediaOpen.h"><Filter>Shared</Filter></ClInclude>
@@ -40,6 +45,7 @@
     <ClInclude Include="..\..\src\VideoPlayer\PreviewFrame.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PreviewMath.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ProgressStrip.h"><Filter>Shared</Filter></ClInclude>
+    <ClInclude Include="..\..\src\VideoPlayer\IntervalTimeline.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\PrivacyPolicy.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\TimeFormatter.h"><Filter>Shared</Filter></ClInclude>
     <ClInclude Include="..\..\src\VideoPlayer\ToolbarVisibility.h"><Filter>Shared</Filter></ClInclude>

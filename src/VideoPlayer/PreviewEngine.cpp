@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <malloc.h>
 #include <memory>
@@ -30,6 +31,7 @@ constexpr std::size_t kPreviewBufferCount = 3;
 constexpr std::size_t kPreviewBufferAlignment = 32;
 constexpr auto kDecodeThrottle = std::chrono::milliseconds(120);
 constexpr auto kHoverSettleDelay = std::chrono::milliseconds(100);
+constexpr auto kWarmupStartDelay = std::chrono::milliseconds(400);
 constexpr auto kFrameWaitTimeout = std::chrono::milliseconds(3000);
 constexpr auto kCancellationPollInterval = std::chrono::milliseconds(40);
 constexpr auto kRetryBackoff = std::chrono::milliseconds(80);
@@ -1091,11 +1093,13 @@ public:
             for (;;) {
                 DecodeRequest request;
                 bool releaseOnly = false;
+                bool warmOnly = false;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     condition.wait(lock, [this] {
                         return stopping.load(std::memory_order_acquire) ||
-                            pending.has_value() || mediaResetRequested;
+                            pending.has_value() || mediaResetRequested ||
+                            (prefetchEnabled && !warmTimestamps.empty());
                     });
                     if (stopping.load(std::memory_order_acquire)) {
                         break;
@@ -1103,7 +1107,7 @@ public:
                     if (mediaResetRequested) {
                         mediaResetRequested = false;
                         releaseOnly = true;
-                    } else {
+                    } else if (pending.has_value()) {
                         // Only decode a new bucket after a brief hover settle.
                         // Replacement requests wake this loop and move its
                         // deadline; duplicates in the same bucket do neither.
@@ -1129,12 +1133,33 @@ public:
                             : PreviewWorkerState::Recovering;
                         nextDecodeAllowed =
                             std::chrono::steady_clock::now() + kDecodeThrottle;
+                    } else {
+                        if (std::chrono::steady_clock::now() < warmNotBefore) {
+                            condition.wait_until(lock, warmNotBefore);
+                            continue;
+                        }
+                        const auto generation = activeMediaGeneration.load(std::memory_order_acquire);
+                        while (!warmTimestamps.empty() && cache.Find(generation, warmTimestamps.front())) {
+                            warmTimestamps.pop_front();
+                        }
+                        if (!prefetchEnabled || warmTimestamps.empty()) {
+                            continue;
+                        }
+                        request = DecodeRequest{mediaPath, generation,
+                            latestRequestId.load(std::memory_order_acquire),
+                            prefetchEpoch.load(std::memory_order_acquire),
+                            warmTimestamps.front(), warmDurationMs};
+                        warmOnly = true;
                     }
                 }
                 if (releaseOnly) {
                     if (backend) {
                         backend->ReleaseMedia();
                     }
+                    continue;
+                }
+                if (warmOnly) {
+                    WarmFrame(request, backend);
                     continue;
                 }
 
@@ -1247,14 +1272,111 @@ public:
         condition.notify_all();
     }
 
+    void WarmFrame(const DecodeRequest& request,
+        std::unique_ptr<PreviewBackend>& backend) noexcept {
+        const PreviewCancellation cancellation{
+            stopping, prefetchEpoch, activeMediaGeneration, latestRequestId};
+        DecodeStatus status = DecodeStatus::Cancelled;
+        PreviewFramePtr frame;
+        try {
+            if (!cancellation.IsCancelled(request)) {
+                if (!backend) {
+                    backend = backendFactory ? backendFactory()
+                        : std::make_unique<WorkerResources>(videoWakeRelay);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!stopping.load(std::memory_order_acquire)) {
+                        workerState = PreviewWorkerState::Running;
+                    }
+                }
+                status = backend ? backend->Decode(request, cancellation, frame)
+                    : DecodeStatus::RuntimeFailure;
+            }
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                // On preemption leave this bucket queued for idle time. Never
+                // publish speculative pixels as a foreground request result.
+                if (prefetchEnabled && !cancellation.IsCancelled(request) &&
+                    request.durationMs == warmDurationMs && !warmTimestamps.empty() &&
+                    warmTimestamps.front() == request.timestampMs) {
+                    warmTimestamps.pop_front();
+                    if (status == DecodeStatus::Ready && frame && frame->IsValid() &&
+                        frame->mediaGeneration == request.mediaGeneration &&
+                        frame->timestampMs == request.timestampMs) {
+                        cache.Put(std::move(frame));
+                        cached = true;
+                    } else if (status == DecodeStatus::RuntimeFailure ||
+                               status == DecodeStatus::UnsupportedMedia) {
+                        // Do not retry a broken backend across the whole file,
+                        // or negatively cache speculative failures for hover.
+                        warmTimestamps.clear();
+                    }
+                }
+                warmNotBefore = std::chrono::steady_clock::now() + kDecodeThrottle;
+            }
+            if (status == DecodeStatus::RuntimeFailure) {
+                backend.reset();
+            } else if (backend) {
+                backend->ReleaseMedia();
+            }
+            if (cached) {
+                Notify();
+            }
+        } catch (...) {
+            backend.reset();
+            // A failed speculative allocation must not poison hover state or
+            // spin indefinitely when the periodic UI asks to warm again.
+            std::lock_guard<std::mutex> lock(mutex);
+            if (request.durationMs == warmDurationMs &&
+                activeMediaGeneration.load(std::memory_order_acquire) == request.mediaGeneration &&
+                prefetchEpoch.load(std::memory_order_acquire) == request.cancelEpoch) {
+                warmTimestamps.clear();
+            }
+        }
+    }
+
+    // Caller serializes with shutdownMutex and mutex. Only exited workers are
+    // joined, so this never waits for decoder cleanup on the UI thread.
+    bool StartWorkerLocked() noexcept {
+        if (workerExiting && !workerExited) {
+            return false;
+        }
+        if (workerExited) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+            try {
+                workerExited = false;
+                workerExiting = false;
+                workerState = PreviewWorkerState::Recovering;
+                worker = std::thread([this] { WorkerMain(); });
+#if defined(VIDEOPLAYER_TESTING)
+                ++workerLaunchCountForTesting;
+#endif
+            } catch (...) {
+                workerExited = true;
+                workerState = PreviewWorkerState::Faulted;
+                return false;
+            }
+        } else if (workerState == PreviewWorkerState::Faulted) {
+            workerState = PreviewWorkerState::Recovering;
+        }
+        return true;
+    }
+
     mutable std::mutex mutex;
     std::mutex shutdownMutex;
     std::condition_variable condition;
     PreviewContextWakeRelay videoWakeRelay;
-    PreviewCache cache{24};
+    PreviewCache cache{128};
     PreviewBackendFactory backendFactory;
     std::thread worker;
     std::optional<DecodeRequest> pending;
+    std::deque<std::int64_t> warmTimestamps;
+    std::int64_t warmDurationMs = 0;
+    std::chrono::steady_clock::time_point warmNotBefore{};
     std::optional<PreviewResult> readyResult;
     std::optional<std::uint32_t> unsupportedGeneration;
     std::wstring mediaPath;
@@ -1332,6 +1454,9 @@ void PreviewEngine::SetMedia(
             impl_->readyResult.reset();
             impl_->requestState = PreviewRequestState::Idle;
             impl_->unsupportedGeneration.reset();
+            impl_->warmTimestamps.clear();
+            impl_->warmDurationMs = 0;
+            impl_->prefetchEpoch.fetch_add(1, std::memory_order_acq_rel);
             impl_->mediaResetRequested = true;
             impl_->cache.ClearForMedia(mediaGeneration);
         }
@@ -1346,6 +1471,9 @@ void PreviewEngine::SetMedia(
             {
                 std::lock_guard<std::mutex> lock(impl_->mutex);
                 impl_->mediaPath.clear();
+                impl_->warmTimestamps.clear();
+                impl_->warmDurationMs = 0;
+                impl_->prefetchEpoch.fetch_add(1, std::memory_order_acq_rel);
                 impl_->activeMediaGeneration.store(mediaGeneration, std::memory_order_release);
                 impl_->cancelEpoch.fetch_add(1, std::memory_order_acq_rel);
                 impl_->latestRequestId.store(++impl_->nextRequestId, std::memory_order_release);
@@ -1430,30 +1558,9 @@ std::uint64_t PreviewEngine::RequestFrame(
             }
             impl_->pending = request;
             impl_->pendingNotBefore = std::chrono::steady_clock::now() + kHoverSettleDelay;
-            if (impl_->workerExited) {
-                // Set only after backend/callback destruction; this join
-                // cannot wait for a decoder or for its cleanup.
-                if (impl_->worker.joinable()) {
-                    impl_->worker.join();
-                }
-                try {
-                    impl_->workerExited = false;
-                    impl_->workerExiting = false;
-                    impl_->workerState = PreviewWorkerState::Recovering;
-                    impl_->worker = std::thread([implementation = impl_.get()] {
-                        implementation->WorkerMain();
-                    });
-#if defined(VIDEOPLAYER_TESTING)
-                    ++impl_->workerLaunchCountForTesting;
-#endif
-                } catch (...) {
-                    impl_->workerExited = true;
-                    impl_->workerState = PreviewWorkerState::Faulted;
-                    impl_->pending.reset();
-                    impl_->requestState = PreviewRequestState::RuntimeFailure;
-                }
-            } else if (impl_->workerState == PreviewWorkerState::Faulted) {
-                impl_->workerState = PreviewWorkerState::Recovering;
+            if (!impl_->StartWorkerLocked()) {
+                impl_->pending.reset();
+                impl_->requestState = PreviewRequestState::RuntimeFailure;
             }
         }
         impl_->condition.notify_all();
@@ -1492,6 +1599,35 @@ void PreviewEngine::SetPrefetchEnabled(const bool enabled) noexcept {
         impl_->condition.notify_all();
         impl_->videoWakeRelay.Wake();
     } catch (...) {
+    }
+}
+
+void PreviewEngine::WarmMedia(const std::int64_t durationMs) noexcept {
+    try {
+        std::lock_guard<std::mutex> shutdownLock(impl_->shutdownMutex);
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            if (!impl_->initialized || !impl_->accepting || !impl_->prefetchEnabled ||
+                impl_->mediaPath.empty() || durationMs <= 0 ||
+                impl_->unsupportedGeneration == impl_->activeMediaGeneration.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (durationMs != impl_->warmDurationMs) {
+                const auto timestamps = BuildPreviewWarmupTimestamps(durationMs);
+                std::deque<std::int64_t> queued(timestamps.begin(), timestamps.end());
+                impl_->warmTimestamps.swap(queued);
+                impl_->warmDurationMs = durationMs;
+                impl_->prefetchEpoch.fetch_add(1, std::memory_order_acq_rel);
+                impl_->warmNotBefore = std::chrono::steady_clock::now() + kWarmupStartDelay;
+            }
+            if (impl_->warmTimestamps.empty() || !impl_->StartWorkerLocked()) {
+                return;
+            }
+        }
+        impl_->condition.notify_all();
+        impl_->videoWakeRelay.Wake();
+    } catch (...) {
+        // Warming is best effort and never changes foreground request state.
     }
 }
 
@@ -1597,6 +1733,8 @@ void PreviewEngine::Shutdown() noexcept {
         impl_->readyResult.reset();
         impl_->requestState = PreviewRequestState::Cancelled;
         impl_->workerState = PreviewWorkerState::Stopping;
+        impl_->warmTimestamps.clear();
+        impl_->warmDurationMs = 0;
         impl_->mediaResetRequested = false;
         impl_->notificationWindow = nullptr;
     }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 namespace videoplayer {
 namespace {
@@ -16,14 +17,45 @@ LONG ClampLongLong(const long long value, const LONG minimum, const LONG maximum
 }  // namespace
 
 std::int64_t PreviewTimestampQuantum(const std::int64_t durationMs) noexcept {
-    constexpr std::int64_t intervals = 120;
-    constexpr std::int64_t maximumQuantum = 30'000;
-    // Clamp before adding/rounding, including int64-max durations.
-    const std::int64_t bounded = std::clamp(
-        durationMs, std::int64_t{0}, maximumQuantum * intervals);
-    const std::int64_t interval = (bounded + intervals - 1) / intervals;
-    return std::clamp(((interval + 999) / 1000) * 1000,
-        kPreviewTimestampQuantumMs, maximumQuantum);
+    if (durationMs <= 0) {
+        return kPreviewTimestampQuantumMs;
+    }
+    // Divide before rounding so even int64-max durations remain representable.
+    const std::int64_t interval = durationMs / kPreviewMaximumIntervals +
+        (durationMs % kPreviewMaximumIntervals != 0 ? 1 : 0);
+    const std::int64_t seconds = interval / 1000 + (interval % 1000 != 0 ? 1 : 0);
+    return (std::max)(kPreviewTimestampQuantumMs, seconds * 1000);
+}
+
+std::vector<std::int64_t> BuildPreviewWarmupTimestamps(const std::int64_t durationMs) {
+    if (durationMs <= 0) {
+        return {};
+    }
+
+    const std::int64_t quantum = PreviewTimestampQuantum(durationMs);
+    const std::int64_t lastBucket = durationMs / quantum +
+        (durationMs % quantum != 0 ? 1 : 0);
+    std::vector<std::int64_t> timestamps;
+    timestamps.reserve(static_cast<std::size_t>(lastBucket + 1));
+    timestamps.push_back(0);
+    timestamps.push_back(durationMs);
+
+    // Each gap is expressed in bucket indices, not milliseconds. The final
+    // bucket may be shorter, and always represents the exact media endpoint.
+    std::vector<std::pair<std::int64_t, std::int64_t>> gaps;
+    gaps.reserve(static_cast<std::size_t>(lastBucket));
+    gaps.emplace_back(0, lastBucket);
+    for (std::size_t next = 0; next < gaps.size(); ++next) {
+        const auto [left, right] = gaps[next];
+        if (right - left <= 1) {
+            continue;
+        }
+        const std::int64_t middle = left + (right - left) / 2;
+        timestamps.push_back(middle * quantum);
+        if (middle - left > 1) gaps.emplace_back(left, middle);
+        if (right - middle > 1) gaps.emplace_back(middle, right);
+    }
+    return timestamps;
 }
 
 std::int64_t QuantizePreviewTimestamp(
@@ -51,9 +83,8 @@ std::int64_t QuantizePreviewTimestamp(
     std::int64_t quantized = quotient * quantumMs;
     const std::int64_t roundingThreshold =
         (quantumMs / 2) + (quantumMs % 2);
-    if (remainder >= roundingThreshold &&
-        quantized <= (std::numeric_limits<std::int64_t>::max)() - quantumMs) {
-        quantized += quantumMs;
+    if (remainder >= roundingThreshold) {
+        quantized += (std::min)(quantumMs, durationMs - quantized);
     }
     return (std::min)(quantized, durationMs);
 }

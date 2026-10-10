@@ -21,6 +21,7 @@
     <ClCompile Include="ExportJob.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="ExportPlanner.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="ExportProcess.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="RemoveSegment.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="LibVlcRuntime.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="MainWindow.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="MediaProbe.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -47,6 +48,7 @@
     <ClInclude Include="ExportJob.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ExportPlanner.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ExportProcess.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="RemoveSegment.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ExportTypes.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LibVlcRuntime.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="MainWindow.h"><Filter>Header Files</Filter></ClInclude>
@@ -62,8 +64,10 @@
     <ClInclude Include="PreviewMath.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PreviewPopup.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ProgressStrip.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="IntervalTimeline.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PrivacyPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Resource.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="AppIcon.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="SelectionOverlay.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="targetver.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="TimeFormatter.h"><Filter>Header Files</Filter></ClInclude>
@@ -78,6 +82,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="VideoPlayer.manifest"><Filter>Resource Files</Filter></None>
+    <None Include="assets\VideoPlayer.png"><Filter>Resource Files</Filter></None>
+    <None Include="assets\VideoPlayer.ico"><Filter>Resource Files</Filter></None>
+    <None Include="assets\README.md"><Filter>Resource Files</Filter></None>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PlaybackSnapshot.h"><Filter>Header Files</Filter></ClInclude>

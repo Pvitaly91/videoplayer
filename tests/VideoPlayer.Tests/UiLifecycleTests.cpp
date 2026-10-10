@@ -1,4 +1,5 @@
 #include "../../src/VideoPlayer/MainWindow.h"
+#include "../../src/VideoPlayer/ExportDialog.h"
 #include "../../src/VideoPlayer/PreviewMath.h"
 #include "../../src/VideoPlayer/ProgressStrip.h"
 #include "../../src/VideoPlayer/Resource.h"
@@ -139,8 +140,9 @@ struct MainWindowTestAccess final {
         }
     }
 
-    static std::array<HWND, 18> Controls(const MainWindow& window) {
+    static std::array<HWND, 21> Controls(const MainWindow& window) {
         return {window.openButton_, window.playButton_, window.stopButton_, window.exportButton_,
+            window.removeSegmentButton_, window.addRemovalButton_, window.removalCountLabel_,
             window.seekSlider_, window.currentTimeLabel_, window.durationLabel_,
             window.muteButton_, window.volumeSlider_, window.zoomButton_,
             window.fullscreenButton_, window.hideToolbarButton_,
@@ -176,6 +178,44 @@ struct MainWindowTestAccess final {
             return nullptr;
         }
         return ::SetParent(child, parent);
+    }
+
+    static bool IconDimensions(const HICON icon, const int width, const int height) {
+        ICONINFO info{};
+        if (!icon || !GetIconInfo(icon, &info)) return false;
+        BITMAP color{};
+        const bool matches = info.fIcon && info.hbmColor &&
+            GetObjectW(info.hbmColor, sizeof(color), &color) == static_cast<int>(sizeof(color)) &&
+            color.bmWidth == width && color.bmHeight == height;
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+        return matches;
+    }
+
+    static void ApplicationIcon(Checks& checks) {
+        Fixture fixture;
+        checks.Expect(fixture.Create(), L"create production icon HWND fixture");
+        const auto& window = fixture.window;
+        if (!window.window_) return;
+        const HICON large = reinterpret_cast<HICON>(GetClassLongPtrW(window.window_, GCLP_HICON));
+        const HICON small = reinterpret_cast<HICON>(GetClassLongPtrW(window.window_, GCLP_HICONSM));
+        const HICON expectedLarge = static_cast<HICON>(LoadImageW(window.instance_,
+            MAKEINTRESOURCEW(IDI_VIDEOPLAYER), IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR | LR_SHARED));
+        const HICON expectedSmall = static_cast<HICON>(LoadImageW(window.instance_,
+            MAKEINTRESOURCEW(IDI_VIDEOPLAYER), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR | LR_SHARED));
+        checks.Expect(large && large == expectedLarge,
+            L"main window class uses the embedded shared large application icon");
+        checks.Expect(small && small == expectedSmall,
+            L"main window class uses the embedded shared small application icon");
+        checks.Expect(large != LoadIconW(nullptr, IDI_APPLICATION) &&
+            small != LoadIconW(nullptr, IDI_APPLICATION),
+            L"main window does not use the generic Windows application icon");
+        checks.Expect(IconDimensions(large, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)),
+            L"main window large icon follows the system icon dimensions");
+        checks.Expect(IconDimensions(small, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)),
+            L"main window small icon follows the system small-icon dimensions");
     }
 
     static void Ownership(Checks& checks) {
@@ -620,6 +660,22 @@ struct MainWindowTestAccess final {
         window.ExitFullscreen();
         checks.Expect(!window.fullscreen_ && AllParents(window, window.controlBar_),
             L"next transition recovers after one reparent failure");
+        window.setParent_ = FailOneReparent;
+        reparentCalls = 0;
+        failReparentCall = static_cast<int>(Controls(window).size());
+        window.EnterFullscreen();
+        checks.Expect(!window.fullscreen_ && AllParents(window, window.controlBar_),
+            L"late entry failure also rolls back multi-cut controls and count label");
+        window.setParent_ = ::SetParent;
+        window.EnterFullscreen();
+        window.setParent_ = FailOneReparent;
+        reparentCalls = 0;
+        failReparentCall = static_cast<int>(Controls(window).size());
+        window.ExitFullscreen();
+        checks.Expect(window.fullscreen_ && AllParents(window, window.fullscreenControlBar_),
+            L"late exit failure keeps multi-cut controls and count label in fullscreen host");
+        window.setParent_ = ::SetParent;
+        window.ExitFullscreen();
     }
 
     static void ZoomAndEscape(Checks& checks) {
@@ -921,6 +977,452 @@ struct MainWindowTestAccess final {
             SendMessageW(other.seekSlider_, TBM_GETSELSTART, 0, 0) == -1 &&
             SendMessageW(other.seekSlider_, TBM_GETSELEND, 0, 0) == -1,
             L"new media generation clears loop mode, endpoints and selected range");
+    }
+
+    static void RemovalIntervalControls(Checks& checks) {
+        Fixture fixture;
+        Fixture independent;
+        checks.Expect(fixture.Create() && independent.Create(),
+            L"create multi-cut and independent control fixtures");
+        auto& window = fixture.window;
+        auto& other = independent.window;
+        if (window.window_ == nullptr || other.window_ == nullptr) return;
+
+        const auto click = [](const HWND button) {
+            SendMessageW(button, BM_CLICK, 0, 0);
+        };
+        const auto select = [&](const std::int64_t start, const std::int64_t end) {
+            fixture.backend.positionMs = start;
+            window.RefreshControls();
+            click(window.loopStartButton_);
+            fixture.backend.positionMs = end;
+            window.RefreshControls();
+            click(window.loopEndButton_);
+            window.RefreshControls();
+        };
+        const auto intervalIs = [&](const std::size_t index,
+                                   const std::int64_t start,
+                                   const std::int64_t end) {
+            return index < window.removalIntervals_.size() &&
+                window.removalIntervals_[index].startMs == start &&
+                window.removalIntervals_[index].endMs == end;
+        };
+        const std::wstring emptyCount = ControlText(window.removalCountLabel_);
+        checks.Expect(GetDlgCtrlID(window.addRemovalButton_) == IDC_ADD_REMOVAL_BUTTON &&
+            GetDlgCtrlID(window.removalCountLabel_) == IDC_REMOVAL_COUNT_LABEL &&
+            (GetWindowLongPtrW(window.addRemovalButton_, GWL_STYLE) & WS_TABSTOP) != 0 &&
+            !emptyCount.empty() && window.removalIntervals_.empty() &&
+            IsWindowEnabled(window.addRemovalButton_) == FALSE &&
+            IsWindowEnabled(window.removeSegmentButton_) == FALSE,
+            L"multi-cut controls have distinct IDs and require a valid initial selection");
+
+        select(8000, 10000);
+        checks.Expect(IsWindowEnabled(window.addRemovalButton_) != FALSE &&
+            IsWindowEnabled(window.removeSegmentButton_) != FALSE,
+            L"completed A-B enables adding and one-shot removal");
+        const auto generation = window.player_.Generation();
+        const int seeksBeforeAdd = fixture.backend.seekCalls;
+        click(window.addRemovalButton_);
+        checks.Expect(window.removalIntervals_.size() == 1 && intervalIs(0, 8000, 10000) &&
+            window.playbackLoop_.StartMs() == -1 && window.playbackLoop_.EndMs() == -1 &&
+            window.playbackLoop_.Mode() == LoopMode::Off &&
+            IsWindowEnabled(window.addRemovalButton_) == FALSE &&
+            IsWindowEnabled(window.removeSegmentButton_) != FALSE &&
+            SendMessageW(window.seekSlider_, TBM_GETSELSTART, 0, 0) == -1 &&
+            SendMessageW(window.seekSlider_, TBM_GETSELEND, 0, 0) == -1 &&
+            fixture.backend.seekCalls == seeksBeforeAdd &&
+            window.player_.Generation() == generation,
+            L"actual Add queues A-B and clears looping/range without seek or media replacement");
+        checks.Expect(ControlText(window.removalCountLabel_) != emptyCount &&
+            ControlText(window.removalCountLabel_).find(L"1") != std::wstring::npos,
+            L"queued interval updates the accessible count label");
+
+        fixture.backend.positionMs = 15000;
+        const int unrestrictedSeeks = fixture.backend.seekCalls;
+        window.RefreshControls();
+        checks.Expect(fixture.backend.positionMs == 15000 &&
+            fixture.backend.seekCalls == unrestrictedSeeks,
+            L"queued cut does not constrain playback while selecting the next interval");
+        select(2000, 4000);
+        click(window.addRemovalButton_);
+        checks.Expect(window.removalIntervals_.size() == 2 && intervalIs(0, 2000, 4000) &&
+            intervalIs(1, 8000, 10000) &&
+            ControlText(window.removalCountLabel_).find(L"2") != std::wstring::npos,
+            L"out-of-order selections are retained in timeline order with updated count");
+        select(8000, 10000);
+        window.AddRemovalInterval();
+        checks.Expect(window.removalIntervals_.size() == 2 && intervalIs(0, 2000, 4000) &&
+            intervalIs(1, 8000, 10000) && window.playbackLoop_.StartMs() == 8000 &&
+            window.playbackLoop_.EndMs() == -1 &&
+            IsWindowEnabled(window.addRemovalButton_) == FALSE,
+            L"saved-boundary A is allowed but duplicate B is rejected without changing queued cuts");
+
+        select(12000, 14000);
+        click(window.loopClearButton_);
+        checks.Expect(window.removalIntervals_.size() == 2 && intervalIs(0, 2000, 4000) &&
+            intervalIs(1, 8000, 10000) && window.playbackLoop_.StartMs() == -1 &&
+            window.playbackLoop_.EndMs() == -1 &&
+            IsWindowEnabled(window.removeSegmentButton_) != FALSE,
+            L"Clear A-B cancels only the current markers and preserves queued deletion cuts");
+        window.AddRemovalInterval();
+        checks.Expect(window.removalIntervals_.size() == 2 &&
+            other.removalIntervals_.empty() &&
+            ControlText(other.removalCountLabel_) == emptyCount &&
+            IsWindowEnabled(other.removeSegmentButton_) == FALSE,
+            L"no-selection Add is harmless and queued cuts stay local to their player instance");
+
+        select(12000, 14000);
+        const bool activeDialogSet = SetPropW(window.window_,
+            L"VideoPlayer.ActiveExportDialog", reinterpret_cast<HANDLE>(window.window_)) != FALSE;
+        window.RefreshControls();
+        window.AddRemovalInterval();
+        const bool editingBlocked = activeDialogSet &&
+            window.removalIntervals_.size() == 2 && intervalIs(0, 2000, 4000) &&
+            intervalIs(1, 8000, 10000) && window.playbackLoop_.StartMs() == 12000 &&
+            window.playbackLoop_.EndMs() == 14000 &&
+            IsWindowEnabled(window.addRemovalButton_) == FALSE &&
+            IsWindowEnabled(window.removeSegmentButton_) == FALSE;
+        RemovePropW(window.window_, L"VideoPlayer.ActiveExportDialog");
+        window.RefreshControls();
+        checks.Expect(editingBlocked && IsWindowEnabled(window.addRemovalButton_) != FALSE &&
+            IsWindowEnabled(window.removeSegmentButton_) != FALSE,
+            L"active export dialog blocks queued-cut edits and restores actions after dismissal");
+        click(window.loopClearButton_);
+
+        window.EnterFullscreen();
+        const bool fullscreenQueue = window.fullscreen_ &&
+            AllParents(window, window.fullscreenControlBar_) &&
+            window.removalIntervals_.size() == 2 && intervalIs(0, 2000, 4000) &&
+            intervalIs(1, 8000, 10000);
+        window.ExitFullscreen();
+        checks.Expect(fullscreenQueue && !window.fullscreen_ &&
+            AllParents(window, window.controlBar_) && window.removalIntervals_.size() == 2 &&
+            IsWindowEnabled(window.removeSegmentButton_) != FALSE,
+            L"fullscreen roundtrip reparents all cut controls while preserving queued intervals");
+
+        window.hasMedia_ = false;
+        window.ResetMediaUiState();
+        window.RefreshControls();
+        window.AddRemovalInterval();
+        checks.Expect(window.removalIntervals_.empty() &&
+            ControlText(window.removalCountLabel_) == emptyCount &&
+            IsWindowEnabled(window.addRemovalButton_) == FALSE &&
+            IsWindowEnabled(window.removeSegmentButton_) == FALSE,
+            L"new-media reset clears queued cuts/count and no-media Add cannot recreate them");
+    }
+
+    static void RemovalOverlapGuards(Checks& checks) {
+        Fixture fixture;
+        Fixture independent;
+        fixture.backend.backendState = independent.backend.backendState = 4; // paused
+        checks.Expect(fixture.Create() && independent.Create(),
+            L"create saved-interval overlap fixtures");
+        auto& window = fixture.window;
+        auto& other = independent.window;
+        if (window.window_ == nullptr || other.window_ == nullptr) return;
+        window.removalIntervals_ = {{8000, 10000}};
+        window.RefreshControls();
+        const auto click = [](const HWND button) {
+            SendMessageW(button, BM_CLICK, 0, 0);
+        };
+        const auto select = [&](const std::int64_t start, const std::int64_t end) {
+            fixture.backend.positionMs = start;
+            window.RefreshControls();
+            click(window.loopStartButton_);
+            fixture.backend.positionMs = end;
+            window.RefreshControls();
+            click(window.loopEndButton_);
+            window.RefreshControls();
+        };
+        select(2000, 4000);
+        const int seeksBeforeRejections = fixture.backend.seekCalls;
+        const auto originalSelectionPreserved = [&] {
+            return window.playbackLoop_.StartMs() == 2000 &&
+                window.playbackLoop_.EndMs() == 4000 &&
+                window.playbackLoop_.Mode() == LoopMode::Segment &&
+                fixture.backend.seekCalls == seeksBeforeRejections &&
+                SendMessageW(window.seekSlider_, TBM_GETSELSTART, 0, 0) ==
+                    MainWindow::TimeToSlider(2000, fixture.backend.durationMs) &&
+                SendMessageW(window.seekSlider_, TBM_GETSELEND, 0, 0) ==
+                    MainWindow::TimeToSlider(4000, fixture.backend.durationMs);
+        };
+        fixture.backend.positionMs = 9000;
+        window.RefreshControls();
+        const bool aDisabled = IsWindowEnabled(window.loopStartButton_) == FALSE;
+        click(window.loopStartButton_);
+        const bool aButtonPreserved = originalSelectionPreserved();
+        const bool aKeyHandled = window.HandleHotKey(VK_OEM_4, false, false);
+        const bool aKeyPreserved = originalSelectionPreserved();
+        window.SetLoopPoint(true);
+        checks.Expect(aDisabled && aButtonPreserved && aKeyHandled && aKeyPreserved &&
+            originalSelectionPreserved(),
+            L"saved-interior A is blocked by HWND button, keyboard and direct setter without mutation");
+        const bool bDisabled = IsWindowEnabled(window.loopEndButton_) == FALSE;
+        click(window.loopEndButton_);
+        const bool bButtonPreserved = originalSelectionPreserved();
+        const bool bKeyHandled = window.HandleHotKey(VK_OEM_6, false, false);
+        const bool bKeyPreserved = originalSelectionPreserved();
+        window.SetLoopPoint(false);
+        checks.Expect(bDisabled && bButtonPreserved && bKeyHandled && bKeyPreserved &&
+            originalSelectionPreserved(),
+            L"saved-interior B preserves the existing A-B, loop mode and selected slider range");
+
+        select(6000, 8000);
+        const bool leftAdjacent = window.playbackLoop_.StartMs() == 6000 &&
+            window.playbackLoop_.EndMs() == 8000 &&
+            IsWindowEnabled(window.addRemovalButton_) != FALSE;
+        click(window.addRemovalButton_);
+        select(10000, 12000);
+        const bool rightAdjacent = window.playbackLoop_.StartMs() == 10000 &&
+            window.playbackLoop_.EndMs() == 12000 &&
+            IsWindowEnabled(window.addRemovalButton_) != FALSE;
+        click(window.addRemovalButton_);
+        checks.Expect(leftAdjacent && rightAdjacent && window.removalIntervals_.size() == 3 &&
+            window.removalIntervals_[0].startMs == 6000 &&
+            window.removalIntervals_[0].endMs == 8000 &&
+            window.removalIntervals_[1].startMs == 8000 &&
+            window.removalIntervals_[1].endMs == 10000 &&
+            window.removalIntervals_[2].startMs == 10000 &&
+            window.removalIntervals_[2].endMs == 12000,
+            L"touching endpoints permit adjacent A-B selections and preserve all three queued cuts");
+
+        window.removalIntervals_ = {{8000, 10000}};
+        fixture.backend.positionMs = 6000;
+        window.RefreshControls();
+        click(window.loopStartButton_);
+        fixture.backend.positionMs = 12000;
+        window.RefreshControls();
+        const bool crossingBDisabled = IsWindowEnabled(window.loopEndButton_) == FALSE;
+        click(window.loopEndButton_);
+        const bool crossingKeyHandled = window.HandleHotKey(VK_OEM_6, false, false);
+        window.SetLoopPoint(false);
+        checks.Expect(crossingBDisabled && crossingKeyHandled &&
+            window.playbackLoop_.StartMs() == 6000 && window.playbackLoop_.EndMs() == -1 &&
+            window.playbackLoop_.Mode() == LoopMode::Off,
+            L"B outside saved cuts still rejects a candidate spanning a saved interval");
+
+        const std::array<VideoInterval, 5> conflictingCandidates{{
+            {6000, 9000}, {9000, 12000}, {6000, 12000},
+            {8500, 9500}, {8000, 10000}}};
+        bool defensiveGuards = true;
+        for (const auto& candidate : conflictingCandidates) {
+            window.playbackLoop_.SetStart(candidate.startMs, fixture.backend.durationMs);
+            window.playbackLoop_.SetEnd(candidate.endMs, fixture.backend.durationMs);
+            window.RefreshControls();
+            defensiveGuards = defensiveGuards &&
+                IsWindowEnabled(window.addRemovalButton_) == FALSE &&
+                IsWindowEnabled(window.removeSegmentButton_) == FALSE;
+            window.AddRemovalInterval();
+            window.ShowRemoveSegmentVideoDialog();
+            defensiveGuards = defensiveGuards &&
+                window.playbackLoop_.StartMs() == candidate.startMs &&
+                window.playbackLoop_.EndMs() == candidate.endMs &&
+                window.playbackLoop_.Mode() == LoopMode::Segment &&
+                window.removalIntervals_.size() == 1 &&
+                window.removalIntervals_[0].startMs == 8000 &&
+                window.removalIntervals_[0].endMs == 10000 &&
+                !HasActiveExportDialog(window.window_);
+        }
+        checks.Expect(defensiveGuards,
+            L"stale partial, containing, contained and duplicate A-B cannot Add or open one-shot removal");
+        click(window.loopClearButton_);
+        checks.Expect(window.playbackLoop_.StartMs() == -1 &&
+            window.playbackLoop_.EndMs() == -1 && window.removalIntervals_.size() == 1 &&
+            IsWindowEnabled(window.removeSegmentButton_) != FALSE,
+            L"clearing rejected current A-B restores removal of the valid saved queue");
+
+        independent.backend.positionMs = 9000;
+        other.RefreshControls();
+        const bool otherAEnabled = IsWindowEnabled(other.loopStartButton_) != FALSE;
+        const bool otherAHandled = other.HandleHotKey(VK_OEM_4, false, false);
+        independent.backend.positionMs = 11000;
+        other.RefreshControls();
+        const bool otherBEnabled = IsWindowEnabled(other.loopEndButton_) != FALSE;
+        const bool otherBHandled = other.HandleHotKey(VK_OEM_6, false, false);
+        checks.Expect(otherAEnabled && otherBEnabled && otherAHandled && otherBHandled &&
+            other.playbackLoop_.StartMs() == 9000 && other.playbackLoop_.EndMs() == 11000 &&
+            other.removalIntervals_.empty() && window.removalIntervals_.size() == 1,
+            L"saved cuts in one player do not block keyboard selection in another instance");
+    }
+
+    static void SavedIntervalPainting(Checks& checks) {
+        Fixture fixture;
+        fixture.backend.backendState = 4; // paused
+        checks.Expect(fixture.Create(), L"create saved-interval pixel fixture");
+        auto& window = fixture.window;
+        if (window.window_ == nullptr) return;
+        struct Pixels final {
+            HDC dc = CreateCompatibleDC(nullptr);
+            HBITMAP bitmap = nullptr;
+            HGDIOBJ previous = nullptr;
+            Pixels(const int width, const int height) {
+                if (dc == nullptr) return;
+                BITMAPINFO info{};
+                info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                info.bmiHeader.biWidth = width;
+                info.bmiHeader.biHeight = -height;
+                info.bmiHeader.biPlanes = 1;
+                info.bmiHeader.biBitCount = 32;
+                info.bmiHeader.biCompression = BI_RGB;
+                void* bits = nullptr;
+                bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+                if (bitmap != nullptr) previous = SelectObject(dc, bitmap);
+            }
+            ~Pixels() {
+                if (previous != nullptr && previous != HGDI_ERROR) SelectObject(dc, previous);
+                if (bitmap != nullptr) DeleteObject(bitmap);
+                if (dc != nullptr) DeleteDC(dc);
+            }
+            bool Valid() const {
+                return dc != nullptr && bitmap != nullptr &&
+                    previous != nullptr && previous != HGDI_ERROR;
+            }
+            void Fill(const RECT& bounds, const COLORREF color) const {
+                SetDCBrushColor(dc, color);
+                FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            }
+        };
+        HIGHCONTRASTW highContrast{};
+        highContrast.cbSize = sizeof(highContrast);
+        const bool highContrastOn = SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST, sizeof(highContrast), &highContrast, 0) != FALSE &&
+            (highContrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+        const COLORREF savedColor = highContrastOn
+            ? GetSysColor(COLOR_HIGHLIGHT) : RGB(255, 153, 0);
+        constexpr COLORREF untouchedColor = RGB(21, 27, 31);
+        const auto sampleX = [](const RECT& bounds, const int percent) {
+            return bounds.left + (bounds.right - bounds.left) * percent / 100;
+        };
+        window.removalIntervals_ = {{2000, 4000}, {8000, 10000}};
+        fixture.backend.positionMs = 6000;
+        window.RefreshControls();
+        const auto channelPaintMatches = [&](const HWND parent, const bool hasSaved) {
+            RECT client{}, channel{}, thumb{};
+            GetClientRect(window.seekSlider_, &client);
+            SendMessageW(window.seekSlider_, TBM_GETCHANNELRECT, 0,
+                reinterpret_cast<LPARAM>(&channel));
+            SendMessageW(window.seekSlider_, TBM_GETTHUMBRECT, 0,
+                reinterpret_cast<LPARAM>(&thumb));
+            RECT timeline = TrackbarPointerRange(channel, thumb);
+            if (timeline.bottom - timeline.top > 2) {
+                ++timeline.top;
+                --timeline.bottom;
+            }
+            if (client.right <= 0 || client.bottom <= 0 ||
+                timeline.right <= timeline.left || timeline.bottom <= timeline.top) return false;
+            Pixels surface(client.right, client.bottom);
+            if (!surface.Valid()) return false;
+            surface.Fill(client, untouchedColor);
+            NMCUSTOMDRAW draw{};
+            draw.hdr.hwndFrom = window.seekSlider_;
+            draw.hdr.idFrom = IDC_SEEK_SLIDER;
+            draw.hdr.code = NM_CUSTOMDRAW;
+            draw.hdc = surface.dc;
+            draw.dwDrawStage = CDDS_PREPAINT;
+            const bool stages = SendMessageW(parent, WM_NOTIFY, IDC_SEEK_SLIDER,
+                reinterpret_cast<LPARAM>(&draw)) == CDRF_NOTIFYITEMDRAW;
+            draw.dwItemSpec = TBCD_CHANNEL;
+            draw.dwDrawStage = CDDS_ITEMPREPAINT;
+            const bool postRequested = SendMessageW(parent, WM_NOTIFY, IDC_SEEK_SLIDER,
+                reinterpret_cast<LPARAM>(&draw)) == CDRF_NOTIFYPOSTPAINT;
+            draw.dwDrawStage = CDDS_ITEMPOSTPAINT;
+            SendMessageW(parent, WM_NOTIFY, IDC_SEEK_SLIDER, reinterpret_cast<LPARAM>(&draw));
+            const int row = timeline.top + (timeline.bottom - timeline.top) / 2;
+            const COLORREF expected = hasSaved ? savedColor : untouchedColor;
+            const bool paintMatches =
+                GetPixel(surface.dc, sampleX(timeline, 15), row) == expected &&
+                GetPixel(surface.dc, sampleX(timeline, 45), row) == expected &&
+                GetPixel(surface.dc, sampleX(timeline, 30), row) == untouchedColor &&
+                GetPixel(surface.dc, sampleX(timeline, 75), row) == untouchedColor;
+            return stages && postRequested && paintMatches &&
+                GetDCBrushColor(surface.dc) == untouchedColor;
+        };
+        checks.Expect(channelPaintMatches(window.controlBar_, true),
+            L"docked native channel customdraw paints two saved intervals while preserving gaps and DC state");
+        RECT originalBounds{}, originalSeek{}, scaledSeek{};
+        GetWindowRect(window.window_, &originalBounds);
+        GetClientRect(window.seekSlider_, &originalSeek);
+        const int originalDpi = window.dpi_;
+        const int scaledDpi = originalDpi * 3 / 2;
+        const RECT suggested{originalBounds.left, originalBounds.top,
+            originalBounds.left + (originalBounds.right - originalBounds.left) * 3 / 2,
+            originalBounds.top + (originalBounds.bottom - originalBounds.top) * 3 / 2};
+        SendMessageW(window.window_, WM_DPICHANGED, MAKEWPARAM(scaledDpi, scaledDpi),
+            reinterpret_cast<LPARAM>(&suggested));
+        GetClientRect(window.seekSlider_, &scaledSeek);
+        checks.Expect(window.dpi_ == scaledDpi && scaledSeek.right > originalSeek.right &&
+            channelPaintMatches(window.controlBar_, true),
+            L"actual DPI/suggested-window resize reprojects saved marks through the native thumb travel range");
+        SendMessageW(window.window_, WM_DPICHANGED, MAKEWPARAM(originalDpi, originalDpi),
+            reinterpret_cast<LPARAM>(&originalBounds));
+        window.EnterFullscreen();
+        checks.Expect(GetParent(window.seekSlider_) == window.fullscreenControlBar_ &&
+            channelPaintMatches(window.fullscreenControlBar_, true),
+            L"fullscreen channel customdraw keeps saved marks at the resized trackbar positions");
+        window.ExitFullscreen();
+
+        ShowWindow(window.window_, SW_SHOWNA);
+        window.SetToolbarManuallyHidden(true);
+        window.RefreshControls();
+        RECT videoClient{}, stripClient{};
+        GetClientRect(window.videoWindow_, &videoClient);
+        GetClientRect(window.progressStrip_, &stripClient);
+        Pixels compact(videoClient.right, (std::max)(1L, stripClient.bottom));
+        checks.Expect(compact.Valid(), L"allocate compact saved-interval pixel surface");
+        if (!compact.Valid()) {
+            ShowWindow(window.window_, SW_HIDE);
+            return;
+        }
+        compact.Fill(videoClient, untouchedColor);
+        SendMessageW(window.progressStrip_, WM_PRINTCLIENT,
+            reinterpret_cast<WPARAM>(compact.dc), PRF_CLIENT);
+        const int row = stripClient.bottom / 2;
+        COLORREF transparent = 0;
+        BYTE alpha = 0;
+        DWORD flags = 0;
+        const bool colorKey = GetLayeredWindowAttributes(
+            window.progressStrip_, &transparent, &alpha, &flags) != FALSE &&
+            transparent == RGB(1, 0, 1) &&
+            (flags & (LWA_ALPHA | LWA_COLORKEY)) == (LWA_ALPHA | LWA_COLORKEY);
+        checks.Expect(IsWindowVisible(window.progressStrip_) &&
+            stripClient.right == videoClient.right && colorKey &&
+            GetPixel(compact.dc, sampleX(stripClient, 5), row) == RGB(255, 0, 0) &&
+            GetPixel(compact.dc, sampleX(stripClient, 15), row) == savedColor &&
+            GetPixel(compact.dc, sampleX(stripClient, 25), row) == RGB(255, 0, 0) &&
+            GetPixel(compact.dc, sampleX(stripClient, 45), row) == savedColor &&
+            GetPixel(compact.dc, sampleX(stripClient, 70), row) == RGB(1, 0, 1),
+            L"compact popup prints full-width saved marks over red playback with transparent future gaps");
+
+        fixture.backend.positionMs = 0;
+        window.RefreshControls();
+        compact.Fill(stripClient, untouchedColor);
+        SendMessageW(window.progressStrip_, WM_PRINTCLIENT,
+            reinterpret_cast<WPARAM>(compact.dc), PRF_CLIENT);
+        checks.Expect(IsWindowVisible(window.progressStrip_) && window.progressCompletedWidth_ == 0 &&
+            GetPixel(compact.dc, sampleX(stripClient, 5), row) == RGB(1, 0, 1) &&
+            GetPixel(compact.dc, sampleX(stripClient, 15), row) == savedColor &&
+            GetPixel(compact.dc, sampleX(stripClient, 45), row) == savedColor,
+            L"saved compact intervals remain visible before any video progress is completed");
+
+        window.ResetMediaUiState();
+        fixture.backend.positionMs = 6000;
+        window.RefreshControls();
+        RECT clearedStrip{};
+        GetClientRect(window.progressStrip_, &clearedStrip);
+        compact.Fill(stripClient, untouchedColor);
+        SendMessageW(window.progressStrip_, WM_PRINTCLIENT,
+            reinterpret_cast<WPARAM>(compact.dc), PRF_CLIENT);
+        checks.Expect(window.removalIntervals_.empty() &&
+            clearedStrip.right == videoClient.right * 6000 / fixture.backend.durationMs &&
+            GetPixel(compact.dc, sampleX(stripClient, 15), row) == RGB(255, 0, 0) &&
+            GetPixel(compact.dc, sampleX(stripClient, 45), row) == untouchedColor &&
+            channelPaintMatches(window.controlBar_, false),
+            L"media reset repaints away saved marks and restores completed-width compact progress");
+        fixture.backend.positionMs = 0;
+        window.RefreshControls();
+        checks.Expect(!IsWindowVisible(window.progressStrip_),
+            L"empty saved queue and zero playback progress hide the compact popup again");
+        ShowWindow(window.window_, SW_HIDE);
     }
 
     static void PlaybackLoopRestartLifecycle(Checks& checks) {
@@ -1793,6 +2295,7 @@ struct MainWindowTestAccess final {
 
     static void Run(int& passed, int& failed) {
         Checks checks{passed, failed};
+        ApplicationIcon(checks);
         Ownership(checks);
         ManualToolbarHiding(checks);
         CaptureCancellation(checks);
@@ -1805,6 +2308,9 @@ struct MainWindowTestAccess final {
         RepeatedIndependentControllers(checks);
         ReentrantCropGetter(checks);
         PlaybackLoopControls(checks);
+        RemovalIntervalControls(checks);
+        RemovalOverlapGuards(checks);
+        SavedIntervalPainting(checks);
         PlaybackLoopRestartLifecycle(checks);
         SnapshotProgress(checks);
         PreviewRequestReuse(checks);

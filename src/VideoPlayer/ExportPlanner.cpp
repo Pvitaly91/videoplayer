@@ -226,7 +226,21 @@ ExportPlan BuildExportPlan(
             Add(args, L"-vf", filter);
         }
         Add(args, L"-c:v", plan.videoEncoder);
-        if (video->bitRate > 0) Add(args, L"-b:v", std::to_wstring(video->bitRate));
+        if (video->bitRate > 0) {
+            plan.targetVideoBitRate = video->bitRate;
+            if (crop && options.resolution == ExportResolution::NativeCrop &&
+                video->width != 0 && video->height != 0) {
+                const long double sourcePixels = static_cast<long double>(video->width) *
+                    static_cast<long double>(video->height);
+                const long double outputPixels = static_cast<long double>(plan.outputWidth) *
+                    static_cast<long double>(plan.outputHeight);
+                const auto proportional = static_cast<std::int64_t>(
+                    static_cast<long double>(video->bitRate) * outputPixels / sourcePixels + 0.5L);
+                plan.targetVideoBitRate = (std::min)(video->bitRate,
+                    (std::max<std::int64_t>)(16000, proportional));
+            }
+            Add(args, L"-b:v", std::to_wstring(plan.targetVideoBitRate));
+        }
         if (!codecFallback && !video->pixelFormat.empty()) {
             Add(args, L"-pix_fmt", video->pixelFormat);
         } else if (codecFallback) {
@@ -273,7 +287,18 @@ ExportPlan BuildExportPlan(
     } else {
         summary << L"повний кадр";
     }
-    summary << L"\r\nВідео: " << (plan.streamCopy ? L"без перекодування" : plan.videoEncoder)
+    summary << L"\r\nРозмір кадру результату: " << plan.outputWidth << L"×"
+        << plan.outputHeight;
+    if (crop && options.resolution == ExportResolution::NativeCrop) {
+        summary << L" (фізичний crop, без доданого полотна)";
+    } else if (crop) {
+        summary << L" (полотно джерела з black padding)";
+    }
+    summary << L"\r\nВідео: " << (plan.streamCopy ? L"без перекодування" : plan.videoEncoder);
+    if (plan.targetVideoBitRate > 0) {
+        summary << L", цільовий bitrate " << plan.targetVideoBitRate / 1000 << L" кбіт/с";
+    }
+    summary
         << L"\r\nАудіо: " << (options.audio == ExportAudio::None ? L"вилучено" :
             segment ? (plan.muxer == L"webm" ? L"перекодовано Opus для точного A–B" :
                 L"перекодовано AAC для точного A–B") : L"оригінальний потік без перекодування")

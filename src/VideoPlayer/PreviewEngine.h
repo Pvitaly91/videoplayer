@@ -84,7 +84,7 @@ public:
     PreviewEngine& operator=(PreviewEngine&&) = delete;
 
     // This only records the UI notification target. The worker, LibVLC
-    // runtime, instance and player remain uncreated until the first cache miss.
+    // runtime, instance and player remain uncreated until warming or a cache miss.
     bool Initialize(
         HWND notificationWindow,
         UINT resultMessage = kPreviewFrameReadyMessage) noexcept;
@@ -102,10 +102,15 @@ public:
         std::int64_t timestampMs,
         std::int64_t durationMs) noexcept;
 
-    // Opt-in, RAM-only warming of at most the two adjacent missing buckets
-    // after a foreground decode. Disabling cancels only speculative work.
-    // Cache hits do not start more warming; foreground requests always win.
+    // Opt-in RAM-only warming: adjacent buckets after foreground decode and
+    // a whole-video plan started by WarmMedia. Disabling pauses that plan and
+    // cancels only speculative work; foreground requests always win.
     void SetPrefetchEnabled(bool enabled) noexcept;
+
+    // Schedule a bounded whole-video RAM cache once duration is known. Repeated
+    // calls for the same duration are cheap and never restart the plan. Uses
+    // the same low-priority worker; foreground requests preempt this work.
+    void WarmMedia(std::int64_t durationMs) noexcept;
 
     // Returns only current-media RAM data, retaining its real timestamp. This
     // never starts a decoder or alters the foreground request/result state.
