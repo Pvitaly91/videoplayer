@@ -10,6 +10,7 @@ ExportPlan BuildExportPlan(
     const ExportSnapshot& snapshot,
     const MediaProbeResult& probe,
     const ExportOptions& options,
-    const ExportSourceRegion& visibleRegion);
+    const ExportSourceRegion& visibleRegion,
+    const std::vector<std::int64_t>& keyframes = {});
 
 }  // namespace videoplayer

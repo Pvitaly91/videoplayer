@@ -137,6 +137,8 @@ struct ExportOptions final {
 struct ExportPlan final {
     bool valid = false;
     bool streamCopy = false;
+    bool keyframeAligned = false;
+    std::int64_t copySeekMs = 0;
     bool requiresCodecFallbackConfirmation = false;
     std::wstring muxer;
     std::wstring outputExtension;

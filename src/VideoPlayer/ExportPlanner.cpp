@@ -3,9 +3,11 @@
 #include "PathUtils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include <iomanip>
 #include <locale>
+#include <limits>
 #include <sstream>
 
 namespace videoplayer {
@@ -81,7 +83,8 @@ ExportPlan BuildExportPlan(
     const ExportSnapshot& snapshot,
     const MediaProbeResult& probe,
     const ExportOptions& options,
-    const ExportSourceRegion& visibleRegion) {
+    const ExportSourceRegion& visibleRegion,
+    const std::vector<std::int64_t>& keyframes) {
     ExportPlan plan{};
     const MediaStreamInfo* video = probe.MainVideo();
     if (!probe.valid || video == nullptr) {
@@ -129,10 +132,46 @@ ExportPlan BuildExportPlan(
         }
     }
     const bool segment = options.fragment == ExportFragment::Segment;
-    plan.streamCopy = !crop && !segment;
-    if (segment && options.method == ExportMethod::FastStreamCopy) {
-        plan.error = L"Швидке копіювання A–B доступне лише після підтвердження безпечної ключової межі. Оберіть точний експорт.";
+    // A full frame never needs encoding, including an A-B selection.
+    plan.streamCopy = !crop;
+    if (crop && options.method == ExportMethod::FastStreamCopy) {
+        plan.error = L"Зум змінює пікселі та потребує перекодування. Для копіювання виберіть повний кадр.";
         return plan;
+    }
+    if (segment && plan.streamCopy) {
+        if (!std::isfinite(probe.durationSeconds) || probe.durationSeconds <= 0.0 ||
+            probe.durationSeconds >= static_cast<double>((std::numeric_limits<std::int64_t>::max)()) / 1000.0) {
+            plan.error = L"Некоректна тривалість для копіювання A–B.";
+            return plan;
+        }
+        const auto duration = static_cast<std::int64_t>(std::llround(probe.durationSeconds * 1000.0));
+        if (plan.startMs >= duration || plan.endMs - (std::min)(plan.endMs, duration) > 500) {
+            plan.error = L"Інтервал A–B виходить за межі відео.";
+            return plan;
+        }
+        std::vector<std::int64_t> boundaries;
+        for (const auto keyframe : keyframes) {
+            if (keyframe >= 0 && keyframe < duration) boundaries.push_back(keyframe);
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+        const auto left = std::upper_bound(boundaries.begin(), boundaries.end(), plan.startMs);
+        if (left == boundaries.begin()) {
+            plan.error = L"Не знайдено ключового кадру для початку A–B. Перекодування не виконується.";
+            return plan;
+        }
+        const auto right = std::lower_bound(boundaries.begin(), boundaries.end(), plan.endMs);
+        plan.startMs = *std::prev(left);
+        plan.endMs = right == boundaries.end() ? duration : *right;
+        const long double seek = static_cast<long double>(plan.startMs) +
+            (static_cast<long double>(video->startSeconds) - probe.startSeconds) * 1000.0L;
+        if (!std::isfinite(seek) || seek >= (std::numeric_limits<std::int64_t>::max)() ||
+            seek <= (std::numeric_limits<std::int64_t>::min)()) {
+            plan.error = L"Некоректні часові мітки для копіювання A–B.";
+            return plan;
+        }
+        plan.copySeekMs = (std::max)(std::int64_t{0}, static_cast<std::int64_t>(std::llround(seek)));
+        plan.keyframeAligned = true;
     }
     const std::wstring sourceFamilyEncoder = EncoderForCodec(video->codecName);
     const bool preservesVideoCodec = plan.streamCopy ||
@@ -142,11 +181,11 @@ ExportPlan BuildExportPlan(
         plan.error = L"Вибраний контейнер несумісний з codec family відео. Виберіть MKV або інший сумісний контейнер.";
         return plan;
     }
-    if (plan.outputHasAudio && !segment) {
+    if (plan.outputHasAudio && (plan.streamCopy || !segment)) {
         for (const auto& stream : probe.streams) {
             if (stream.codecType == L"audio" &&
                 !ContainerAcceptsCodec(plan.muxer, L"audio", stream.codecName)) {
-                plan.error = L"Вибраний контейнер не підтримує один з оригінальних audio streams. Виберіть MKV, вимкніть аудіо або точний A–B export.";
+                plan.error = L"Контейнер не підтримує оригінальне аудіо. Виберіть MKV або «Без аудіо»; перекодування не виконується.";
                 return plan;
             }
         }
@@ -156,9 +195,12 @@ ExportPlan BuildExportPlan(
     args = {L"-hide_banner", L"-nostats", L"-loglevel", L"warning",
         L"-progress", L"pipe:1", L"-y"};
     if (crop) args.push_back(L"-noautorotate");
+    if (plan.keyframeAligned && plan.copySeekMs > 0) {
+        Add(args, L"-ss", FormatExportSeconds(plan.copySeekMs));
+    }
     Add(args, L"-i", PathForWin32Io(snapshot.sourcePath));
     if (segment) {
-        Add(args, L"-ss", FormatExportSeconds(plan.startMs));
+        if (!plan.keyframeAligned) Add(args, L"-ss", FormatExportSeconds(plan.startMs));
         Add(args, L"-t", FormatExportSeconds(plan.endMs - plan.startMs));
     }
     Add(args, L"-map", L"0:" + std::to_wstring(video->index));
@@ -171,6 +213,15 @@ ExportPlan BuildExportPlan(
 
     if (plan.streamCopy) {
         args.insert(args.end(), {L"-c", L"copy"});
+        if (plan.keyframeAligned) {
+            const auto length = FormatExportSeconds(plan.endMs - plan.startMs);
+            // Same packet-preserving bounds as lossless interval deletion.
+            Add(args, L"-bsf:v", L"noise=amount=0:drop=lt(pts*tb\\,-0.0005)+gte(pts*tb\\," + length + L"-0.0005)");
+            if (plan.outputHasAudio) {
+                Add(args, L"-bsf:a", L"noise=amount=0:drop=lt(pts*tb\\,0)+gte(pts*tb\\," + length + L")");
+            }
+            Add(args, L"-avoid_negative_ts", L"disabled");
+        }
     } else {
         plan.videoEncoder = EncoderForCodec(video->codecName);
         if (!plan.videoEncoder.empty() && !probe.HasEncoder(plan.videoEncoder)) {
@@ -301,9 +352,16 @@ ExportPlan BuildExportPlan(
     summary
         << L"\r\nАудіо: " << (options.audio == ExportAudio::None ? L"вилучено" :
             !plan.outputHasAudio ? L"відсутнє у джерелі" :
-            segment ? (plan.muxer == L"webm" ? L"перекодовано Opus для точного A–B" :
+            segment && !plan.streamCopy ? (plan.muxer == L"webm" ? L"перекодовано Opus для точного A–B" :
                 L"перекодовано AAC для точного A–B") : L"оригінальний потік без перекодування")
         << L"\r\nДодаткові відеопотоки, субтитри, вкладення та розділи: не експортуються.";
+    if (plan.keyframeAligned) {
+        summary << L"\r\nЗапитаний A–B: " << FormatExportSeconds(snapshot.segmentStartMs)
+            << L"–" << FormatExportSeconds(snapshot.segmentEndMs) << L" с."
+            << L"\r\nМежі розширюються до ключових кадрів для безпечного копіювання."
+            << L"\r\nФактично буде збережено: " << FormatExportSeconds(plan.startMs)
+            << L"–" << FormatExportSeconds(plan.endMs) << L" с; без втрати якості.";
+    }
     plan.summary = summary.str();
     plan.valid = true;
     return plan;

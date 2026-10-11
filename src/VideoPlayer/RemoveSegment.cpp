@@ -183,7 +183,7 @@ std::vector<std::int64_t> ProbeVideoKeyframes(
     }
     std::sort(keyframes.begin(), keyframes.end());
     keyframes.erase(std::unique(keyframes.begin(), keyframes.end()), keyframes.end());
-    if (keyframes.empty()) error = L"Ключові кадри не знайдено; без перекодування видалення неможливе.";
+    if (keyframes.empty()) error = L"Ключові кадри не знайдено; безпечне копіювання без перекодування неможливе.";
     return keyframes;
 }
 

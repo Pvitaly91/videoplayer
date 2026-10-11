@@ -372,12 +372,34 @@ void TestVideoExport(TestRunner& runner) {
         L"export planner never invents a 30 fps rate");
 
     options.fragment = ExportFragment::Segment;
-    plan = BuildExportPlan(snapshot, probe, options, clipped);
-    runner.True(plan.valid && !plan.streamCopy && plan.videoEncoder == L"libx264",
-        L"exact arbitrary A-B export transcodes in source codec family");
+    const std::vector<std::int64_t> copyBoundaries{0, 1000, 2000, 3000, 4000, 12000};
+    plan = BuildExportPlan(snapshot, probe, options, clipped, copyBoundaries);
+    runner.True(plan.valid && plan.streamCopy && plan.keyframeAligned && plan.videoEncoder.empty() &&
+        HasArgument(plan.ffmpegArguments, L"copy") && !HasArgument(plan.ffmpegArguments, L"libx264") &&
+        !HasArgument(plan.ffmpegArguments, L"-c:a"),
+        L"A-B without zoom copies both codecs even with legacy Exact method");
     runner.True(HasArgument(plan.ffmpegArguments, L"1.000") &&
         HasArgument(plan.ffmpegArguments, L"3.000"),
-        L"exact A-B plan carries half-open start and duration");
+        L"aligned copy A-B plan carries start and duration");
+    runner.True(std::find(plan.ffmpegArguments.begin(), plan.ffmpegArguments.end(), L"-ss") <
+        std::find(plan.ffmpegArguments.begin(), plan.ffmpegArguments.end(), L"-i"),
+        L"A-B copy uses input keyframe seeking");
+    snapshot.segmentStartMs = 1500;
+    snapshot.segmentEndMs = 3500;
+    plan = BuildExportPlan(snapshot, probe, options, clipped, {4000, 0, 1000, 4000});
+    runner.True(plan.valid && plan.startMs == 1000 && plan.endMs == 4000 &&
+        plan.summary.find(L"1.500–3.500") != std::wstring::npos &&
+        plan.summary.find(L"1.000–4.000") != std::wstring::npos,
+        L"copy A-B expands to safe boundaries and reports requested and actual interval");
+    runner.True(!BuildExportPlan(snapshot, probe, options, clipped).valid,
+        L"missing keyframe proof never silently triggers A-B reencoding");
+    MediaProbeResult noEncoders = probe;
+    noEncoders.availableEncoders.clear();
+    plan = BuildExportPlan(snapshot, noEncoders, options, clipped, copyBoundaries);
+    runner.True(plan.valid && plan.streamCopy && !plan.requiresCodecFallbackConfirmation,
+        L"A-B copy needs no installed source video or audio encoder");
+    snapshot.segmentStartMs = 1000;
+    snapshot.segmentEndMs = 4000;
 
     options.image = ExportImage::VisibleZoom;
     options.resolution = ExportResolution::SourceCanvas;
@@ -428,6 +450,7 @@ void TestVideoExport(TestRunner& runner) {
         SetMainCodec(codecProbe, encoderCase.first);
         options = {};
         options.fragment = ExportFragment::Segment;
+        options.image = ExportImage::VisibleZoom;
         options.audio = ExportAudio::None;
         options.destinationPath = encoderCase.first == std::wstring(L"vp9")
             ? L"C:\\out\\result.webm" : L"C:\\out\\result.mp4";
@@ -440,6 +463,7 @@ void TestVideoExport(TestRunner& runner) {
     SetMainCodec(unsupportedCodec, L"prores");
     options = {};
     options.fragment = ExportFragment::Segment;
+    options.image = ExportImage::VisibleZoom;
     options.audio = ExportAudio::None;
     options.destinationPath = L"C:\\out\\fallback.mp4";
     plan = BuildExportPlan(snapshot, unsupportedCodec, options, clipped);
@@ -507,6 +531,10 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         RemoveDirectoryW(directory.c_str());
         return;
     }
+    std::wstring copyKeyframeError;
+    const auto copyKeyframes = ProbeVideoKeyframes(ffprobe, source, probe, nullptr, copyKeyframeError);
+    runner.True(copyKeyframeError.empty() && !copyKeyframes.empty(),
+        L"real A-B export scans source keyframe packets without decoding");
     ExportSnapshot snapshot{};
     snapshot.sourcePath = source;
     snapshot.sourceIdentity = CaptureExportFileIdentity(source);
@@ -577,7 +605,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         options.resolution = combination.resolution;
         options.audio = combination.audio;
         options.destinationPath = directory + L"\\" + combination.name + L".mp4";
-        const ExportPlan plan = BuildExportPlan(snapshot, probe, options, region);
+        const ExportPlan plan = BuildExportPlan(snapshot, probe, options, region, copyKeyframes);
         std::atomic_bool cancellation{false};
         const ExportJobResult exported = RunExportJob(ffmpeg, ffprobe, snapshot,
             options, plan, false, cancellation);
@@ -597,6 +625,67 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
 
     // Audio is optional even when "Original" is selected: the source or A-B
     // interval can contain no samples. Still reject loss of real source audio.
+    struct CopyPacket final { double pts = 0.0; std::string hash; };
+    const auto copyPackets = [&](const std::wstring& file, const wchar_t* selector) {
+        std::vector<CopyPacket> packets;
+        const auto analysis = RunHiddenExportProcess(ffprobe,
+            {L"-v", L"error", L"-select_streams", selector, L"-show_packets",
+             L"-show_entries", L"packet=pts_time,data_hash", L"-show_data_hash", L"sha256",
+             L"-of", L"compact=p=0:nk=0", file}, nullptr,
+            [&](const std::string& line) {
+                const auto pts = line.find("pts_time=");
+                const auto hash = line.find("data_hash=");
+                if (pts == std::string::npos || hash == std::string::npos) return;
+                std::string value = line.substr(hash + 10);
+                const auto delimiter = value.find_first_of("|\r");
+                if (delimiter != std::string::npos) value.resize(delimiter);
+                packets.push_back({std::strtod(line.c_str() + pts + 9, nullptr), value});
+            });
+        if (!analysis.started || analysis.exitCode != 0) packets.clear();
+        return packets;
+    };
+    const auto originalCopyVideo = copyPackets(source, L"v:0");
+    const auto originalCopyAudio = copyPackets(source, L"a:0");
+    for (const auto* extension : {L".mp4", L".mkv"}) {
+        ExportSnapshot copySnapshot = snapshot;
+        copySnapshot.segmentStartMs = 1500;
+        copySnapshot.segmentEndMs = 2500;
+        ExportOptions copyOptions{};
+        copyOptions.fragment = ExportFragment::Segment;
+        copyOptions.destinationPath = directory + L"\\lossless-segment" + extension;
+        const auto copyPlan = BuildExportPlan(copySnapshot, probe, copyOptions, region, copyKeyframes);
+        // This source is 30000/1001 fps: 30-frame GOPs last 1001 ms.
+        runner.True(copyPlan.valid && copyPlan.streamCopy && copyPlan.startMs == 1001 &&
+            copyPlan.endMs == 3003 && copyPlan.expectedAudioCodecs == std::vector<std::wstring>{L"aac"},
+            L"real no-zoom A-B keeps source codecs and safe keyframe bounds");
+        std::atomic_bool copyCancellation{false};
+        const auto copied = RunExportJob(ffmpeg, ffprobe, copySnapshot,
+            copyOptions, copyPlan, false, copyCancellation);
+        if (!copied.success) std::wcerr << L"A-B COPY FAILURE: " << copied.diagnostics << L'\n';
+        const auto copiedProbe = ProbeMediaFile(ffprobe, copyOptions.destinationPath);
+        runner.True(copied.success && copiedProbe.valid && copiedProbe.HasAudio() &&
+            std::abs(copiedProbe.durationSeconds - 2.0) < 0.05,
+            L"real MP4/MKV no-zoom A-B copies and validates source interval");
+        std::vector<std::string> expectedHashes, actualHashes;
+        for (const auto& packet : originalCopyVideo) {
+            if (packet.pts * 1000.0 >= copyPlan.startMs - 0.5 &&
+                packet.pts * 1000.0 < copyPlan.endMs - 0.5) expectedHashes.push_back(packet.hash);
+        }
+        for (const auto& packet : copyPackets(copyOptions.destinationPath, L"v:0")) actualHashes.push_back(packet.hash);
+        runner.True(expectedHashes.size() == 60 && actualHashes == expectedHashes,
+            L"A-B export video packets are byte-identical to source in encoded order");
+        const auto copiedAudio = copyPackets(copyOptions.destinationPath, L"a:0");
+        runner.True(!copiedAudio.empty() && std::all_of(copiedAudio.begin(), copiedAudio.end(),
+            [&](const CopyPacket& packet) {
+                return std::any_of(originalCopyAudio.begin(), originalCopyAudio.end(),
+                    [&](const CopyPacket& original) { return packet.hash == original.hash; });
+            }), L"A-B export audio packets are copied without AAC reencoding");
+        runner.True(CaptureExportFileIdentity(source).size == snapshot.sourceIdentity.size &&
+            CaptureExportFileIdentity(source).modifiedTime == snapshot.sourceIdentity.modifiedTime,
+            L"lossless A-B export leaves the source untouched");
+        DeleteFileW(copyOptions.destinationPath.c_str());
+    }
+
     const auto SameFileIdentity = [](const ExportFileIdentity& before,
                                      const ExportFileIdentity& after) {
         return before.valid && after.valid && before.volume == after.volume &&
@@ -624,7 +713,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         videoOnlyOptions.audio = ExportAudio::Original;
         videoOnlyOptions.destinationPath = directory + L"\\video-only-segment.mp4";
         ExportPlan videoOnlyPlan = BuildExportPlan(
-            videoOnlySnapshot, videoOnlyProbe, videoOnlyOptions, region);
+            videoOnlySnapshot, videoOnlyProbe, videoOnlyOptions, region, copyKeyframes);
         runner.True(videoOnlyPlan.valid && !videoOnlyPlan.outputHasAudio &&
             videoOnlyPlan.expectedAudioCodecs.empty() &&
             HasArgument(videoOnlyPlan.ffmpegArguments, L"-an") &&
@@ -642,7 +731,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
 
         videoOnlyOptions.destinationPath = directory + L"\\phantom-audio-segment.mp4";
         videoOnlyPlan = BuildExportPlan(
-            videoOnlySnapshot, videoOnlyProbe, videoOnlyOptions, region);
+            videoOnlySnapshot, videoOnlyProbe, videoOnlyOptions, region, copyKeyframes);
         videoOnlyPlan.outputHasAudio = true;
         videoOnlyPlan.expectedAudioCodecs = {L"aac"};
         const ExportJobResult phantomAudioExport = RunExportJob(ffmpeg, ffprobe,
@@ -664,7 +753,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
          L"-f", L"lavfi", L"-i", L"testsrc2=size=320x180:rate=30:duration=4",
          L"-f", L"lavfi", L"-i", L"sine=frequency=880:sample_rate=48000:duration=1",
          L"-map", L"0:v:0", L"-map", L"1:a:0", L"-t", L"4",
-         L"-c:v", L"libx264", L"-preset", L"ultrafast", L"-pix_fmt", L"yuv420p",
+         L"-c:v", L"libx264", L"-preset", L"ultrafast", L"-g", L"15", L"-pix_fmt", L"yuv420p",
          L"-c:a", L"aac", L"-f", L"mp4", prefixAudioSource});
     const MediaProbeResult prefixAudioProbe = ProbeMediaFile(ffprobe, prefixAudioSource);
     runner.True(prefixAudioFixture.started && prefixAudioFixture.exitCode == 0 &&
@@ -672,6 +761,9 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         prefixAudioProbe.durationSeconds > 3.9,
         L"real audio regression creates four seconds of video with one second of audio");
     if (prefixAudioProbe.valid && prefixAudioProbe.HasAudio()) {
+        std::wstring prefixKeyframeError;
+        const auto prefixKeyframes = ProbeVideoKeyframes(ffprobe, prefixAudioSource,
+            prefixAudioProbe, nullptr, prefixKeyframeError);
         ExportSnapshot prefixAudioSnapshot = snapshot;
         prefixAudioSnapshot.sourcePath = prefixAudioSource;
         prefixAudioSnapshot.sourceIdentity = CaptureExportFileIdentity(prefixAudioSource);
@@ -685,7 +777,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         prefixAudioOptions.audio = ExportAudio::Original;
         prefixAudioOptions.destinationPath = directory + L"\\after-audio-segment.mp4";
         ExportPlan prefixAudioPlan = BuildExportPlan(
-            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region);
+            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region, prefixKeyframes);
         runner.True(prefixAudioPlan.valid && prefixAudioPlan.outputHasAudio &&
             !prefixAudioPlan.expectedAudioCodecs.empty(),
             L"source audio is initially expected for an A-B interval after it ends");
@@ -703,7 +795,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         prefixAudioSnapshot.segmentEndMs = 900;
         prefixAudioOptions.destinationPath = directory + L"\\with-audio-segment.mp4";
         prefixAudioPlan = BuildExportPlan(
-            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region);
+            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region, prefixKeyframes);
         const ExportJobResult withAudioExport = RunExportJob(ffmpeg, ffprobe,
             prefixAudioSnapshot, prefixAudioOptions, prefixAudioPlan, false, audioCancellation);
         const MediaProbeResult withAudioOutput = ProbeMediaFile(
@@ -719,7 +811,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         const ExportFileIdentity destinationBefore = CaptureExportFileIdentity(
             prefixAudioOptions.destinationPath);
         prefixAudioPlan = BuildExportPlan(
-            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region);
+            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region, prefixKeyframes);
         prefixAudioPlan.ffmpegArguments.push_back(L"-an");
         const ExportJobResult droppedAudioExport = RunExportJob(ffmpeg, ffprobe,
             prefixAudioSnapshot, prefixAudioOptions, prefixAudioPlan, true, audioCancellation);
@@ -765,7 +857,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
     const std::wstring existing = directory + L"\\existing.mp4";
     CopyFileW(source.c_str(), existing.c_str(), FALSE);
     protectionOptions.destinationPath = existing;
-    protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
+    protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region, copyKeyframes);
     protectionCancellation.store(false);
     ExportJobResult unconfirmedOverwrite = RunExportJob(ffmpeg, ffprobe, snapshot,
         protectionOptions, protectionPlan, false, protectionCancellation);
@@ -790,7 +882,7 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
 
     protectionOptions.destinationPath = directory + L"\\cancelled.mp4";
     protectionOptions.fragment = ExportFragment::Segment;
-    protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
+    protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region, copyKeyframes);
     protectionCancellation.store(false);
     ExportJobResult cancelledJob = RunExportJob(ffmpeg, ffprobe, snapshot,
         protectionOptions, protectionPlan, false, protectionCancellation,

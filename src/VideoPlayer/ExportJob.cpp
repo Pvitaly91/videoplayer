@@ -129,7 +129,7 @@ SourceAudioPresence CheckSourceIntervalAudio(
     const std::vector<std::wstring> arguments{
         L"-hide_banner", L"-v", L"error", L"-xerror",
         L"-i", PathForWin32Io(snapshot.sourcePath),
-        L"-ss", FormatExportSeconds(plan.startMs),
+        L"-ss", FormatExportSeconds(plan.keyframeAligned ? plan.copySeekMs : plan.startMs),
         L"-t", FormatExportSeconds(plan.endMs - plan.startMs),
         L"-map", L"0:" + std::to_wstring(source.MainVideo()->index),
         L"-map", L"0:a?", L"-sn", L"-dn",
@@ -179,6 +179,11 @@ ExportJobResult RunExportJob(
         result.diagnostics = plan.error;
         return result;
     }
+    if (options.fragment == ExportFragment::Segment && options.image == ExportImage::FullFrame &&
+        (!plan.streamCopy || !plan.keyframeAligned)) {
+        result.diagnostics = L"A–B без зуму зберігається лише копіюванням після аналізу ключових кадрів.";
+        return result;
+    }
     const ExportFileIdentity sourceAtStart = ReadIdentity(snapshot.sourcePath);
     const ExportFileIdentity destinationAtStart = ReadIdentity(options.destinationPath);
     if (!snapshot.sourceIdentity.valid || !sourceAtStart.valid) {
@@ -202,12 +207,13 @@ ExportJobResult RunExportJob(
     std::vector<std::wstring> arguments = plan.ffmpegArguments;
     arguments.push_back(PathForWin32Io(result.partialPath));
     const std::int64_t durationMs = plan.endMs - plan.startMs;
-    if (progress) progress(0, L"Експорт відео…");
+    const std::wstring operation = plan.streamCopy ? L"Копіювання без перекодування…" : L"Експорт відео…";
+    if (progress) progress(0, operation);
     ExportProcessResult process = RunHiddenExportProcess(
         ffmpegPath, arguments, &cancellation,
         [&](const std::string& line) {
             const int percent = ParseProgress(line, durationMs);
-            if (progress && percent >= 0) progress(percent, L"Експорт відео…");
+            if (progress && percent >= 0) progress(percent, operation);
         });
     if (process.cancelled || cancellation.load()) {
         result.cancelled = true;
@@ -279,8 +285,8 @@ ExportJobResult RunExportJob(
         return result;
     }
     const std::vector<std::wstring> decodeArguments{
-        L"-v", L"error", L"-i", PathForWin32Io(result.partialPath),
-        L"-map", L"0:v:0", L"-f", L"null", L"NUL"};
+        L"-v", L"error", L"-xerror", L"-i", PathForWin32Io(result.partialPath),
+        L"-map", L"0:v:0", L"-map", L"0:a?", L"-f", L"null", L"NUL"};
     ExportProcessResult decode = RunHiddenExportProcess(
         ffmpegPath, decodeArguments, &cancellation, {}, 256U * 1024U);
     if (decode.cancelled || cancellation.load()) {
@@ -290,7 +296,9 @@ ExportJobResult RunExportJob(
         return result;
     }
     if (!decode.started || decode.exitCode != 0) {
-        result.diagnostics = L"Декодування перевірочного файла завершилося помилкою.\r\n" + Utf8(decode.standardError);
+        result.diagnostics = (plan.keyframeAligned
+            ? L"Скопійований фрагмент не декодується безпечно (можливі відкриті GOP). Виберіть інші межі A–B; автоматичного перекодування немає.\r\n"
+            : L"Декодування перевірочного файла завершилося помилкою.\r\n") + Utf8(decode.standardError);
         DeleteFileW(PathForWin32Io(result.partialPath).c_str());
         return result;
     }

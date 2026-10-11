@@ -283,7 +283,8 @@ private:
             {L"Полотно джерела (можливі чорні поля)",
              L"Фізично обрізаний кадр (native crop)"},
             snapshot_.zoomApplied ? 1 : 0);
-        AddComboValues(method_, {L"Точно (frame-accurate)", L"Швидко, без перекодування"}, 0);
+        AddComboValues(method_, {L"Перекодування для зуму", L"Без перекодування"}, snapshot_.zoomApplied ? 0 : 1);
+        EnableWindow(method_, FALSE);
         AddComboValues(audio_, {L"Зберегти аудіо", L"Без аудіо"}, 0);
         SendMessageW(progress_, PBM_SETRANGE32, 0, 100);
         EnableWindow(resolution_, snapshot_.zoomApplied ? TRUE : FALSE);
@@ -311,7 +312,7 @@ private:
         const std::wstring ffprobe = ExportToolsDirectory() + L"\\ffprobe.exe";
         worker_ = std::thread([this, ffprobe] {
             probe_ = ProbeMediaFile(ffprobe, snapshot_.sourcePath, &cancellation_);
-            if (removing_ && probe_.valid) {
+            if ((removing_ || snapshot_.hasSegment) && probe_.valid) {
                 std::wstring error;
                 keyframes_ = ProbeVideoKeyframes(ffprobe, snapshot_.sourcePath,
                     probe_, &cancellation_, error);
@@ -351,10 +352,11 @@ private:
             EnableWindow(save_, plan.valid);
             return;
         }
-        ExportPlan plan = BuildExportPlan(snapshot_, probe_, Options(), VisibleRegion());
+        ExportPlan plan = BuildExportPlan(snapshot_, probe_, Options(), VisibleRegion(), keyframes_);
         std::wstring text = DescribeMediaProbe(probe_) + L"\r\n\r\n";
         text += plan.valid ? plan.summary : L"Поточний вибір: " + plan.error;
         SetWindowTextW(summary_, text.c_str());
+        EnableWindow(save_, plan.valid || plan.requiresCodecFallbackConfirmation);
     }
 
     void RefreshRemovalList() {
@@ -423,13 +425,13 @@ private:
         }
         options.destinationPath = absoluteDestination;
         SetWindowTextW(path_, options.destinationPath.c_str());
-        ExportPlan plan = BuildExportPlan(snapshot_, probe_, options, VisibleRegion());
+        ExportPlan plan = BuildExportPlan(snapshot_, probe_, options, VisibleRegion(), keyframes_);
         if (plan.requiresCodecFallbackConfirmation) {
             if (MessageBoxW(window_,
                     (plan.error + L"\r\n\r\nПродовжити з H.264/AAC у MP4?").c_str(),
                     L"Підтвердження кодека", MB_YESNO | MB_ICONWARNING) != IDYES) return;
             options.confirmedCodecFallback = true;
-            plan = BuildExportPlan(snapshot_, probe_, options, VisibleRegion());
+            plan = BuildExportPlan(snapshot_, probe_, options, VisibleRegion(), keyframes_);
         }
         if (!plan.valid) {
             MessageBoxW(window_, plan.error.c_str(), L"Експорт недоступний", MB_OK | MB_ICONWARNING);
@@ -575,6 +577,7 @@ private:
         if (enabled != FALSE && SendMessageW(image_, CB_GETCURSEL, 0, 0) != 1) {
             EnableWindow(resolution_, FALSE);
         }
+        EnableWindow(method_, FALSE);
     }
 
     void DetachOwnerSubclass() {
@@ -616,12 +619,14 @@ private:
                 UpdateSummary();
                 return 0;
             }
-            if (removing_ && LOWORD(wParam) == kPath && HIWORD(wParam) == EN_CHANGE) {
+            if (LOWORD(wParam) == kPath && HIWORD(wParam) == EN_CHANGE) {
                 UpdateSummary();
             }
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (LOWORD(wParam) == kImage) {
                     const bool visibleZoom = SendMessageW(image_, CB_GETCURSEL, 0, 0) == 1;
+                    SendMessageW(method_, CB_SETCURSEL, visibleZoom ? 0 : 1, 0);
+                    EnableWindow(method_, FALSE);
                     if (visibleZoom) SendMessageW(resolution_, CB_SETCURSEL, 1, 0);
                     EnableWindow(resolution_, visibleZoom && !exporting_ ? TRUE : FALSE);
                 }
