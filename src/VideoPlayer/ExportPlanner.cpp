@@ -300,6 +300,7 @@ ExportPlan BuildExportPlan(
     }
     summary
         << L"\r\nАудіо: " << (options.audio == ExportAudio::None ? L"вилучено" :
+            !plan.outputHasAudio ? L"відсутнє у джерелі" :
             segment ? (plan.muxer == L"webm" ? L"перекодовано Opus для точного A–B" :
                 L"перекодовано AAC для точного A–B") : L"оригінальний потік без перекодування")
         << L"\r\nДодаткові відеопотоки, субтитри, вкладення та розділи: не експортуються.";

@@ -106,6 +106,53 @@ int ParseProgress(const std::string& line, const std::int64_t durationMs) {
     return static_cast<int>((std::clamp)(microseconds / (durationMs * 1000.0) * 100.0, 0.0, 99.0));
 }
 
+enum class SourceAudioPresence { Absent, Present, Unknown, Cancelled };
+
+SourceAudioPresence CheckSourceIntervalAudio(
+    const std::wstring& ffmpegPath,
+    const std::wstring& ffprobePath,
+    const ExportSnapshot& snapshot,
+    const ExportPlan& plan,
+    std::atomic_bool& cancellation) {
+    const auto source = ProbeMediaFile(ffprobePath, snapshot.sourcePath, &cancellation);
+    if (cancellation.load()) return SourceAudioPresence::Cancelled;
+    if (!source.valid) return SourceAudioPresence::Unknown;
+    if (!source.HasAudio()) return SourceAudioPresence::Absent;
+
+    // A container may declare an empty audio stream, or its audio may end
+    // before A. Use the export's own timestamp normalization/seek to check
+    // actual decoded samples; raw packet timestamps can differ for TS/HLS.
+    // Keep the main video enabled as in the real export: TS/HLS timestamp
+    // normalization can otherwise shift an audio-only input differently.
+    // Checksums go to a pipe, so this creates no file and adds no silent track.
+    std::atomic_bool hasSamples{false};
+    const std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-v", L"error", L"-xerror",
+        L"-i", PathForWin32Io(snapshot.sourcePath),
+        L"-ss", FormatExportSeconds(plan.startMs),
+        L"-t", FormatExportSeconds(plan.endMs - plan.startMs),
+        L"-map", L"0:" + std::to_wstring(source.MainVideo()->index),
+        L"-map", L"0:a?", L"-sn", L"-dn",
+        L"-c:v", L"copy", L"-c:a", L"pcm_s16le", L"-f", L"framecrc", L"pipe:1"};
+    const auto decoded = RunHiddenExportProcess(ffmpegPath, arguments, &cancellation,
+        [&](const std::string& line) {
+            const auto first = line.find_first_not_of(" \t\r");
+            // Output stream 0 is the copied video; streams 1+ are decoded audio.
+            // Unknown data also fails closed rather than proving audio absent.
+            if (first != std::string::npos && line[first] != '#') {
+                char* end = nullptr;
+                const auto streamIndex = std::strtol(line.c_str() + first, &end, 10);
+                if (end == line.c_str() + first || end == nullptr || *end != ',' ||
+                    streamIndex != 0) {
+                    hasSamples.store(true);
+                }
+            }
+        }, 64U * 1024U);
+    if (decoded.cancelled || cancellation.load()) return SourceAudioPresence::Cancelled;
+    if (!decoded.started || decoded.exitCode != 0) return SourceAudioPresence::Unknown;
+    return hasSamples.load() ? SourceAudioPresence::Present : SourceAudioPresence::Absent;
+}
+
 }  // namespace
 
 ExportFileIdentity CaptureExportFileIdentity(const std::wstring& path) {
@@ -186,6 +233,24 @@ ExportJobResult RunExportJob(
         if (stream.codecType == L"video" && !stream.attachedPicture) ++videoStreamCount;
         if (stream.codecType == L"audio") verifiedAudioCodecs.push_back(stream.codecName);
     }
+    bool acceptsAbsentAudio = false;
+    if (verification.valid && plan.outputHasAudio && !verification.HasAudio()) {
+        if (progress) progress(99, L"Перевірка аудіо фрагмента…");
+        const auto sourceAudio = CheckSourceIntervalAudio(
+            ffmpegPath, ffprobePath, snapshot, plan, cancellation);
+        if (sourceAudio == SourceAudioPresence::Cancelled) {
+            result.cancelled = true;
+            result.diagnostics = L"Перевірку скасовано користувачем.";
+            DeleteFileW(PathForWin32Io(result.partialPath).c_str());
+            return result;
+        }
+        // Missing output audio is harmless only when its source interval has
+        // no samples. Real audio loss or an inconclusive check remains an error.
+        acceptsAbsentAudio = sourceAudio == SourceAudioPresence::Absent;
+    }
+    const bool audioMatches = acceptsAbsentAudio ||
+        (verification.HasAudio() == plan.outputHasAudio &&
+         verifiedAudioCodecs == plan.expectedAudioCodecs);
     const bool sampleAspectMatches = verifiedVideo != nullptr &&
         verifiedVideo->sampleAspectRatio.denominator != 0 &&
         plan.expectedSampleAspectRatio.denominator != 0 &&
@@ -195,8 +260,7 @@ ExportJobResult RunExportJob(
         verification.durationSeconds <= 0.0 ||
         std::abs(verification.durationSeconds - expectedSeconds) > durationTolerance ||
         verifiedVideo->width != plan.outputWidth || verifiedVideo->height != plan.outputHeight ||
-        verification.HasAudio() != plan.outputHasAudio ||
-        verifiedAudioCodecs != plan.expectedAudioCodecs || videoStreamCount != 1 ||
+        !audioMatches || videoStreamCount != 1 ||
         verifiedVideo->codecName != plan.expectedVideoCodec ||
         (!plan.expectedPixelFormat.empty() &&
             verifiedVideo->pixelFormat != plan.expectedPixelFormat) ||

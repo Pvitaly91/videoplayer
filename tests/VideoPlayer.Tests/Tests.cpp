@@ -595,6 +595,150 @@ void TestRealVideoExportIntegration(TestRunner& runner) {
         DeleteFileW(options.destinationPath.c_str());
     }
 
+    // Audio is optional even when "Original" is selected: the source or A-B
+    // interval can contain no samples. Still reject loss of real source audio.
+    const auto SameFileIdentity = [](const ExportFileIdentity& before,
+                                     const ExportFileIdentity& after) {
+        return before.valid && after.valid && before.volume == after.volume &&
+            before.fileIndex == after.fileIndex && before.size == after.size &&
+            before.modifiedTime == after.modifiedTime;
+    };
+    const std::wstring videoOnlySource = directory + L"\\video-only-source.mp4";
+    const ExportProcessResult videoOnlyFixture = RunHiddenExportProcess(ffmpeg,
+        {L"-hide_banner", L"-loglevel", L"error", L"-y", L"-i", source,
+         L"-map", L"0:v:0", L"-c", L"copy", L"-an", L"-f", L"mp4",
+         videoOnlySource});
+    const MediaProbeResult videoOnlyProbe = ProbeMediaFile(ffprobe, videoOnlySource);
+    runner.True(videoOnlyFixture.started && videoOnlyFixture.exitCode == 0 &&
+        videoOnlyProbe.valid && !videoOnlyProbe.HasAudio(),
+        L"real audio regression creates a genuinely video-only source");
+    if (videoOnlyProbe.valid && !videoOnlyProbe.HasAudio()) {
+        ExportSnapshot videoOnlySnapshot = snapshot;
+        videoOnlySnapshot.sourcePath = videoOnlySource;
+        videoOnlySnapshot.sourceIdentity = CaptureExportFileIdentity(videoOnlySource);
+        videoOnlySnapshot.durationMs = static_cast<std::int64_t>(
+            videoOnlyProbe.durationSeconds * 1000.0 + 0.5);
+        ExportOptions videoOnlyOptions{};
+        videoOnlyOptions.fragment = ExportFragment::Segment;
+        videoOnlyOptions.image = ExportImage::FullFrame;
+        videoOnlyOptions.audio = ExportAudio::Original;
+        videoOnlyOptions.destinationPath = directory + L"\\video-only-segment.mp4";
+        ExportPlan videoOnlyPlan = BuildExportPlan(
+            videoOnlySnapshot, videoOnlyProbe, videoOnlyOptions, region);
+        runner.True(videoOnlyPlan.valid && !videoOnlyPlan.outputHasAudio &&
+            videoOnlyPlan.expectedAudioCodecs.empty() &&
+            HasArgument(videoOnlyPlan.ffmpegArguments, L"-an") &&
+            videoOnlyPlan.summary.find(L"Аудіо: відсутнє") != std::wstring::npos,
+            L"video-only A-B plan disables audio and reports its absence");
+        std::atomic_bool audioCancellation{false};
+        const ExportJobResult videoOnlyExport = RunExportJob(ffmpeg, ffprobe,
+            videoOnlySnapshot, videoOnlyOptions, videoOnlyPlan, false, audioCancellation);
+        const MediaProbeResult videoOnlyOutput = ProbeMediaFile(
+            ffprobe, videoOnlyOptions.destinationPath);
+        runner.True(videoOnlyExport.success && videoOnlyOutput.valid &&
+            !videoOnlyOutput.HasAudio(),
+            L"video-only full-frame A-B export succeeds with Original audio selected");
+        DeleteFileW(videoOnlyOptions.destinationPath.c_str());
+
+        videoOnlyOptions.destinationPath = directory + L"\\phantom-audio-segment.mp4";
+        videoOnlyPlan = BuildExportPlan(
+            videoOnlySnapshot, videoOnlyProbe, videoOnlyOptions, region);
+        videoOnlyPlan.outputHasAudio = true;
+        videoOnlyPlan.expectedAudioCodecs = {L"aac"};
+        const ExportJobResult phantomAudioExport = RunExportJob(ffmpeg, ffprobe,
+            videoOnlySnapshot, videoOnlyOptions, videoOnlyPlan, false, audioCancellation);
+        const MediaProbeResult phantomAudioOutput = ProbeMediaFile(
+            ffprobe, videoOnlyOptions.destinationPath);
+        runner.True(phantomAudioExport.success && phantomAudioOutput.valid &&
+            !phantomAudioOutput.HasAudio(),
+            L"fresh source probe accepts absent audio despite a phantom audio expectation");
+        runner.True(SameFileIdentity(videoOnlySnapshot.sourceIdentity,
+            CaptureExportFileIdentity(videoOnlySource)),
+            L"video-only audio fallback preserves the original source");
+        DeleteFileW(videoOnlyOptions.destinationPath.c_str());
+    }
+
+    const std::wstring prefixAudioSource = directory + L"\\short-audio-source.mp4";
+    const ExportProcessResult prefixAudioFixture = RunHiddenExportProcess(ffmpeg,
+        {L"-hide_banner", L"-loglevel", L"error", L"-y",
+         L"-f", L"lavfi", L"-i", L"testsrc2=size=320x180:rate=30:duration=4",
+         L"-f", L"lavfi", L"-i", L"sine=frequency=880:sample_rate=48000:duration=1",
+         L"-map", L"0:v:0", L"-map", L"1:a:0", L"-t", L"4",
+         L"-c:v", L"libx264", L"-preset", L"ultrafast", L"-pix_fmt", L"yuv420p",
+         L"-c:a", L"aac", L"-f", L"mp4", prefixAudioSource});
+    const MediaProbeResult prefixAudioProbe = ProbeMediaFile(ffprobe, prefixAudioSource);
+    runner.True(prefixAudioFixture.started && prefixAudioFixture.exitCode == 0 &&
+        prefixAudioProbe.valid && prefixAudioProbe.HasAudio() &&
+        prefixAudioProbe.durationSeconds > 3.9,
+        L"real audio regression creates four seconds of video with one second of audio");
+    if (prefixAudioProbe.valid && prefixAudioProbe.HasAudio()) {
+        ExportSnapshot prefixAudioSnapshot = snapshot;
+        prefixAudioSnapshot.sourcePath = prefixAudioSource;
+        prefixAudioSnapshot.sourceIdentity = CaptureExportFileIdentity(prefixAudioSource);
+        prefixAudioSnapshot.durationMs = static_cast<std::int64_t>(
+            prefixAudioProbe.durationSeconds * 1000.0 + 0.5);
+        prefixAudioSnapshot.segmentStartMs = 2000;
+        prefixAudioSnapshot.segmentEndMs = 3500;
+        ExportOptions prefixAudioOptions{};
+        prefixAudioOptions.fragment = ExportFragment::Segment;
+        prefixAudioOptions.image = ExportImage::FullFrame;
+        prefixAudioOptions.audio = ExportAudio::Original;
+        prefixAudioOptions.destinationPath = directory + L"\\after-audio-segment.mp4";
+        ExportPlan prefixAudioPlan = BuildExportPlan(
+            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region);
+        runner.True(prefixAudioPlan.valid && prefixAudioPlan.outputHasAudio &&
+            !prefixAudioPlan.expectedAudioCodecs.empty(),
+            L"source audio is initially expected for an A-B interval after it ends");
+        std::atomic_bool audioCancellation{false};
+        const ExportJobResult afterAudioExport = RunExportJob(ffmpeg, ffprobe,
+            prefixAudioSnapshot, prefixAudioOptions, prefixAudioPlan, false, audioCancellation);
+        const MediaProbeResult afterAudioOutput = ProbeMediaFile(
+            ffprobe, prefixAudioOptions.destinationPath);
+        runner.True(afterAudioExport.success && afterAudioOutput.valid &&
+            !afterAudioOutput.HasAudio(),
+            L"A-B export accepts no audio when the selected interval has no decoded samples");
+        DeleteFileW(prefixAudioOptions.destinationPath.c_str());
+
+        prefixAudioSnapshot.segmentStartMs = 100;
+        prefixAudioSnapshot.segmentEndMs = 900;
+        prefixAudioOptions.destinationPath = directory + L"\\with-audio-segment.mp4";
+        prefixAudioPlan = BuildExportPlan(
+            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region);
+        const ExportJobResult withAudioExport = RunExportJob(ffmpeg, ffprobe,
+            prefixAudioSnapshot, prefixAudioOptions, prefixAudioPlan, false, audioCancellation);
+        const MediaProbeResult withAudioOutput = ProbeMediaFile(
+            ffprobe, prefixAudioOptions.destinationPath);
+        runner.True(withAudioExport.success && withAudioOutput.valid &&
+            withAudioOutput.HasAudio(),
+            L"A-B export preserves real audio samples inside the selected interval");
+        DeleteFileW(prefixAudioOptions.destinationPath.c_str());
+
+        prefixAudioOptions.destinationPath = directory + L"\\protected-audio-destination.mp4";
+        const bool copiedDestination = CopyFileW(source.c_str(),
+            prefixAudioOptions.destinationPath.c_str(), FALSE) != FALSE;
+        const ExportFileIdentity destinationBefore = CaptureExportFileIdentity(
+            prefixAudioOptions.destinationPath);
+        prefixAudioPlan = BuildExportPlan(
+            prefixAudioSnapshot, prefixAudioProbe, prefixAudioOptions, region);
+        prefixAudioPlan.ffmpegArguments.push_back(L"-an");
+        const ExportJobResult droppedAudioExport = RunExportJob(ffmpeg, ffprobe,
+            prefixAudioSnapshot, prefixAudioOptions, prefixAudioPlan, true, audioCancellation);
+        runner.True(!droppedAudioExport.success && !droppedAudioExport.cancelled &&
+            droppedAudioExport.diagnostics.find(L"Перевірка контейнера") != std::wstring::npos,
+            L"audio fallback rejects an output that dropped genuine A-B audio");
+        runner.True(copiedDestination && SameFileIdentity(destinationBefore,
+            CaptureExportFileIdentity(prefixAudioOptions.destinationPath)) &&
+            SameFileIdentity(prefixAudioSnapshot.sourceIdentity,
+                CaptureExportFileIdentity(prefixAudioSource)),
+            L"rejected genuine-audio loss preserves both source and existing destination");
+        runner.True(!droppedAudioExport.partialPath.empty() &&
+            GetFileAttributesW(droppedAudioExport.partialPath.c_str()) == INVALID_FILE_ATTRIBUTES,
+            L"rejected genuine-audio loss removes its temporary partial output");
+        DeleteFileW(prefixAudioOptions.destinationPath.c_str());
+    }
+    DeleteFileW(prefixAudioSource.c_str());
+    DeleteFileW(videoOnlySource.c_str());
+
     ExportOptions protectionOptions{};
     protectionOptions.destinationPath = source;
     ExportPlan protectionPlan = BuildExportPlan(snapshot, probe, protectionOptions, region);
