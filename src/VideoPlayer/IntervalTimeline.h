@@ -91,6 +91,19 @@ inline ScaledPosition ScalePosition(
 
 }  // namespace interval_timeline_detail
 
+inline LONG IntervalTimelineX(const std::int64_t positionMs,
+    const std::int64_t durationMs, const RECT& timeline) noexcept {
+    const auto width = static_cast<std::int64_t>(timeline.right) - timeline.left;
+    if (durationMs <= 0 || width <= 0 || width > (std::numeric_limits<int>::max)()) return timeline.left;
+    const auto position = std::clamp(positionMs, std::int64_t{0}, durationMs);
+    const auto scaled = interval_timeline_detail::ScalePosition(
+        static_cast<std::uint64_t>(position), static_cast<std::uint64_t>(durationMs),
+        static_cast<std::uint32_t>(width));
+    const auto rounded = scaled.quotient +
+        (scaled.remainder >= static_cast<std::uint64_t>(durationMs) - scaled.remainder ? 1 : 0);
+    return static_cast<LONG>(timeline.left + static_cast<std::int64_t>(rounded));
+}
+
 // Clips the range to the video and returns its occupied pixels in [left, right).
 // Left uses floor, right uses ceil, so even a subpixel range is visible. Wider
 // than INT_MAX timelines and malformed/fully clipped ranges return an empty RECT.

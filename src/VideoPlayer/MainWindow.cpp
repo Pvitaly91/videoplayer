@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -525,6 +527,11 @@ LRESULT MainWindow::HandleMessage(
         if (shutdownComplete_ || IsWindowEnabled(window_) == FALSE) {
             return 0;
         }
+        if (LOWORD(wParam) == IDC_SAVED_INTERVAL_LIST && HIWORD(wParam) == CBN_SELCHANGE) {
+            RegisterInteraction();
+            InvalidateIntervalTimeline();
+            return 0;
+        }
         if (HIWORD(wParam) == BN_CLICKED) {
             RegisterInteraction();
             switch (LOWORD(wParam)) {
@@ -550,6 +557,10 @@ LRESULT MainWindow::HandleMessage(
                 return 0;
             case IDC_ADD_REMOVAL_BUTTON:
                 AddRemovalInterval();
+                FinishMouseControlInteraction();
+                return 0;
+            case IDC_REMOVE_SAVED_INTERVAL:
+                RemoveSavedInterval();
                 FinishMouseControlInteraction();
                 return 0;
             case IDC_MUTE_BUTTON:
@@ -871,7 +882,11 @@ LRESULT MainWindow::HandleControlBarMessage(
         const auto* draw = reinterpret_cast<const NMCUSTOMDRAW*>(lParam);
         if (draw == nullptr || draw->hdr.hwndFrom != seekSlider_ ||
             draw->hdr.code != NM_CUSTOMDRAW) break;
-        if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
+        if (draw->dwDrawStage == CDDS_POSTPAINT) {
+            DrawTimelineMarkers(draw->hdc, SeekTimelineRect(), true);
+            return CDRF_DODEFAULT;
+        }
         if (draw->dwItemSpec == TBCD_CHANNEL) {
             if (draw->dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYPOSTPAINT;
             if (draw->dwDrawStage == CDDS_ITEMPOSTPAINT) {
@@ -886,6 +901,7 @@ LRESULT MainWindow::HandleControlBarMessage(
                     --timeline.bottom;
                 }
                 DrawSavedIntervals(draw->hdc, timeline);
+                DrawCurrentInterval(draw->hdc, timeline);
             }
         }
         return CDRF_DODEFAULT;
@@ -906,9 +922,9 @@ LRESULT MainWindow::HandleControlBarMessage(
             const HWND hitWindow = GetCursorPos(&cursor) != FALSE
                 ? WindowFromPoint(cursor)
                 : nullptr;
-            const std::array<HWND, 17> interactiveControls{
+            const std::array<HWND, 19> interactiveControls{
                 openButton_, playButton_, stopButton_, exportButton_,
-                removeSegmentButton_, addRemovalButton_, seekSlider_,
+                removeSegmentButton_, addRemovalButton_, savedIntervalList_, removeSavedIntervalButton_, seekSlider_,
                 muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
                 hideToolbarButton_, loopVideoButton_, loopStartButton_,
                 loopEndButton_, loopSegmentButton_, loopClearButton_};
@@ -1073,6 +1089,204 @@ void MainWindow::DrawSavedIntervals(const HDC dc, const RECT& timeline) const no
     RestoreDC(dc, savedDc);
 }
 
+void MainWindow::DrawCurrentInterval(const HDC dc, const RECT& timeline) const noexcept {
+    if (dc == nullptr || !hasMedia_ || !playbackLoop_.HasSegment(playbackSnapshot_.durationMs)) return;
+    const RECT bounds = IntervalTimelineRect({playbackLoop_.StartMs(), playbackLoop_.EndMs()},
+        playbackSnapshot_.durationMs, timeline);
+    const int saved = SaveDC(dc);
+    if (saved == 0) return;
+    SetDCBrushColor(dc, IsHighContrastEnabled() ? GetSysColor(COLOR_HIGHLIGHT) : RGB(0, 160, 230));
+    FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    RestoreDC(dc, saved);
+}
+
+RECT MainWindow::SeekTimelineRect() const noexcept {
+    RECT channel{}, thumb{};
+    if (seekSlider_ == nullptr) return {};
+    SendMessageW(seekSlider_, TBM_GETCHANNELRECT, 0, reinterpret_cast<LPARAM>(&channel));
+    SendMessageW(seekSlider_, TBM_GETTHUMBRECT, 0, reinterpret_cast<LPARAM>(&thumb));
+    return TrackbarPointerRange(channel, thumb);
+}
+
+void MainWindow::DrawTimelineMarkers(const HDC dc, const RECT& timeline, const bool labels) const noexcept {
+    if (dc == nullptr || !hasMedia_ || playbackSnapshot_.durationMs <= 0 || timeline.right <= timeline.left) return;
+    const int saved = SaveDC(dc);
+    if (saved == 0) return;
+    HFONT font = labels ? CreateFontW(-Scale(10), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_PITCH, L"Segoe UI") : nullptr;
+    if (font != nullptr) SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    const auto draw = [&](const std::int64_t time, const bool start, const COLORREF color, const bool caption) {
+        if (time < 0 || time > playbackSnapshot_.durationMs) return;
+        const LONG x = IntervalTimelineX(time, playbackSnapshot_.durationMs, timeline);
+        const int half = labels ? (std::max)(1, Scale(1)) : 1;
+        RECT line{(std::max)(timeline.left, x - half), labels ? (std::max)(0L, timeline.top - Scale(3)) : timeline.top,
+            (std::min)(timeline.right, x + half + 1), labels ? timeline.bottom + Scale(5) : timeline.bottom};
+        SetDCBrushColor(dc, color);
+        FillRect(dc, &line, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        if (labels) {
+            RECT cap{(std::max)(timeline.left, x - Scale(4)), (std::max)(0L, timeline.top - Scale(4)),
+                (std::min)(timeline.right, x + Scale(4) + 1), timeline.top};
+            FillRect(dc, &cap, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            if (caption) {
+                SetTextColor(dc, IsHighContrastEnabled() ? GetSysColor(COLOR_BTNTEXT) : color);
+                RECT text{x - Scale(10), (std::max)(0L, timeline.top - Scale(16)),
+                    x + Scale(10), (std::max)(Scale(11), static_cast<int>(timeline.top - Scale(4)))};
+                DrawTextW(dc, start ? L"A" : L"B", 1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+        }
+    };
+    const auto selected = SendMessageW(savedIntervalList_, CB_GETCURSEL, 0, 0);
+    const auto orange = IsHighContrastEnabled() ? GetSysColor(COLOR_HIGHLIGHT) : kSavedIntervalColor;
+    for (std::size_t index = 0; index < removalIntervals_.size(); ++index) {
+        const auto& interval = removalIntervals_[index];
+        draw(interval.startMs, true, orange, selected == static_cast<LRESULT>(index));
+        draw(interval.endMs, false, orange, selected == static_cast<LRESULT>(index));
+    }
+    draw(playbackLoop_.StartMs(), true, IsHighContrastEnabled() ? GetSysColor(COLOR_HIGHLIGHT) : RGB(0, 160, 230), true);
+    draw(playbackLoop_.EndMs(), false, IsHighContrastEnabled() ? GetSysColor(COLOR_HIGHLIGHT) : RGB(0, 190, 100), true);
+    RestoreDC(dc, saved);
+    if (font != nullptr) DeleteObject(font);
+}
+
+int MainWindow::SavedIntervalAtPointer(const int mouseX) const noexcept {
+    const auto time = PreviewTimeFromChannelX(mouseX, SeekTimelineRect(), playbackSnapshot_.durationMs);
+    for (std::size_t i = 0; i < removalIntervals_.size(); ++i) {
+        if (time >= removalIntervals_[i].startMs && time < removalIntervals_[i].endMs) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool MainWindow::BeginMarkerDrag(const int mouseX, const int mouseY) {
+    if (markerDragging_ || !hasMedia_ || !playerInitialized_ || HasActiveExportDialog(window_)) return false;
+    playbackSnapshot_ = player_.Snapshot();
+    const auto duration = playbackSnapshot_.durationMs;
+    if (!playbackSnapshot_.seekable || duration <= 0 || playbackSnapshot_.state == PlaybackState::Opening ||
+        playbackSnapshot_.state == PlaybackState::Error) return false;
+    const RECT timeline = SeekTimelineRect();
+    if (timeline.right <= timeline.left) return false;
+    // Marker flags live above the channel; the channel/thumb keep normal seek.
+    if (mouseY >= 0 && mouseY >= timeline.top) return false;
+    int index = -2;
+    bool start = true;
+    long long distance = Scale(8) + 1;
+    const auto consider = [&](const VideoInterval interval, const int candidateIndex) {
+        for (const bool candidateStart : {true, false}) {
+            const auto time = candidateStart ? interval.startMs : interval.endMs;
+            if (time < 0 || time > duration) continue;
+            const auto delta = std::llabs(static_cast<long long>(mouseX) - IntervalTimelineX(time, duration, timeline));
+            if (delta < distance) { distance = delta; index = candidateIndex; start = candidateStart; }
+        }
+    };
+    consider({playbackLoop_.StartMs(), playbackLoop_.EndMs()}, -1);
+    const auto selected = SendMessageW(savedIntervalList_, CB_GETCURSEL, 0, 0);
+    if (selected >= 0 && static_cast<std::size_t>(selected) < removalIntervals_.size()) {
+        consider(removalIntervals_[selected], static_cast<int>(selected));
+    }
+    for (std::size_t i = 0; i < removalIntervals_.size(); ++i) consider(removalIntervals_[i], static_cast<int>(i));
+    if (index == -2 || distance > Scale(8)) return false;
+    const auto generation = player_.Generation();
+    SetFocus(seekSlider_);
+    SetCapture(seekSlider_);
+    if (GetCapture() != seekSlider_) return true;
+    if (!hasMedia_ || generation != player_.Generation()) { ReleaseCapture(); return true; }
+    markerSavedIndex_ = index;
+    markerStart_ = start;
+    markerGeneration_ = generation;
+    markerOriginalLoop_ = playbackLoop_;
+    markerOriginal_ = index < 0 ? VideoInterval{playbackLoop_.StartMs(), playbackLoop_.EndMs()} : removalIntervals_[index];
+    if (index >= 0) SendMessageW(savedIntervalList_, CB_SETCURSEL, index, 0);
+    markerDragging_ = true;
+    seekDragging_ = false;
+    mouseControlInteraction_ = true;
+    playbackLoop_.CancelPending();
+    HideSeekPreview();
+    RegisterInteraction();
+    InvalidateIntervalTimeline();
+    return true;
+}
+
+void MainWindow::UpdateMarkerDrag(const int mouseX) {
+    if (!markerDragging_) return;
+    if (markerSavedIndex_ >= 0 && static_cast<std::size_t>(markerSavedIndex_) >= removalIntervals_.size()) {
+        EndMarkerDrag(false);
+        if (GetCapture() == seekSlider_) ReleaseCapture();
+        return;
+    }
+    if (markerGeneration_ != player_.Generation() || playbackSnapshot_.state == PlaybackState::Error) {
+        EndMarkerDrag(false);
+        if (GetCapture() == seekSlider_) ReleaseCapture();
+        return;
+    }
+    const auto duration = playbackSnapshot_.durationMs;
+    const auto desired = PreviewTimeFromChannelX(mouseX, SeekTimelineRect(), duration);
+    VideoInterval candidate = markerSavedIndex_ < 0
+        ? VideoInterval{playbackLoop_.StartMs(), playbackLoop_.EndMs()}
+        : removalIntervals_[markerSavedIndex_];
+    if (markerStart_) candidate.startMs = desired;
+    else candidate.endMs = desired;
+    if (candidate.startMs < 0 || candidate.startMs >= duration || candidate.endMs > duration ||
+        (candidate.endMs >= 0 && candidate.endMs - candidate.startMs < 500)) return;
+    for (std::size_t i = 0; i < removalIntervals_.size(); ++i) {
+        if (static_cast<int>(i) == markerSavedIndex_) continue;
+        if (candidate.endMs < 0 ? IsInsideSavedInterval(candidate.startMs, {removalIntervals_[i]})
+                               : OverlapsSavedInterval(candidate, {removalIntervals_[i]})) return;
+    }
+    if (markerSavedIndex_ >= 0) {
+        if (playbackLoop_.HasSegment(duration) && OverlapsSavedInterval(candidate,
+            {{playbackLoop_.StartMs(), playbackLoop_.EndMs()}})) return;
+        const auto currentA = playbackLoop_.StartMs();
+        if (currentA >= 0 && candidate.startMs < currentA && currentA < candidate.endMs) return;
+        removalIntervals_[markerSavedIndex_] = candidate;
+        RefreshSavedIntervalList();
+    } else if (!playbackLoop_.MovePoint(markerStart_, desired, duration)) return;
+    RegisterInteraction(true);
+    UpdateLoopControls();
+    InvalidateIntervalTimeline();
+}
+
+void MainWindow::EndMarkerDrag(const bool cancel) noexcept {
+    if (!markerDragging_) return;
+    markerDragging_ = false;
+    if (cancel && hasMedia_ && markerGeneration_ == player_.Generation() &&
+        playbackSnapshot_.state != PlaybackState::Error) {
+        if (markerSavedIndex_ < 0) { playbackLoop_ = markerOriginalLoop_; playbackLoop_.CancelPending(); }
+        else if (static_cast<std::size_t>(markerSavedIndex_) < removalIntervals_.size()) removalIntervals_[markerSavedIndex_] = markerOriginal_;
+    }
+    markerSavedIndex_ = -1;
+    InvalidateIntervalTimeline();
+}
+
+void MainWindow::RefreshSavedIntervalList() {
+    const bool same = listedRemovalIntervals_.size() == removalIntervals_.size() &&
+        std::equal(listedRemovalIntervals_.begin(), listedRemovalIntervals_.end(), removalIntervals_.begin(),
+            [](const VideoInterval& a, const VideoInterval& b) { return a.startMs == b.startMs && a.endMs == b.endMs; });
+    if (same || savedIntervalList_ == nullptr) return;
+    const auto selected = SendMessageW(savedIntervalList_, CB_GETCURSEL, 0, 0);
+    SendMessageW(savedIntervalList_, CB_RESETCONTENT, 0, 0);
+    for (std::size_t i = 0; i < removalIntervals_.size(); ++i) {
+        const auto& interval = removalIntervals_[i];
+        const std::wstring text = std::to_wstring(i + 1) + L". " + FormatLoopPoint(interval.startMs) +
+            L"–" + FormatLoopPoint(interval.endMs);
+        SendMessageW(savedIntervalList_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+    }
+    if (!removalIntervals_.empty()) SendMessageW(savedIntervalList_, CB_SETCURSEL,
+        (std::max)(LRESULT{0}, (std::min)(selected, static_cast<LRESULT>(removalIntervals_.size() - 1))), 0);
+    listedRemovalIntervals_ = removalIntervals_;
+}
+
+void MainWindow::RemoveSavedInterval(int index) {
+    if (!hasMedia_ || !playerInitialized_ || shutdownComplete_ || markerDragging_ || HasActiveExportDialog(window_)) return;
+    if (index < 0) index = static_cast<int>(SendMessageW(savedIntervalList_, CB_GETCURSEL, 0, 0));
+    if (index < 0 || static_cast<std::size_t>(index) >= removalIntervals_.size()) return;
+    removalIntervals_.erase(removalIntervals_.begin() + index);
+    RefreshSavedIntervalList();
+    InvalidateIntervalTimeline();
+    RegisterInteraction();
+    RefreshControls();
+}
+
 void MainWindow::DrawCompactProgress(const HDC dc, const RECT& bounds) const noexcept {
     if (dc == nullptr) return;
     const int savedDc = SaveDC(dc);
@@ -1087,6 +1301,8 @@ void MainWindow::DrawCompactProgress(const HDC dc, const RECT& bounds) const noe
         FillRect(dc, &completed, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
     DrawSavedIntervals(dc, bounds);
+    DrawCurrentInterval(dc, bounds);
+    DrawTimelineMarkers(dc, bounds, false);
     RestoreDC(dc, savedDc);
 }
 
@@ -1136,6 +1352,11 @@ LRESULT MainWindow::HandleSeekSubclass(
     const LPARAM lParam) {
     switch (message) {
     case WM_MOUSEMOVE: {
+        if (markerDragging_) {
+            UpdateMarkerDrag(GET_X_LPARAM(lParam));
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+            return 0;
+        }
         if (!seekMouseTracking_) {
             TRACKMOUSEEVENT tracking{};
             tracking.cbSize = sizeof(tracking);
@@ -1162,6 +1383,11 @@ LRESULT MainWindow::HandleSeekSubclass(
         break;
 
     case WM_LBUTTONDOWN:
+        if (BeginMarkerDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) return 0;
+        if (const int index = SavedIntervalAtPointer(GET_X_LPARAM(lParam)); index >= 0) {
+            SendMessageW(savedIntervalList_, CB_SETCURSEL, index, 0);
+            InvalidateIntervalTimeline();
+        }
         if (hasMedia_ && player_.IsSeekable() && player_.DurationMs() > 0) {
             playbackLoop_.CancelPending();
             seekDragging_ = true;
@@ -1182,6 +1408,14 @@ LRESULT MainWindow::HandleSeekSubclass(
         break;
 
     case WM_LBUTTONUP:
+        if (markerDragging_) {
+            UpdateMarkerDrag(GET_X_LPARAM(lParam));
+            EndMarkerDrag(false);
+            if (GetCapture() == window) ReleaseCapture();
+            RefreshControls();
+            FinishMouseControlInteraction();
+            return 0;
+        }
         if (seekDragging_) {
             RegisterInteraction();
             SetSeekSliderFromPointer(GET_X_LPARAM(lParam));
@@ -1197,7 +1431,7 @@ LRESULT MainWindow::HandleSeekSubclass(
         break;
 
     case WM_CANCELMODE:
-        if (seekDragging_) {
+        if (seekDragging_ || markerDragging_) {
             CancelTransientUi();
             RefreshControls();
             return 0;
@@ -1205,7 +1439,7 @@ LRESULT MainWindow::HandleSeekSubclass(
         break;
 
     case WM_CAPTURECHANGED:
-        if (seekDragging_ && reinterpret_cast<HWND>(lParam) != window) {
+        if ((seekDragging_ || markerDragging_) && reinterpret_cast<HWND>(lParam) != window) {
             CancelTransientUi();
             RefreshControls();
             return 0;
@@ -1213,12 +1447,49 @@ LRESULT MainWindow::HandleSeekSubclass(
         break;
 
     case WM_NCDESTROY:
+        EndMarkerDrag(false);
         seekMouseTracking_ = false;
         seekDragging_ = false;
         if (GetCapture() == window) {
             ReleaseCapture();
         }
         break;
+
+    case WM_KEYDOWN:
+        if (markerDragging_ && wParam == VK_ESCAPE) {
+            CancelTransientUi();
+            RefreshControls();
+            return 0;
+        }
+        break;
+
+    case WM_RBUTTONUP: {
+        if (markerDragging_ || HasActiveExportDialog(window_) || !hasMedia_) return 0;
+        const int index = SavedIntervalAtPointer(GET_X_LPARAM(lParam));
+        if (index < 0) break;
+        SendMessageW(savedIntervalList_, CB_SETCURSEL, index, 0);
+        InvalidateIntervalTimeline();
+        const auto interval = removalIntervals_[index];
+        const auto generation = player_.Generation();
+        mouseControlInteraction_ = true;
+        SetFocus(window);
+        RegisterInteraction();
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return 0;
+        AppendMenuW(menu, MF_STRING, 1, L"Прибрати цей відрізок зі списку");
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ClientToScreen(window, &point);
+        const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            point.x, point.y, 0, window_, nullptr);
+        DestroyMenu(menu);
+        if (command == 1 && generation == player_.Generation() &&
+            static_cast<std::size_t>(index) < removalIntervals_.size() &&
+            removalIntervals_[index].startMs == interval.startMs && removalIntervals_[index].endMs == interval.endMs) {
+            RemoveSavedInterval(index);
+        }
+        FinishMouseControlInteraction();
+        return 0;
+    }
 
     default:
         break;
@@ -1377,6 +1648,12 @@ bool MainWindow::CreateChildWindows() {
         0, L"STATIC", L"У списку на видалення: 0",
         child | SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
         0, 0, 0, 0, controlBar_, ControlId(IDC_REMOVAL_COUNT_LABEL), instance_, nullptr);
+    savedIntervalList_ = CreateWindowExW(
+        0, WC_COMBOBOXW, nullptr, child | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        0, 0, 0, 0, controlBar_, ControlId(IDC_SAVED_INTERVAL_LIST), instance_, nullptr);
+    removeSavedIntervalButton_ = CreateWindowExW(
+        0, L"BUTTON", L"Прибрати зі списку", child | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 0, 0, controlBar_, ControlId(IDC_REMOVE_SAVED_INTERVAL), instance_, nullptr);
     seekSlider_ = CreateWindowExW(
         0, TRACKBAR_CLASSW, nullptr,
         child | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_ENABLESELRANGE,
@@ -1425,11 +1702,11 @@ bool MainWindow::CreateChildWindows() {
         0, 0, 0, 0, toolbarRestorePopup_,
         ControlId(IDC_RESTORE_TOOLBAR_BUTTON), instance_, nullptr);
 
-    const std::array<HWND, 28> controls{
+    const std::array<HWND, 30> controls{
         videoWindow_, videoRenderWindow_, controlBar_, fullscreenControlBar_, progressStrip_,
         toolbarRestorePopup_, toolbarRestoreButton_,
         openButton_, playButton_, stopButton_, exportButton_, removeSegmentButton_,
-        addRemovalButton_, removalCountLabel_,
+        addRemovalButton_, removalCountLabel_, savedIntervalList_, removeSavedIntervalButton_,
         seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, loopVideoButton_, loopStartButton_, loopEndButton_,
@@ -1493,9 +1770,9 @@ void MainWindow::ApplySystemFont() {
         uiFont_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     }
 
-    const std::array<HWND, 22> controls{
+    const std::array<HWND, 24> controls{
         openButton_, playButton_, stopButton_, exportButton_, removeSegmentButton_,
-        addRemovalButton_, removalCountLabel_,
+        addRemovalButton_, removalCountLabel_, savedIntervalList_, removeSavedIntervalButton_,
         seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, toolbarRestoreButton_, loopVideoButton_, loopStartButton_,
@@ -1593,6 +1870,13 @@ void MainWindow::LayoutChildren(const int width, const int height) {
     left = margin + addRemovalWidth + gap;
     MoveWindow(removeSegmentButton_, left, removalRowY, removeWidth, rowHeight, TRUE);
     left += removeWidth + gap;
+    const int listWidth = (std::min)(Scale(180), (std::max)(Scale(100),
+        width - left - Scale(148) - 2 * gap - margin));
+    MoveWindow(savedIntervalList_, left, removalRowY, listWidth, Scale(220), TRUE);
+    left += listWidth + gap;
+    const int removeSavedWidth = Scale(148);
+    MoveWindow(removeSavedIntervalButton_, left, removalRowY, removeSavedWidth, rowHeight, TRUE);
+    left += removeSavedWidth + gap;
     MoveWindow(removalCountLabel_, left, removalRowY,
         (std::max)(0, width - margin - left), rowHeight, TRUE);
 
@@ -1627,14 +1911,14 @@ bool MainWindow::ReparentControlBarControls(const HWND parent) noexcept {
         return false;
     }
 
-    const std::array<HWND, 21> controls{
+    const std::array<HWND, 23> controls{
         openButton_, playButton_, stopButton_, exportButton_, removeSegmentButton_,
-        addRemovalButton_, removalCountLabel_,
+        addRemovalButton_, removalCountLabel_, savedIntervalList_, removeSavedIntervalButton_,
         seekSlider_, currentTimeLabel_,
         durationLabel_, muteButton_, volumeSlider_, zoomButton_, fullscreenButton_,
         hideToolbarButton_, loopVideoButton_, loopStartButton_, loopEndButton_,
         loopSegmentButton_, loopClearButton_, loopRangeLabel_};
-    std::array<HWND, 21> previousParents{};
+    std::array<HWND, 23> previousParents{};
     for (std::size_t index = 0; index < controls.size(); ++index) {
         if (controls[index] == nullptr || IsWindow(controls[index]) == FALSE) {
             return false;
@@ -1745,7 +2029,7 @@ void MainWindow::UpdateProgressStrip() noexcept {
     input.positionMs = playbackSnapshot_.positionMs;
     input.durationMs = playbackSnapshot_.durationMs;
     const ProgressStripDecision decision = EvaluateProgressStrip(input);
-    const bool hasSavedIntervals = !removalIntervals_.empty() && input.hasMedia &&
+    const bool hasSavedIntervals = (!removalIntervals_.empty() || playbackLoop_.StartMs() >= 0) && input.hasMedia &&
         input.durationMs > 0 && input.availableWidth > 0 &&
         input.compactMode && !input.toolbarVisible;
     const int previousCompletedWidth = progressCompletedWidth_;
@@ -1869,10 +2153,11 @@ void MainWindow::CancelTransientUi() noexcept {
         return;
     }
     cancellingTransient_ = true;
+    EndMarkerDrag(true);
     EndZoomPan();
     zoomWheelRemainder_ = 0;
     pendingVideoRefocus_ = pendingVideoRefocus_ || mouseControlInteraction_ ||
-        seekDragging_ || volumeDragging_;
+        seekDragging_ || markerDragging_ || volumeDragging_;
     seekDragging_ = false;
     volumeDragging_ = false;
     mouseControlInteraction_ = false;
@@ -1980,6 +2265,11 @@ bool MainWindow::HandleHotKey(
     const UINT key,
     const bool controlDown,
     const bool repeated) {
+    if (markerDragging_ && key == VK_ESCAPE) {
+        CancelTransientUi();
+        RefreshControls();
+        return true;
+    }
     if (!controlDown && zoomState_ == ZoomState::Applied &&
         (key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN)) {
         PanZoomByKeyboard(key);
@@ -2135,7 +2425,7 @@ void MainWindow::ShowExportVideoDialog() {
 
 void MainWindow::AddRemovalInterval() {
     if (!hasMedia_ || !playerInitialized_ || shutdownComplete_ ||
-        HasActiveExportDialog(window_)) return;
+        HasActiveExportDialog(window_) || markerDragging_) return;
     playbackSnapshot_ = player_.Snapshot();
     if (!playbackLoop_.HasSegment(playbackSnapshot_.durationMs) ||
         playbackSnapshot_.state == PlaybackState::Opening ||
@@ -2339,7 +2629,7 @@ void MainWindow::TogglePlayback() {
 }
 
 void MainWindow::ToggleWholeVideoLoop() {
-    if (!hasMedia_ || !playerInitialized_ || player_.State() == PlaybackState::Error) {
+    if (!hasMedia_ || !playerInitialized_ || markerDragging_ || player_.State() == PlaybackState::Error) {
         return;
     }
     RegisterInteraction();
@@ -2351,7 +2641,7 @@ void MainWindow::ToggleWholeVideoLoop() {
 }
 
 void MainWindow::SetLoopPoint(const bool start) {
-    if (!hasMedia_ || !playerInitialized_) {
+    if (!hasMedia_ || !playerInitialized_ || markerDragging_) {
         return;
     }
     playbackSnapshot_ = player_.Snapshot();
@@ -2380,7 +2670,7 @@ void MainWindow::SetLoopPoint(const bool start) {
 }
 
 void MainWindow::ToggleSegmentLoop() {
-    if (!hasMedia_ || !playerInitialized_) {
+    if (!hasMedia_ || !playerInitialized_ || markerDragging_) {
         return;
     }
     playbackSnapshot_ = player_.Snapshot();
@@ -2397,6 +2687,7 @@ void MainWindow::ToggleSegmentLoop() {
 }
 
 void MainWindow::ClearLoopSegment() {
+    if (markerDragging_) CancelTransientUi();
     playbackLoop_.ClearSegment();
     RegisterInteraction();
     RefreshControls();
@@ -2415,7 +2706,7 @@ void MainWindow::ApplyPlaybackLoop() {
     // Manual Stop/Pause must win over a late EndReached notification. Update
     // still observes generation/errors, but cannot restart user-stopped media.
     const LoopAction action = playbackLoop_.Update(
-        playbackSnapshot_, GetTickCount64(), seekDragging_ || !loopPlaybackRequested_);
+        playbackSnapshot_, GetTickCount64(), seekDragging_ || markerDragging_ || !loopPlaybackRequested_);
     applyingPlaybackLoop_ = true;
     if (action.kind == LoopActionKind::Seek) {
         player_.Seek(action.positionMs);
@@ -2463,8 +2754,10 @@ void MainWindow::UpdateLoopControls() {
         label += L"   Перетин зі збереженим відрізком";
     }
     SetWindowTextW(loopRangeLabel_, label.c_str());
-    if (timelineDurationMs_ != snapshot.durationMs) {
+    if (timelineDurationMs_ != snapshot.durationMs || timelineStartMs_ != start || timelineEndMs_ != end) {
         timelineDurationMs_ = snapshot.durationMs;
+        timelineStartMs_ = start;
+        timelineEndMs_ = end;
         InvalidateIntervalTimeline();
     }
     if (playbackLoop_.HasSegment(snapshot.durationMs)) {
@@ -2954,7 +3247,7 @@ void MainWindow::UpdateControlBarVisibilityFromCursor(
     if (volumeDragging_ && GetCapture() != volumeSlider_) {
         volumeDragging_ = false;
     }
-    if (mouseControlInteraction_ && !seekDragging_ && !volumeDragging_ &&
+    if (mouseControlInteraction_ && !seekDragging_ && !markerDragging_ && !volumeDragging_ &&
         GetCapture() == nullptr) {
         // A trackbar can lose capture without sending TB_ENDTRACK. Clear the
         // mouse-only focus blocker; a keyboard-focused control is untouched.
@@ -3024,7 +3317,7 @@ void MainWindow::UpdateControlBarVisibilityFromCursor(
     input.cursorMoved = moved;
     input.pointerOverToolbar = pointerOverToolbar;
     input.pointerOverRestore = pointerOverRestore;
-    input.seekDragging = seekDragging_;
+    input.seekDragging = seekDragging_ || markerDragging_;
     input.volumeDragging = volumeDragging_;
     input.previewVisible = previewPopup_.IsVisible();
     input.zoomSelecting = zoomState_ == ZoomState::Selecting;
@@ -3690,6 +3983,7 @@ void MainWindow::RefreshControls() {
 void MainWindow::RenderPlaybackSnapshot() {
     const PlaybackState state = playbackSnapshot_.state;
     if (state == PlaybackState::Error) {
+        if (markerDragging_) CancelTransientUi();
         playbackLoop_.Reset();
         if (!removalIntervals_.empty()) {
             removalIntervals_.clear();
@@ -3742,6 +4036,9 @@ void MainWindow::RenderPlaybackSnapshot() {
     const bool canRemove = hasMedia_ &&
         state != PlaybackState::Opening && state != PlaybackState::Error &&
         duration > 0 && !HasActiveExportDialog(window_);
+    RefreshSavedIntervalList();
+    EnableWindow(savedIntervalList_, canRemove && !markerDragging_ && !removalIntervals_.empty());
+    EnableWindow(removeSavedIntervalButton_, canRemove && !markerDragging_ && !removalIntervals_.empty());
     const bool hasCurrentSegment = playbackLoop_.HasSegment(duration);
     const bool currentConflict = hasCurrentSegment && OverlapsSavedInterval(
         {playbackLoop_.StartMs(), playbackLoop_.EndMs()}, removalIntervals_);

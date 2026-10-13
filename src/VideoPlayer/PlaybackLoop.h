@@ -78,6 +78,22 @@ public:
         return true;
     }
 
+    // Editing an existing marker preserves the opposite marker and loop mode.
+    bool MovePoint(const bool start, const std::int64_t positionMs,
+        const std::int64_t durationMs) noexcept {
+        if (durationMs <= 0 || positionMs < 0 || positionMs > durationMs) return false;
+        if (start) {
+            if (startMs_ < 0 || positionMs >= durationMs ||
+                (endMs_ >= 0 && (endMs_ > durationMs || endMs_ - positionMs < kMinimumSegmentMs))) return false;
+            startMs_ = positionMs;
+        } else {
+            if (endMs_ < 0 || startMs_ < 0 || positionMs - startMs_ < kMinimumSegmentMs) return false;
+            endMs_ = positionMs;
+        }
+        CancelPending();
+        return true;
+    }
+
     bool ToggleSegment(const std::int64_t durationMs) noexcept {
         // Switching off must always work, even if a length update has made
         // the stored endpoint invalid or duration is temporarily unavailable.

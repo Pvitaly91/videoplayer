@@ -71,6 +71,15 @@ private:
         HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleSeekSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     void DrawSavedIntervals(HDC dc, const RECT& timeline) const noexcept;
+    void DrawCurrentInterval(HDC dc, const RECT& timeline) const noexcept;
+    void DrawTimelineMarkers(HDC dc, const RECT& timeline, bool labels) const noexcept;
+    RECT SeekTimelineRect() const noexcept;
+    bool BeginMarkerDrag(int mouseX, int mouseY = -1);
+    void UpdateMarkerDrag(int mouseX);
+    void EndMarkerDrag(bool cancel) noexcept;
+    int SavedIntervalAtPointer(int mouseX) const noexcept;
+    void RefreshSavedIntervalList();
+    void RemoveSavedInterval(int index = -1);
     void DrawCompactProgress(HDC dc, const RECT& bounds) const noexcept;
     void InvalidateIntervalTimeline() noexcept;
 
@@ -194,6 +203,8 @@ private:
     HWND removeSegmentButton_ = nullptr;
     HWND addRemovalButton_ = nullptr;
     HWND removalCountLabel_ = nullptr;
+    HWND savedIntervalList_ = nullptr;
+    HWND removeSavedIntervalButton_ = nullptr;
     HWND seekSlider_ = nullptr;
     HWND currentTimeLabel_ = nullptr;
     HWND durationLabel_ = nullptr;
@@ -217,6 +228,15 @@ private:
     PlaybackLoop playbackLoop_;
     std::vector<VideoInterval> removalIntervals_;
     std::int64_t timelineDurationMs_ = 0;
+    std::int64_t timelineStartMs_ = -1;
+    std::int64_t timelineEndMs_ = -1;
+    std::vector<VideoInterval> listedRemovalIntervals_;
+    bool markerDragging_ = false;
+    bool markerStart_ = true;
+    int markerSavedIndex_ = -1;
+    std::uint32_t markerGeneration_ = 0;
+    VideoInterval markerOriginal_{};
+    PlaybackLoop markerOriginalLoop_;
     int progressCompletedWidth_ = 0;
     bool applyingPlaybackLoop_ = false;
     bool loopPlaybackRequested_ = false;

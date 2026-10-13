@@ -3,6 +3,7 @@
 #include "../../src/VideoPlayer/PreviewMath.h"
 #include "../../src/VideoPlayer/ProgressStrip.h"
 #include "../../src/VideoPlayer/Resource.h"
+#include "../../src/VideoPlayer/IntervalTimeline.h"
 #include "FakePlayerBackend.h"
 
 #include <commctrl.h>
@@ -140,9 +141,10 @@ struct MainWindowTestAccess final {
         }
     }
 
-    static std::array<HWND, 21> Controls(const MainWindow& window) {
+    static std::array<HWND, 23> Controls(const MainWindow& window) {
         return {window.openButton_, window.playButton_, window.stopButton_, window.exportButton_,
             window.removeSegmentButton_, window.addRemovalButton_, window.removalCountLabel_,
+            window.savedIntervalList_, window.removeSavedIntervalButton_,
             window.seekSlider_, window.currentTimeLabel_, window.durationLabel_,
             window.muteButton_, window.volumeSlider_, window.zoomButton_,
             window.fullscreenButton_, window.hideToolbarButton_,
@@ -1245,6 +1247,100 @@ struct MainWindowTestAccess final {
             L"saved cuts in one player do not block keyboard selection in another instance");
     }
 
+    static void TimelineEditing(Checks& checks) {
+        Fixture fixture;
+        fixture.backend.backendState = 4;
+        checks.Expect(fixture.Create(), L"create editable A-B timeline fixture");
+        auto& window = fixture.window;
+        if (window.window_ == nullptr) return;
+        fixture.backend.positionMs = 4000;
+        window.SetLoopPoint(true);
+        checks.Expect(window.playbackLoop_.StartMs() == 4000 && window.playbackLoop_.EndMs() == -1 &&
+            window.timelineStartMs_ == 4000 && window.removalIntervals_.empty(),
+            L"standalone A immediately invalidates timeline before B or saving");
+        fixture.backend.positionMs = 7000;
+        window.SetLoopPoint(false);
+        window.ToggleSegmentLoop();
+        checks.Expect(window.playbackLoop_.HasSegment(20000) && window.timelineEndMs_ == 7000 &&
+            window.removalIntervals_.empty(), L"unsaved A-B exists on timeline without queue import");
+        const auto timeline = window.SeekTimelineRect();
+        const auto x = [&](const std::int64_t time) { return IntervalTimelineX(time, 20000, timeline); };
+        const auto point = [&](const LONG px) { return MAKELPARAM(static_cast<WORD>(px), static_cast<WORD>((std::max)(0L, timeline.top - 1))); };
+        const int originalSeeks = fixture.backend.seekCalls;
+        SendMessageW(window.seekSlider_, WM_LBUTTONDOWN, MK_LBUTTON, point(x(4000)));
+        checks.Expect(window.markerDragging_ && !window.seekDragging_ && GetCapture() == window.seekSlider_,
+            L"actual marker flag starts its own captured drag instead of seeking");
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(5000)));
+        const auto movedA = PreviewTimeFromChannelX(x(5000), timeline, 20000);
+        checks.Expect(window.playbackLoop_.StartMs() == movedA && window.playbackLoop_.EndMs() == 7000 &&
+            fixture.backend.seekCalls == originalSeeks, L"dragging A preserves B and does not seek playback");
+        SendMessageW(window.seekSlider_, WM_LBUTTONUP, 0, point(x(5000)));
+        checks.Expect(!window.markerDragging_ && GetCapture() != window.seekSlider_ &&
+            window.playbackLoop_.Mode() == LoopMode::Off, L"committed marker drag preserves disabled loop mode");
+        SendMessageW(window.seekSlider_, WM_LBUTTONDOWN, MK_LBUTTON, point(x(movedA)));
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(7000)));
+        checks.Expect(window.playbackLoop_.StartMs() == movedA && window.playbackLoop_.EndMs() == 7000,
+            L"A cannot cross B or collapse the half-second minimum interval");
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(6000)));
+        SendMessageW(window.seekSlider_, WM_CANCELMODE, 0, 0);
+        checks.Expect(!window.markerDragging_ && window.playbackLoop_.StartMs() == movedA &&
+            window.playbackLoop_.EndMs() == 7000, L"cancelled marker capture restores the original current range");
+
+        window.removalIntervals_ = {{8000, 10000}, {14000, 16000}};
+        window.RefreshControls();
+        checks.Expect(SendMessageW(window.savedIntervalList_, CB_GETCOUNT, 0, 0) == 2 &&
+            IsWindowEnabled(window.removeSavedIntervalButton_), L"saved ranges appear in editable toolbar list");
+        SendMessageW(window.seekSlider_, WM_LBUTTONDOWN, MK_LBUTTON, point(x(10000)));
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(12000)));
+        const auto movedB = PreviewTimeFromChannelX(x(12000), timeline, 20000);
+        SendMessageW(window.seekSlider_, WM_LBUTTONUP, 0, point(x(12000)));
+        checks.Expect(window.removalIntervals_[0].startMs == 8000 && window.removalIntervals_[0].endMs == movedB &&
+            window.playbackLoop_.StartMs() == movedA && fixture.backend.seekCalls == originalSeeks,
+            L"saved B is draggable and current A-B remains independent");
+        SendMessageW(window.seekSlider_, WM_LBUTTONDOWN, MK_LBUTTON, point(x(movedB)));
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(15000)));
+        checks.Expect(window.removalIntervals_[0].endMs == movedB,
+            L"saved marker drag cannot overlap another saved range");
+        SendMessageW(window.seekSlider_, WM_LBUTTONUP, 0, point(x(15000)));
+        SendMessageW(window.seekSlider_, WM_LBUTTONDOWN, MK_LBUTTON, point(x(8000)));
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(6000)));
+        checks.Expect(window.removalIntervals_[0].startMs == 8000,
+            L"saved range cannot expand across the current unsaved A-B");
+        SendMessageW(window.seekSlider_, WM_MOUSEMOVE, MK_LBUTTON, point(x(9000)));
+        window.HandleHotKey(VK_ESCAPE, false, false);
+        checks.Expect(!window.markerDragging_ && window.removalIntervals_[0].startMs == 8000,
+            L"Escape rolls back an edited saved endpoint");
+        SendMessageW(window.savedIntervalList_, CB_SETCURSEL, 1, 0);
+        SendMessageW(window.removeSavedIntervalButton_, BM_CLICK, 0, 0);
+        checks.Expect(window.removalIntervals_.size() == 1 && window.removalIntervals_[0].startMs == 8000 &&
+            SendMessageW(window.savedIntervalList_, CB_GETCOUNT, 0, 0) == 1 &&
+            window.playbackLoop_.StartMs() == movedA && fixture.backend.seekCalls == originalSeeks,
+            L"remove-from-list button removes only the selected saved range without seeking or clearing draft");
+        window.RemoveSavedInterval();
+        checks.Expect(window.removalIntervals_.empty() && !IsWindowEnabled(window.removeSavedIntervalButton_),
+            L"removing the last saved range disables its list controls");
+        const LPARAM channelClick = MAKELPARAM(static_cast<WORD>(x(movedA)), static_cast<WORD>(timeline.bottom + 2));
+        SendMessageW(window.seekSlider_, WM_LBUTTONDOWN, MK_LBUTTON, channelClick);
+        checks.Expect(window.seekDragging_ && !window.markerDragging_,
+            L"clicking channel at the A timestamp still starts ordinary seek");
+        SendMessageW(window.seekSlider_, WM_LBUTTONUP, 0, channelClick);
+        checks.Expect(fixture.backend.seekCalls > originalSeeks, L"ordinary channel click still commits a seek");
+        window.EnterFullscreen();
+        checks.Expect(GetParent(window.savedIntervalList_) == window.fullscreenControlBar_ &&
+            GetParent(window.removeSavedIntervalButton_) == window.fullscreenControlBar_,
+            L"new saved interval controls follow fullscreen toolbar parent");
+        const auto full = window.SeekTimelineRect();
+        const auto fullA = IntervalTimelineX(window.playbackLoop_.StartMs(), 20000, full);
+        checks.Expect(window.BeginMarkerDrag(fullA), L"marker dragging survives fullscreen resize");
+        window.ExitFullscreen();
+        checks.Expect(!window.markerDragging_ && GetParent(window.savedIntervalList_) == window.controlBar_,
+            L"fullscreen transition cancels marker capture and returns list to docked toolbar");
+        checks.Expect(window.BeginMarkerDrag(x(window.playbackLoop_.StartMs())), L"begin marker before media reset");
+        window.ResetMediaUiState();
+        checks.Expect(!window.markerDragging_ && window.playbackLoop_.StartMs() == -1 &&
+            window.removalIntervals_.empty(), L"media reset cancels markers and clears both active and saved ranges");
+    }
+
     static void SavedIntervalPainting(Checks& checks) {
         Fixture fixture;
         fixture.backend.backendState = 4; // paused
@@ -1293,6 +1389,27 @@ struct MainWindowTestAccess final {
         const auto sampleX = [](const RECT& bounds, const int percent) {
             return bounds.left + (bounds.right - bounds.left) * percent / 100;
         };
+        {
+            const RECT range{0, 0, 1000, 8};
+            Pixels draft(1000, 8);
+            checks.Expect(draft.Valid(), L"allocate draft A-B timeline pixels");
+            if (draft.Valid()) {
+                const COLORREF active = highContrastOn ? GetSysColor(COLOR_HIGHLIGHT) : RGB(0, 160, 230);
+                window.playbackLoop_.SetStart(4000, 20000);
+                window.RefreshControls();
+                draft.Fill(range, untouchedColor);
+                window.DrawCurrentInterval(draft.dc, range);
+                window.DrawTimelineMarkers(draft.dc, range, false);
+                checks.Expect(GetPixel(draft.dc, 200, 4) == active && GetPixel(draft.dc, 250, 4) == untouchedColor,
+                    L"standalone A is visible before choosing B and before saving");
+                window.playbackLoop_.SetEnd(7000, 20000);
+                draft.Fill(range, untouchedColor);
+                window.DrawCurrentInterval(draft.dc, range);
+                checks.Expect(GetPixel(draft.dc, 250, 4) == active && window.removalIntervals_.empty(),
+                    L"complete unsaved A-B paints its full interval on timeline");
+                window.playbackLoop_.ClearSegment();
+            }
+        }
         window.removalIntervals_ = {{2000, 4000}, {8000, 10000}};
         fixture.backend.positionMs = 6000;
         window.RefreshControls();
@@ -1320,7 +1437,7 @@ struct MainWindowTestAccess final {
             draw.hdc = surface.dc;
             draw.dwDrawStage = CDDS_PREPAINT;
             const bool stages = SendMessageW(parent, WM_NOTIFY, IDC_SEEK_SLIDER,
-                reinterpret_cast<LPARAM>(&draw)) == CDRF_NOTIFYITEMDRAW;
+                reinterpret_cast<LPARAM>(&draw)) == (CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT);
             draw.dwItemSpec = TBCD_CHANNEL;
             draw.dwDrawStage = CDDS_ITEMPREPAINT;
             const bool postRequested = SendMessageW(parent, WM_NOTIFY, IDC_SEEK_SLIDER,
@@ -2309,6 +2426,7 @@ struct MainWindowTestAccess final {
         ReentrantCropGetter(checks);
         PlaybackLoopControls(checks);
         RemovalIntervalControls(checks);
+        TimelineEditing(checks);
         RemovalOverlapGuards(checks);
         SavedIntervalPainting(checks);
         PlaybackLoopRestartLifecycle(checks);

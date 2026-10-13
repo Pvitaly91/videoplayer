@@ -1859,6 +1859,24 @@ void TestIntervalTimeline(TestRunner& runner)
         saved[0].endMs == 2000 && saved[1].startMs == 4000 && saved[1].endMs == 5000,
         L"interval helpers preserve original saved ranges");
     expectRect(timeline, {100, 7, 1100, 13}, L"interval mapping preserves supplied timeline");
+    runner.Equal(videoplayer::IntervalTimelineX(0, 10000, timeline), 100L, L"A marker maps video start");
+    runner.Equal(videoplayer::IntervalTimelineX(10000, 10000, timeline), 1100L, L"B marker maps video end");
+    runner.Equal(videoplayer::IntervalTimelineX(5000, 10000, timeline), 600L, L"marker maps midpoint");
+    runner.Equal(videoplayer::IntervalTimelineX(maxTime, maxTime, hugeTimeline), maxCoord,
+        L"marker handles int64 maximum duration without overflow");
+    videoplayer::PlaybackLoop edit;
+    edit.SetStart(1000, 10000);
+    runner.True(edit.MovePoint(true, 2000, 10000) && edit.EndMs() == -1,
+        L"moving standalone A does not invent B");
+    runner.True(!edit.MovePoint(false, 4000, 10000), L"unset B cannot be dragged");
+    edit.SetEnd(5000, 10000);
+    runner.True(edit.MovePoint(true, 3000, 10000) && edit.EndMs() == 5000 && edit.Mode() == videoplayer::LoopMode::Segment,
+        L"moving A preserves B and enabled loop mode");
+    runner.True(!edit.MovePoint(true, 4600, 10000) && edit.StartMs() == 3000,
+        L"invalid short marker edit is atomic");
+    edit.ToggleSegment(10000);
+    runner.True(edit.MovePoint(false, 10000, 10000) && edit.Mode() == videoplayer::LoopMode::Off,
+        L"moving B to duration preserves disabled loop mode");
 }
 
 void TestUtf8(TestRunner& runner)
