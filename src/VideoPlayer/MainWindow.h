@@ -38,8 +38,7 @@ public:
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator=(const MainWindow&) = delete;
 
-    bool Create(HINSTANCE instance, std::wstring& error);
-    void Show(int showCommand) const;
+    bool CreateAndShow(HINSTANCE instance, int showCommand, std::wstring& error);
     int RunMessageLoop();
     bool OpenFile(const std::wstring& path);
     void OpenFiles(const std::vector<std::wstring>& paths);

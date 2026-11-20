@@ -142,7 +142,7 @@ MainWindow::~MainWindow() {
     }
 }
 
-bool MainWindow::Create(const HINSTANCE instance, std::wstring& error) {
+bool MainWindow::CreateAndShow(const HINSTANCE instance, const int showCommand, std::wstring& error) {
     instance_ = instance;
     if (!RegisterWindowClasses(error)) {
         return false;
@@ -181,6 +181,10 @@ bool MainWindow::Create(const HINSTANCE instance, std::wstring& error) {
         return false;
     }
 
+    // Explorer should see a painted window even on a cold load of the VLC plugins.
+    ShowWindow(window_, showCommand);
+    RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+
     if (!player_.Initialize(videoRenderWindow_, window_, error)) {
         error = kRuntimeError;
         DestroyWindow(window_);
@@ -206,12 +210,9 @@ bool MainWindow::Create(const HINSTANCE instance, std::wstring& error) {
     SetTimer(window_, kUiTimer, kUiTimerIntervalMs, nullptr);
     lastInteractionMs_ = GetTickCount64();
     RefreshControls();
+    InvalidateRect(videoRenderWindow_, nullptr, FALSE);
+    InvalidateRect(videoWindow_, nullptr, FALSE);
     return true;
-}
-
-void MainWindow::Show(const int showCommand) const {
-    ShowWindow(window_, showCommand);
-    UpdateWindow(window_);
 }
 
 int MainWindow::RunMessageLoop() {
@@ -777,7 +778,7 @@ LRESULT MainWindow::HandleVideoMessage(
             RECT textBounds = bounds;
             const int inset = Scale(24);
             InflateRect(&textBounds, -inset, -inset);
-            DrawTextW(dc, kDropPrompt, -1, &textBounds,
+            DrawTextW(dc, playerInitialized_ ? kDropPrompt : L"Запуск плеєра…", -1, &textBounds,
                 DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
             SelectObject(dc, oldFont);
         }

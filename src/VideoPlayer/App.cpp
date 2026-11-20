@@ -129,12 +129,11 @@ int App::Run(const HINSTANCE instance, PWSTR commandLine, const int showCommand)
     }
 
     MainWindow window;
-    if (!window.Create(instance, error)) {
+    if (!window.CreateAndShow(instance, showCommand, error)) {
         ShowStartupError(error);
         return 5;
     }
 
-    window.Show(showCommand);
     std::vector<std::wstring> mediaPaths;
     if (inheritedMediaStatus == InheritedMediaPathStatus::Ready) {
         mediaPaths.emplace_back(std::move(inheritedMediaPath));
